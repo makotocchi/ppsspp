@@ -364,7 +364,7 @@ GamePauseScreen::~GamePauseScreen() {
 }
 
 void GamePauseScreen::CreateViews() {
-	static const int NUM_SAVESLOTS = 5;
+	static const int NUM_SAVESLOTS = 30;
 
 	using namespace UI;
 	Margins scrollMargins(0, 20, 0, 0);

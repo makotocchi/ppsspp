@@ -678,6 +678,31 @@ namespace MainWindow {
 		case ID_FILE_SAVESTATE_SLOT_3: g_Config.iCurrentStateSlot = 2; break;
 		case ID_FILE_SAVESTATE_SLOT_4: g_Config.iCurrentStateSlot = 3; break;
 		case ID_FILE_SAVESTATE_SLOT_5: g_Config.iCurrentStateSlot = 4; break;
+		case ID_FILE_SAVESTATE_SLOT_6: g_Config.iCurrentStateSlot = 5; break;
+		case ID_FILE_SAVESTATE_SLOT_7: g_Config.iCurrentStateSlot = 6; break;
+		case ID_FILE_SAVESTATE_SLOT_8: g_Config.iCurrentStateSlot = 7; break;
+		case ID_FILE_SAVESTATE_SLOT_9: g_Config.iCurrentStateSlot = 8; break;
+		case ID_FILE_SAVESTATE_SLOT_10: g_Config.iCurrentStateSlot = 9; break;
+		case ID_FILE_SAVESTATE_SLOT_11: g_Config.iCurrentStateSlot = 10; break;
+		case ID_FILE_SAVESTATE_SLOT_12: g_Config.iCurrentStateSlot = 11; break;
+		case ID_FILE_SAVESTATE_SLOT_13: g_Config.iCurrentStateSlot = 12; break;
+		case ID_FILE_SAVESTATE_SLOT_14: g_Config.iCurrentStateSlot = 13; break;
+		case ID_FILE_SAVESTATE_SLOT_15: g_Config.iCurrentStateSlot = 14; break;
+		case ID_FILE_SAVESTATE_SLOT_16: g_Config.iCurrentStateSlot = 15; break;
+		case ID_FILE_SAVESTATE_SLOT_17: g_Config.iCurrentStateSlot = 16; break;
+		case ID_FILE_SAVESTATE_SLOT_18: g_Config.iCurrentStateSlot = 17; break;
+		case ID_FILE_SAVESTATE_SLOT_19: g_Config.iCurrentStateSlot = 18; break;
+		case ID_FILE_SAVESTATE_SLOT_20: g_Config.iCurrentStateSlot = 19; break;
+		case ID_FILE_SAVESTATE_SLOT_21: g_Config.iCurrentStateSlot = 20; break;
+		case ID_FILE_SAVESTATE_SLOT_22: g_Config.iCurrentStateSlot = 21; break;
+		case ID_FILE_SAVESTATE_SLOT_23: g_Config.iCurrentStateSlot = 22; break;
+		case ID_FILE_SAVESTATE_SLOT_24: g_Config.iCurrentStateSlot = 23; break;
+		case ID_FILE_SAVESTATE_SLOT_25: g_Config.iCurrentStateSlot = 24; break;
+		case ID_FILE_SAVESTATE_SLOT_26: g_Config.iCurrentStateSlot = 25; break;
+		case ID_FILE_SAVESTATE_SLOT_27: g_Config.iCurrentStateSlot = 26; break;
+		case ID_FILE_SAVESTATE_SLOT_28: g_Config.iCurrentStateSlot = 27; break;
+		case ID_FILE_SAVESTATE_SLOT_29: g_Config.iCurrentStateSlot = 28; break;
+		case ID_FILE_SAVESTATE_SLOT_30: g_Config.iCurrentStateSlot = 29; break;
 
 		case ID_FILE_QUICKLOADSTATE:
 		{
@@ -1297,6 +1322,31 @@ namespace MainWindow {
 			ID_FILE_SAVESTATE_SLOT_3,
 			ID_FILE_SAVESTATE_SLOT_4,
 			ID_FILE_SAVESTATE_SLOT_5,
+			ID_FILE_SAVESTATE_SLOT_6,
+			ID_FILE_SAVESTATE_SLOT_7,
+			ID_FILE_SAVESTATE_SLOT_8,
+			ID_FILE_SAVESTATE_SLOT_9,
+			ID_FILE_SAVESTATE_SLOT_10,
+			ID_FILE_SAVESTATE_SLOT_11,
+			ID_FILE_SAVESTATE_SLOT_12,
+			ID_FILE_SAVESTATE_SLOT_13,
+			ID_FILE_SAVESTATE_SLOT_14,
+			ID_FILE_SAVESTATE_SLOT_15,
+			ID_FILE_SAVESTATE_SLOT_16,
+			ID_FILE_SAVESTATE_SLOT_17,
+			ID_FILE_SAVESTATE_SLOT_18,
+			ID_FILE_SAVESTATE_SLOT_19,
+			ID_FILE_SAVESTATE_SLOT_20,
+			ID_FILE_SAVESTATE_SLOT_21,
+			ID_FILE_SAVESTATE_SLOT_22,
+			ID_FILE_SAVESTATE_SLOT_23,
+			ID_FILE_SAVESTATE_SLOT_24,
+			ID_FILE_SAVESTATE_SLOT_25,
+			ID_FILE_SAVESTATE_SLOT_26,
+			ID_FILE_SAVESTATE_SLOT_27,
+			ID_FILE_SAVESTATE_SLOT_28,
+			ID_FILE_SAVESTATE_SLOT_29,
+			ID_FILE_SAVESTATE_SLOT_30
 		};
 
 		if (g_Config.iCurrentStateSlot < 0)

@@ -31,7 +31,7 @@ namespace SaveState
 	};
 	typedef std::function<void(Status status, const std::string &message, void *cbUserData)> Callback;
 
-	static const int NUM_SLOTS = 5;
+	static const int NUM_SLOTS = 30;
 	static const char *STATE_EXTENSION = "ppst";
 	static const char *SCREENSHOT_EXTENSION = "jpg";
 	static const char *UNDO_STATE_EXTENSION = "undo.ppst";
