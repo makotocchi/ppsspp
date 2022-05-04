@@ -455,6 +455,16 @@ namespace SaveState
 		g_Config.iCurrentStateSlot = (g_Config.iCurrentStateSlot + 1) % NUM_SLOTS;
 	}
 
+	void PreviousSlot()
+	{
+		if (g_Config.iCurrentStateSlot == 0) {
+			g_Config.iCurrentStateSlot = NUM_SLOTS - 1;
+		}
+		else {
+			g_Config.iCurrentStateSlot = g_Config.iCurrentStateSlot - 1;
+		}
+	}
+
 	static void DeleteIfExists(const Path &fn) {
 		// Just avoiding error messages.
 		if (File::Exists(fn)) {

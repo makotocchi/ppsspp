@@ -292,6 +292,7 @@ namespace CustomKey {
 		{ ImageID::invalid(), VIRTKEY_SAVE_STATE },
 		{ ImageID::invalid(), VIRTKEY_LOAD_STATE },
 		{ ImageID::invalid(), VIRTKEY_NEXT_SLOT },
+		{ ImageID::invalid(), VIRTKEY_PREVIOUS_SLOT },
 #if !defined(MOBILE_DEVICE)
 		{ ImageID::invalid(), VIRTKEY_TOGGLE_FULLSCREEN },
 #endif
@@ -337,6 +338,7 @@ namespace GestureKey {
 		VIRTKEY_SAVE_STATE,
 		VIRTKEY_LOAD_STATE,
 		VIRTKEY_NEXT_SLOT,
+		VIRTKEY_PREVIOUS_SLOT,
 		VIRTKEY_TEXTURE_DUMP, 
 		VIRTKEY_TEXTURE_REPLACE,
 		VIRTKEY_SCREENSHOT,
