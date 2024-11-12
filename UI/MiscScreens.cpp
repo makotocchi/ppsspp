@@ -274,7 +274,7 @@ private:
 	double nextT_ = -INTERVAL;
 };
 
-// TODO: Add more styles. Remember to add to the enum in Config.cpp and the selector in GameSettings too.
+// TODO: Add more styles. Remember to add to the enum in ConfigValues.h and the selector in GameSettings too.
 
 static BackgroundAnimation g_CurBackgroundAnimation = BackgroundAnimation::OFF;
 static std::unique_ptr<Animation> g_Animation;
@@ -332,8 +332,9 @@ void DrawBackground(UIContext &dc, float alpha, float x, float y, float z) {
 		dc.Flush();
 		dc.RebindTexture();
 	} else {
+		// I_BG original color: 0xFF754D24
 		ImageID img = ImageID("I_BG");
-		ui_draw2d.DrawImageStretch(img, dc.GetBounds(), bgColor);
+		ui_draw2d.DrawImageStretch(img, dc.GetBounds(), bgColor & dc.theme->backgroundColor);
 	}
 
 #if PPSSPP_PLATFORM(IOS)
@@ -376,13 +377,13 @@ void DrawGameBackground(UIContext &dc, const Path &gamePath, float x, float y, f
 void HandleCommonMessages(const char *message, const char *value, ScreenManager *manager, Screen *activeScreen) {
 	bool isActiveScreen = manager->topScreen() == activeScreen;
 
-	if (!strcmp(message, "clear jit")) {
-		if (MIPSComp::jit && PSP_IsInited()) {
-			MIPSComp::jit->ClearCache();
+	if (!strcmp(message, "clear jit") && PSP_IsInited()) {
+		if (MIPSComp::jit) {
+			std::lock_guard<std::recursive_mutex> guard(MIPSComp::jitLock);
+			if (MIPSComp::jit)
+				MIPSComp::jit->ClearCache();
 		}
-		if (PSP_IsInited()) {
-			currentMIPS->UpdateCore((CPUCore)g_Config.iCpuCore);
-		}
+		currentMIPS->UpdateCore((CPUCore)g_Config.iCpuCore);
 	} else if (!strcmp(message, "control mapping") && isActiveScreen && activeScreen->tag() != "control mapping") {
 		UpdateUIState(UISTATE_MENU);
 		manager->push(new ControlMappingScreen());
@@ -488,16 +489,13 @@ void PromptScreen::CreateViews() {
 
 	Margins actionMenuMargins(0, 100, 15, 0);
 
-	root_ = new LinearLayout(ORIENT_HORIZONTAL);
+	root_ = new AnchorLayout();
 
-	ViewGroup *leftColumn = new AnchorLayout(new LinearLayoutParams(1.0f));
-	root_->Add(leftColumn);
+	root_->Add(new TextView(message_, ALIGN_LEFT | FLAG_WRAP_TEXT, false, new AnchorLayoutParams(WRAP_CONTENT, WRAP_CONTENT, 15, 15, 330, 10)))->SetClip(false);
 
-	float leftColumnWidth = dp_xres - actionMenuMargins.left - actionMenuMargins.right - 300.0f;
-	leftColumn->Add(new TextView(message_, ALIGN_LEFT | FLAG_WRAP_TEXT, false, new AnchorLayoutParams(leftColumnWidth, WRAP_CONTENT, 10, 10, NONE, NONE)))->SetClip(false);
-
-	ViewGroup *rightColumnItems = new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(300, FILL_PARENT, actionMenuMargins));
+	ViewGroup *rightColumnItems = new LinearLayout(ORIENT_VERTICAL, new AnchorLayoutParams(300, WRAP_CONTENT, NONE, 15, 15, NONE));
 	root_->Add(rightColumnItems);
+
 	Choice *yesButton = rightColumnItems->Add(new Choice(yesButtonText_));
 	yesButton->OnClick.Handle(this, &PromptScreen::OnYes);
 	root_->SetDefaultFocusView(yesButton);
@@ -528,7 +526,7 @@ void PostProcScreen::CreateViews() {
 	shaders_ = GetAllPostShaderInfo();
 	std::vector<std::string> items;
 	int selected = -1;
-	const std::string selectedName = id_ >= g_Config.vPostShaderNames.size() ? "Off" : g_Config.vPostShaderNames[id_];
+	const std::string selectedName = id_ >= (int)g_Config.vPostShaderNames.size() ? "Off" : g_Config.vPostShaderNames[id_];
 	for (int i = 0; i < (int)shaders_.size(); i++) {
 		if (!shaders_[i].visible)
 			continue;
@@ -544,7 +542,7 @@ void PostProcScreen::OnCompleted(DialogResult result) {
 	if (result != DR_OK)
 		return;
 	const std::string &value = shaders_[listView_->GetSelected()].section;
-	if (id_ < g_Config.vPostShaderNames.size())
+	if (id_ < (int)g_Config.vPostShaderNames.size())
 		g_Config.vPostShaderNames[id_] = value;
 	else
 		g_Config.vPostShaderNames.push_back(value);
@@ -770,11 +768,11 @@ void LogoScreen::render() {
 	// Manually formatting UTF-8 is fun.  \xXX doesn't work everywhere.
 	snprintf(temp, sizeof(temp), "%s Henrik Rydg%c%crd", cr->T("created", "Created by"), 0xC3, 0xA5);
 	if (System_GetPropertyBool(SYSPROP_APP_GOLD)) {
-		dc.Draw()->DrawImage(ImageID("I_ICONGOLD"), bounds.centerX() - 120, bounds.centerY() - 30, 1.2f, textColor, ALIGN_CENTER);
+		dc.Draw()->DrawImage(ImageID("I_ICONGOLD"), bounds.centerX() - 120, bounds.centerY() - 30, 1.2f, 0xFFFFFFFF, ALIGN_CENTER);
 	} else {
-		dc.Draw()->DrawImage(ImageID("I_ICON"), bounds.centerX() - 120, bounds.centerY() - 30, 1.2f, textColor, ALIGN_CENTER);
+		dc.Draw()->DrawImage(ImageID("I_ICON"), bounds.centerX() - 120, bounds.centerY() - 30, 1.2f, 0xFFFFFFFF, ALIGN_CENTER);
 	}
-	dc.Draw()->DrawImage(ImageID("I_LOGO"), bounds.centerX() + 40, bounds.centerY() - 30, 1.5f, textColor, ALIGN_CENTER);
+	dc.Draw()->DrawImage(ImageID("I_LOGO"), bounds.centerX() + 40, bounds.centerY() - 30, 1.5f, 0xFFFFFFFF, ALIGN_CENTER);
 	//dc.Draw()->DrawTextShadow(UBUNTU48, "PPSSPP", bounds.w / 2, bounds.h / 2 - 30, textColor, ALIGN_CENTER);
 	dc.SetFontScale(1.0f, 1.0f);
 	dc.SetFontStyle(dc.theme->uiFont);
@@ -784,7 +782,7 @@ void LogoScreen::render() {
 	int ppsspp_org_y = bounds.h / 2 + 130;
 	dc.DrawText("www.ppsspp.org", bounds.centerX(), ppsspp_org_y, textColor, ALIGN_CENTER);
 
-#if (defined(_WIN32) && !PPSSPP_PLATFORM(UWP)) || PPSSPP_PLATFORM(ANDROID) || PPSSPP_PLATFORM(LINUX)
+#if !PPSSPP_PLATFORM(UWP)
 	// Draw the graphics API, except on UWP where it's always D3D11
 	std::string apiName = screenManager()->getDrawContext()->GetInfoString(InfoField::APINAME);
 #ifdef _DEBUG
@@ -994,7 +992,8 @@ void CreditsScreen::render() {
 #endif
 #if defined(USING_QT_UI)
 		"Qt",
-#elif !defined(USING_WIN_UI)
+#endif
+#if defined(SDL)
 		"SDL",
 #endif
 		"CMake",

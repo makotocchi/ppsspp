@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstdio>
+#include <mutex>
 #include "Common/Data/Encoding/Utf8.h"
 #include "Core/Core.h"
 #include "Core/HLE/ReplaceTables.h"
@@ -81,7 +82,7 @@ INT_PTR CALLBACK DumpMemoryWindow::dlgFunc(HWND hwnd, UINT iMsg, WPARAM wParam, 
 				bool priorDumpWasStepping = Core_IsStepping();
 				if (!priorDumpWasStepping && PSP_IsInited()) {
 					// If emulator isn't paused force paused state, but wait before locking.
-					Core_EnableStepping(true);
+					Core_EnableStepping(true, "memory.access", bp->start);
 					Core_WaitInactive();
 				}
 
@@ -102,6 +103,7 @@ INT_PTR CALLBACK DumpMemoryWindow::dlgFunc(HWND hwnd, UINT iMsg, WPARAM wParam, 
 					fwrite(Memory::GetPointer(bp->start), 1, bp->size, output);
 				} else {
 					auto savedReplacements = SaveAndClearReplacements();
+					std::lock_guard<std::recursive_mutex> guard(MIPSComp::jitLock);
 					if (MIPSComp::jit) {
 						auto savedBlocks = MIPSComp::jit->SaveAndClearEmuHackOps();
 						fwrite(Memory::GetPointer(bp->start), 1, bp->size, output);

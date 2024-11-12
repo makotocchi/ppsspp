@@ -4,25 +4,29 @@
 
 #include "Common/Thread/Channel.h"
 #include "Common/Thread/ThreadManager.h"
-#include "Common/Log.h"
 
 template<class T>
 class PromiseTask : public Task {
 public:
-	PromiseTask(std::function<T *()> fun, Mailbox<T> *tx) : fun_(fun), tx_(tx) {
+	PromiseTask(std::function<T ()> fun, Mailbox<T> *tx, TaskType t) : fun_(fun), tx_(tx), type_(t) {
 		tx_->AddRef();
 	}
 	~PromiseTask() {
 		tx_->Release();
 	}
 
+	TaskType Type() const override {
+		return type_;
+	}
+
 	void Run() override {
-		T *value = fun_();
+		T value = fun_();
 		tx_->Send(value);
 	}
 
-	std::function<T *()> fun_;
+	std::function<T ()> fun_;
 	Mailbox<T> *tx_;
+	TaskType type_;
 };
 
 // Represents pending or actual data.
@@ -32,14 +36,14 @@ public:
 template<class T>
 class Promise {
 public:
-	static Promise<T> *Spawn(ThreadManager *threadman, std::function<T *()> fun, TaskType taskType) {
+	static Promise<T> *Spawn(ThreadManager *threadman, std::function<T()> fun, TaskType taskType) {
 		Mailbox<T> *mailbox = new Mailbox<T>();
 
 		Promise<T> *promise = new Promise<T>();
 		promise->rx_ = mailbox;
 
-		PromiseTask<T> *task = new PromiseTask<T>(fun, mailbox);
-		threadman->EnqueueTask(task, taskType);
+		PromiseTask<T> *task = new PromiseTask<T>(fun, mailbox, taskType);
+		threadman->EnqueueTask(task);
 		return promise;
 	}
 
@@ -50,8 +54,8 @@ public:
 		delete data_;
 	}
 
-	// Returns *T if the data is ready, nullptr if it's not.
-	T *Poll() {
+	// Returns T if the data is ready, nullptr if it's not.
+	T Poll() {
 		if (ready_) {
 			return data_;
 		} else {
@@ -66,7 +70,7 @@ public:
 		}
 	}
 
-	T *BlockUntilReady() {
+	T BlockUntilReady() {
 		if (ready_) {
 			return data_;
 		} else {
@@ -81,7 +85,7 @@ public:
 private:
 	Promise() {}
 
-	T *data_ = nullptr;
+	T data_ = nullptr;
 	bool ready_ = false;
 	Mailbox<T> *rx_;
 };

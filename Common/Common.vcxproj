@@ -376,6 +376,7 @@
     <ClInclude Include="..\ext\libpng17\pnglibconf.h" />
     <ClInclude Include="..\ext\libpng17\pngpriv.h" />
     <ClInclude Include="..\ext\libpng17\pngstruct.h" />
+    <ClInclude Include="..\ext\vma\vk_mem_alloc.h" />
     <ClInclude Include="ABI.h" />
     <ClInclude Include="Arm64Emitter.h" />
     <ClInclude Include="ArmCommon.h" />
@@ -436,11 +437,14 @@
     <ClInclude Include="GPU\ShaderWriter.h" />
     <ClInclude Include="GPU\thin3d.h" />
     <ClInclude Include="GPU\thin3d_create.h" />
+    <ClInclude Include="GPU\Vulkan\VulkanAlloc.h" />
+    <ClInclude Include="GPU\Vulkan\VulkanBarrier.h" />
     <ClInclude Include="GPU\Vulkan\VulkanContext.h" />
     <ClInclude Include="GPU\Vulkan\VulkanDebug.h" />
     <ClInclude Include="GPU\Vulkan\VulkanImage.h" />
     <ClInclude Include="GPU\Vulkan\VulkanLoader.h" />
     <ClInclude Include="GPU\Vulkan\VulkanMemory.h" />
+    <ClInclude Include="GPU\Vulkan\VulkanProfiler.h" />
     <ClInclude Include="GPU\Vulkan\VulkanQueueRunner.h" />
     <ClInclude Include="GPU\Vulkan\VulkanRenderManager.h" />
     <ClInclude Include="Input\GestureDetector.h" />
@@ -473,7 +477,6 @@
     <ClInclude Include="LogReporting.h" />
     <ClInclude Include="Serialize\SerializeDeque.h" />
     <ClInclude Include="Serialize\SerializeFuncs.h" />
-    <ClInclude Include="Data\Convert\ColorConvNEON.h" />
     <ClInclude Include="Serialize\SerializeList.h" />
     <ClInclude Include="Serialize\SerializeMap.h" />
     <ClInclude Include="Serialize\Serializer.h" />
@@ -526,8 +529,10 @@
     <ClInclude Include="System\Display.h" />
     <ClInclude Include="System\NativeApp.h" />
     <ClInclude Include="System\System.h" />
+    <ClInclude Include="Thread\Barrier.h" />
     <ClInclude Include="Thread\Channel.h" />
     <ClInclude Include="Thread\Event.h" />
+    <ClInclude Include="Thread\Waitable.h" />
     <ClInclude Include="Thread\ParallelLoop.h" />
     <ClInclude Include="Thread\Promise.h" />
     <ClInclude Include="Thread\ThreadManager.h" />
@@ -794,6 +799,7 @@
       <ForcedIncludeFiles Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
       </ForcedIncludeFiles>
     </ClCompile>
+    <ClCompile Include="..\ext\vma\vk_mem_alloc.cpp" />
     <ClCompile Include="ABI.cpp" />
     <ClCompile Include="Arm64Emitter.cpp" />
     <ClCompile Include="ArmCPUDetect.cpp">
@@ -808,16 +814,6 @@
     </ClCompile>
     <ClCompile Include="ArmEmitter.cpp" />
     <ClCompile Include="Buffer.cpp" />
-    <ClCompile Include="Data\Convert\ColorConvNEON.cpp">
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">false</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|ARM'">false</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">false</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|ARM'">false</ExcludedFromBuild>
-    </ClCompile>
     <ClCompile Include="Data\Color\RGBAUtil.cpp" />
     <ClCompile Include="Data\Convert\SmallDataConvert.cpp" />
     <ClCompile Include="Data\Encoding\Base64.cpp" />
@@ -862,11 +858,13 @@
     <ClCompile Include="GPU\ShaderWriter.cpp" />
     <ClCompile Include="GPU\thin3d.cpp" />
     <ClCompile Include="GPU\Vulkan\thin3d_vulkan.cpp" />
+    <ClCompile Include="GPU\Vulkan\VulkanBarrier.cpp" />
     <ClCompile Include="GPU\Vulkan\VulkanContext.cpp" />
     <ClCompile Include="GPU\Vulkan\VulkanDebug.cpp" />
     <ClCompile Include="GPU\Vulkan\VulkanImage.cpp" />
     <ClCompile Include="GPU\Vulkan\VulkanLoader.cpp" />
     <ClCompile Include="GPU\Vulkan\VulkanMemory.cpp" />
+    <ClCompile Include="GPU\Vulkan\VulkanProfiler.cpp" />
     <ClCompile Include="GPU\Vulkan\VulkanQueueRunner.cpp" />
     <ClCompile Include="GPU\Vulkan\VulkanRenderManager.cpp" />
     <ClCompile Include="Input\GestureDetector.cpp" />

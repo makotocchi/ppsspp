@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "Common/Common.h"
+#include "Common/CommonTypes.h"
 #include "Common/Swap.h"
 #include "GPU/GPU.h"
 #include "GPU/ge_constants.h"
@@ -298,9 +298,7 @@ struct GPUgstate {
 	bool isTextureAlphaUsed() const { return (texfunc & 0x100) != 0; }
 	GETextureFormat getTextureFormat() const { return static_cast<GETextureFormat>(texformat & 0xF); }
 	bool isTextureFormatIndexed() const { return (texformat & 4) != 0; } // GE_TFMT_CLUT4 - GE_TFMT_CLUT32 are 0b1xx.
-	int getTextureEnvColR() const { return texenvcolor&0xFF; }
-	int getTextureEnvColG() const { return (texenvcolor>>8)&0xFF; }
-	int getTextureEnvColB() const { return (texenvcolor>>16)&0xFF; }
+	int getTextureEnvColRGB() const { return texenvcolor & 0x00FFFFFF; }
 	u32 getClutAddress() const { return (clutaddr & 0x00FFFFF0) | ((clutaddrupper << 8) & 0x0F000000); }
 	int getClutLoadBytes() const { return (loadclut & 0x3F) * 32; }
 	int getClutLoadBlocks() const { return (loadclut & 0x3F); }
@@ -340,7 +338,7 @@ struct GPUgstate {
 	unsigned int getAmbientB() const { return (ambientcolor>>16)&0xFF; }
 	unsigned int getAmbientA() const { return ambientalpha&0xFF; }
 	unsigned int getAmbientRGBA() const { return (ambientcolor&0xFFFFFF) | ((ambientalpha&0xFF)<<24); }
-	unsigned int getMaterialUpdate() const { return materialupdate&0xFFFFFF; }
+	unsigned int getMaterialUpdate() const { return materialupdate & 7; }
 	unsigned int getMaterialAmbientR() const { return materialambient&0xFF; }
 	unsigned int getMaterialAmbientG() const { return (materialambient>>8)&0xFF; }
 	unsigned int getMaterialAmbientB() const { return (materialambient>>16)&0xFF; }
@@ -388,8 +386,8 @@ struct GPUgstate {
 	int getScissorY1() const { return (scissor1 >> 10) & 0x3FF; }
 	int getScissorX2() const { return scissor2 & 0x3FF; }
 	int getScissorY2() const { return (scissor2 >> 10) & 0x3FF; }
-	int getRegionX1() const { return region1 & 0x3FF; }
-	int getRegionY1() const { return (region1 >> 10) & 0x3FF; }
+	int getRegionRateX() const { return 0x100 + (region1 & 0x3FF); }
+	int getRegionRateY() const { return 0x100 + ((region1 >> 10) & 0x3FF); }
 	int getRegionX2() const { return (region2 & 0x3FF); }
 	int getRegionY2() const { return (region2 >> 10) & 0x3FF; }
 
@@ -471,7 +469,6 @@ enum {
 	GPU_SUPPORTS_BLEND_MINMAX = FLAG_BIT(4),
 	GPU_SUPPORTS_LOGIC_OP = FLAG_BIT(5),
 	GPU_USE_DEPTH_RANGE_HACK = FLAG_BIT(6),
-	GPU_SUPPORTS_WIDE_LINES = FLAG_BIT(7),
 	GPU_SUPPORTS_ANISOTROPY = FLAG_BIT(8),
 	GPU_USE_CLEAR_RAM_HACK = FLAG_BIT(9),
 	GPU_SUPPORTS_INSTANCE_RENDERING = FLAG_BIT(10),
@@ -482,7 +479,7 @@ enum {
 	GPU_SUPPORTS_32BIT_INT_FSHADER = FLAG_BIT(15),
 	GPU_SUPPORTS_DEPTH_TEXTURE = FLAG_BIT(16),
 	GPU_SUPPORTS_ACCURATE_DEPTH = FLAG_BIT(17),
-	// Free bit: 18,
+	// Free bit: 18
 	GPU_SUPPORTS_COPY_IMAGE = FLAG_BIT(19),
 	GPU_SUPPORTS_ANY_FRAMEBUFFER_FETCH = FLAG_BIT(20),
 	GPU_SCALE_DEPTH_FROM_24BIT_TO_16BIT = FLAG_BIT(21),
@@ -492,8 +489,8 @@ enum {
 	GPU_SUPPORTS_FRAMEBUFFER_BLIT = FLAG_BIT(26),
 	GPU_SUPPORTS_FRAMEBUFFER_BLIT_TO_DEPTH = FLAG_BIT(27),
 	GPU_SUPPORTS_TEXTURE_NPOT = FLAG_BIT(28),
-	GPU_NEEDS_Z_EQUAL_W_HACK = FLAG_BIT(29),
-	// Free bit: 30
+	GPU_SUPPORTS_CLIP_DISTANCE = FLAG_BIT(29),
+	GPU_SUPPORTS_CULL_DISTANCE = FLAG_BIT(30),
 	GPU_PREFER_REVERSE_COLOR_ORDER = FLAG_BIT(31),
 };
 
@@ -595,6 +592,13 @@ struct GPUStateCache {
 	float vpDepthScale;
 
 	KnownVertexBounds vertBounds;
+
+	GEBufferFormat framebufFormat;
+	// Some games use a very specific masking setup to draw into the alpha channel of a 4444 target using the blue channel of a 565 target.
+	// This is done because on PSP you can't write to destination alpha, other than stencil values, which can't be set from a texture.
+	// Examples of games that do this: Outrun, Split/Second.
+	// We detect this case and go into a special drawing mode.
+	bool blueToAlpha;
 
 	// TODO: These should be accessed from the current VFB object directly.
 	u32 curRTWidth;

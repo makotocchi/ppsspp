@@ -17,6 +17,7 @@
 
 #include "ppsspp_config.h"
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <png.h>
@@ -31,6 +32,9 @@
 #include "Common/File/FileUtil.h"
 #include "Common/StringUtils.h"
 #include "Common/Thread/ParallelLoop.h"
+#include "Common/Thread/Waitable.h"
+#include "Common/Thread/ThreadManager.h"
+#include "Common/TimeUtil.h"
 #include "Core/Config.h"
 #include "Core/Host.h"
 #include "Core/System.h"
@@ -499,57 +503,117 @@ static bool WriteTextureToPNG(png_imagep image, const Path &filename, int conver
 	}
 }
 
+class TextureSaveTask : public Task {
+public:
+	// Could probably just use a vector.
+	SimpleBuf<u32> data;
+
+	int w = 0;
+	int h = 0;
+	int pitch = 0;  // bytes
+
+	Path basePath;
+	std::string hashfile;
+	u32 replacedInfoHash;
+
+	bool skipIfExists = false;
+
+	TextureSaveTask(SimpleBuf<u32> _data) : data(std::move(_data)) {}
+
+	TaskType Type() const override { return TaskType::CPU_COMPUTE; }  // Also I/O blocking but dominated by compute
+	void Run() override {
+		const Path filename = basePath / hashfile;
+		const Path saveFilename = basePath / NEW_TEXTURE_DIR / hashfile;
+
+		// Should we skip writing if the newly saved data already exists?
+		// We do this on the thread due to slow IO.
+		if (skipIfExists && File::Exists(saveFilename))
+			return;
+
+		// And we always skip if the replace file already exists.
+		if (File::Exists(filename))
+			return;
+
+		// Create subfolder as needed.
+#ifdef _WIN32
+		size_t slash = hashfile.find_last_of("/\\");
+#else
+		size_t slash = hashfile.find_last_of("/");
+#endif
+		if (slash != hashfile.npos) {
+			// Create any directory structure as needed.
+			const Path saveDirectory = basePath / NEW_TEXTURE_DIR / hashfile.substr(0, slash);
+			if (!File::Exists(saveDirectory)) {
+				File::CreateFullPath(saveDirectory);
+				File::CreateEmptyFile(saveDirectory / ".nomedia");
+			}
+		}
+
+		png_image png{};
+		png.version = PNG_IMAGE_VERSION;
+		png.format = PNG_FORMAT_RGBA;
+		png.width = w;
+		png.height = h;
+		bool success = WriteTextureToPNG(&png, saveFilename, 0, data.data(), pitch, nullptr);
+		png_image_free(&png);
+		if (png.warning_or_error >= 2) {
+			ERROR_LOG(COMMON, "Saving screenshot to PNG produced errors.");
+		} else if (success) {
+			NOTICE_LOG(G3D, "Saving texture for replacement: %08x / %dx%d", replacedInfoHash, w, h);
+		}
+	}
+};
+
+bool TextureReplacer::WillSave(const ReplacedTextureDecodeInfo &replacedInfo) {
+	_assert_msg_(enabled_, "Replacement not enabled");
+	if (!g_Config.bSaveNewTextures)
+		return false;
+	// Don't save the PPGe texture.
+	if (replacedInfo.addr > 0x05000000 && replacedInfo.addr < PSP_GetKernelMemoryEnd())
+		return false;
+	if (replacedInfo.isVideo && !allowVideo_)
+		return false;
+
+	return true;
+}
+
 void TextureReplacer::NotifyTextureDecoded(const ReplacedTextureDecodeInfo &replacedInfo, const void *data, int pitch, int level, int w, int h) {
 	_assert_msg_(enabled_, "Replacement not enabled");
-	if (!g_Config.bSaveNewTextures) {
+	if (!WillSave(replacedInfo)) {
 		// Ignore.
 		return;
-	}
-	if (replacedInfo.addr > 0x05000000 && replacedInfo.addr < PSP_GetKernelMemoryEnd()) {
-		// Don't save the PPGe texture.
-		return;
-	}
-	if (replacedInfo.isVideo && !allowVideo_) {
-		return;
-	}
-	u64 cachekey = replacedInfo.cachekey;
-	if (ignoreAddress_) {
-		cachekey = cachekey & 0xFFFFFFFFULL;
 	}
 	if (ignoreMipmap_ && level > 0) {
 		return;
 	}
 
+	u64 cachekey = replacedInfo.cachekey;
+	if (ignoreAddress_) {
+		cachekey = cachekey & 0xFFFFFFFFULL;
+	}
+
 	std::string hashfile = LookupHashFile(cachekey, replacedInfo.hash, level);
 	const Path filename = basePath_ / hashfile;
-	const Path saveFilename = basePath_ / NEW_TEXTURE_DIR / hashfile;
 
 	// If it's empty, it's an ignored hash, we intentionally don't save.
-	if (hashfile.empty() || File::Exists(filename)) {
+	if (hashfile.empty()) {
 		// If it exists, must've been decoded and saved as a new texture already.
 		return;
 	}
 
 	ReplacementCacheKey replacementKey(cachekey, replacedInfo.hash);
 	auto it = savedCache_.find(replacementKey);
-	if (it != savedCache_.end() && File::Exists(saveFilename)) {
+	bool skipIfExists = false;
+	double now = time_now_d();
+	if (it != savedCache_.end()) {
 		// We've already saved this texture.  Let's only save if it's bigger (e.g. scaled now.)
-		if (it->second.w >= w && it->second.h >= h) {
-			return;
-		}
-	}
+		if (it->second.first.w >= w && it->second.first.h >= h) {
+			// If it's been more than 5 seconds, we'll check again.  Maybe they deleted.
+			double age = now - it->second.second;
+			if (age < 5.0)
+				return;
 
-#ifdef _WIN32
-	size_t slash = hashfile.find_last_of("/\\");
-#else
-	size_t slash = hashfile.find_last_of("/");
-#endif
-	if (slash != hashfile.npos) {
-		// Create any directory structure as needed.
-		const Path saveDirectory = basePath_ / NEW_TEXTURE_DIR / hashfile.substr(0, slash);
-		if (!File::Exists(saveDirectory)) {
-			File::CreateFullPath(saveDirectory);
-			File::CreateEmptyFile(saveDirectory / ".nomedia");
+			skipIfExists = true;
 		}
 	}
 
@@ -561,6 +625,9 @@ void TextureReplacer::NotifyTextureDecoded(const ReplacedTextureDecodeInfo &repl
 		h = lookupH * replacedInfo.scaleFactor;
 	}
 
+	SimpleBuf<u32> saveBuf;
+
+	// Since we're copying, change the format meanwhile.  Not much extra cost.
 	if (replacedInfo.fmt != ReplacedTextureFormat::F_8888) {
 		saveBuf.resize((pitch * h) / sizeof(u16));
 		switch (replacedInfo.fmt) {
@@ -595,30 +662,44 @@ void TextureReplacer::NotifyTextureDecoded(const ReplacedTextureDecodeInfo &repl
 			// We doubled our pitch.
 			pitch *= 2;
 		}
+	} else {
+		// Copy data to a buffer so we can send it to the thread. Might as well compact-away the pitch
+		// while we're at it.
+		saveBuf.resize(w * h);
+		for (int y = 0; y < h; y++) {
+			memcpy((u8 *)saveBuf.data() + y * w * 4, (const u8 *)data + y * pitch, w * sizeof(u32));
+		}
+		pitch = w * 4;
 	}
 
-	png_image png;
-	memset(&png, 0, sizeof(png));
-	png.version = PNG_IMAGE_VERSION;
-	png.format = PNG_FORMAT_RGBA;
-	png.width = w;
-	png.height = h;
-	bool success = WriteTextureToPNG(&png, saveFilename, 0, data, pitch, nullptr);
-	png_image_free(&png);
-
-	if (png.warning_or_error >= 2) {
-		ERROR_LOG(COMMON, "Saving screenshot to PNG produced errors.");
-	} else if (success) {
-		NOTICE_LOG(G3D, "Saving texture for replacement: %08x / %dx%d", replacedInfo.hash, w, h);
-	}
+	TextureSaveTask *task = new TextureSaveTask(std::move(saveBuf));
+	// Should probably do a proper move constructor but this'll work.
+	task->w = w;
+	task->h = h;
+	task->pitch = pitch;
+	task->basePath = basePath_;
+	task->hashfile = hashfile;
+	task->replacedInfoHash = replacedInfo.hash;
+	task->skipIfExists = skipIfExists;
+	g_threadManager.EnqueueTask(task);  // We don't care about waiting for the task. It'll be fine.
 
 	// Remember that we've saved this for next time.
+	// Should be OK that the actual disk write may not be finished yet.
 	ReplacedTextureLevel saved;
 	saved.fmt = ReplacedTextureFormat::F_8888;
 	saved.file = filename;
 	saved.w = w;
 	saved.h = h;
-	savedCache_[replacementKey] = saved;
+	savedCache_[replacementKey] = std::make_pair(saved, now);
+}
+
+void TextureReplacer::Decimate(bool forcePressure) {
+	// Allow replacements to be cached for a long time, although they're large.
+	const double age = forcePressure ? 90.0 : 1800.0;
+	const double threshold = time_now_d() - age;
+	for (auto &item : cache_) {
+		item.second.PurgeIfOlder(threshold);
+	}
 }
 
 template <typename Key, typename Value>
@@ -733,15 +814,80 @@ float TextureReplacer::LookupReduceHashRange(int& w, int& h) {
 	}
 }
 
-bool ReplacedTexture::Load(int level, void *out, int rowPitch) {
+class ReplacedTextureTask : public Task {
+public:
+	ReplacedTextureTask(ReplacedTexture &tex, LimitedWaitable *w) : tex_(tex), waitable_(w) {}
+
+	TaskType Type() const override {
+		return TaskType::IO_BLOCKING;
+	}
+
+	void Run() override {
+		tex_.Prepare();
+		waitable_->Notify();
+	}
+
+private:
+	ReplacedTexture &tex_;
+	LimitedWaitable *waitable_;
+};
+
+bool ReplacedTexture::IsReady(double budget) {
+	lastUsed_ = time_now_d();
+	if (threadWaitable_ && !threadWaitable_->WaitFor(budget)) {
+		return false;
+	}
+
+	// Loaded already, or not yet on a thread?
+	if (!levelData_.empty())
+		return true;
+	// Let's not even start a new texture if we're already behind.
+	if (budget < 0.0)
+		return false;
+
+	if (g_Config.bReplaceTexturesAllowLate) {
+		threadWaitable_ = new LimitedWaitable();
+		g_threadManager.EnqueueTask(new ReplacedTextureTask(*this, threadWaitable_));
+
+		if (threadWaitable_->WaitFor(budget)) {
+			// If we finished all the levels, we're done.
+			return !levelData_.empty();
+		}
+	} else {
+		Prepare();
+		return true;
+	}
+
+	// Still pending on thread.
+	return false;
+}
+
+void ReplacedTexture::Prepare() {
+	std::unique_lock<std::mutex> lock(mutex_);
+	if (cancelPrepare_)
+		return;
+
+	levelData_.resize(MaxLevel() + 1);
+	for (int i = 0; i <= MaxLevel(); ++i) {
+		if (cancelPrepare_)
+			break;
+		PrepareData(i);
+	}
+
+	if (!cancelPrepare_ && threadWaitable_)
+		threadWaitable_->Notify();
+}
+
+void ReplacedTexture::PrepareData(int level) {
 	_assert_msg_((size_t)level < levels_.size(), "Invalid miplevel");
-	_assert_msg_(out != nullptr && rowPitch > 0, "Invalid out/pitch");
 
 	const ReplacedTextureLevel &info = levels_[level];
+	std::vector<uint8_t> &out = levelData_[level];
 
 	FILE *fp = File::OpenCFile(info.file, "rb");
 	if (!fp) {
-		return false;
+		// Leaving the data sized at zero means failure.
+		return;
 	}
 
 	auto imageType = Identify(fp);
@@ -751,29 +897,37 @@ bool ReplacedTexture::Load(int level, void *out, int rowPitch) {
 		if (!zim) {
 			ERROR_LOG(G3D, "Failed to allocate memory for texture replacement");
 			fclose(fp);
-			return false;
+			return;
 		}
 
 		if (fread(&zim[0], 1, zimSize, fp) != zimSize) {
 			ERROR_LOG(G3D, "Could not load texture replacement: %s - failed to read ZIM", info.file.c_str());
 			fclose(fp);
-			return false;
+			return;
 		}
 
 		int w, h, f;
 		uint8_t *image;
-		const int MIN_LINES_PER_THREAD = 4;
+
 		if (LoadZIMPtr(&zim[0], zimSize, &w, &h, &f, &image)) {
-			ParallelRangeLoop(&g_threadManager, [&](int l, int h) {
-				for (int y = l; y < h; ++y) {
-					memcpy((uint8_t *)out + rowPitch * y, image + w * 4 * y, w * 4);
+			if (w > info.w || h > info.h) {
+				ERROR_LOG(G3D, "Texture replacement changed since header read: %s", info.file.c_str());
+				fclose(fp);
+				return;
+			}
+
+			out.resize(info.w * info.h * 4);
+			if (w == info.w) {
+				memcpy(&out[0], image, info.w * 4 * info.h);
+			} else {
+				for (int y = 0; y < h; ++y) {
+					memcpy(&out[info.w * 4 * y], image + w * 4 * y, w * 4);
 				}
-			}, 0, h, MIN_LINES_PER_THREAD);
+			}
 			free(image);
 		}
 
-		// This will only check the hashed bits.
-		CheckAlphaResult res = CheckAlphaRGBA8888Basic((u32 *)out, rowPitch / sizeof(u32), w, h);
+		CheckAlphaResult res = CheckAlpha32Rect((u32 *)&out[0], info.w, w, h, 0xFF000000);
 		if (res == CHECKALPHA_ANY || level == 0) {
 			alphaStatus_ = ReplacedTextureAlpha(res);
 		}
@@ -784,7 +938,12 @@ bool ReplacedTexture::Load(int level, void *out, int rowPitch) {
 		if (!png_image_begin_read_from_stdio(&png, fp)) {
 			ERROR_LOG(G3D, "Could not load texture replacement info: %s - %s", info.file.c_str(), png.message);
 			fclose(fp);
-			return false;
+			return;
+		}
+		if (png.width > (uint32_t)info.w || png.height > (uint32_t)info.h) {
+			ERROR_LOG(G3D, "Texture replacement changed since header read: %s", info.file.c_str());
+			fclose(fp);
+			return;
 		}
 
 		bool checkedAlpha = false;
@@ -797,16 +956,18 @@ bool ReplacedTexture::Load(int level, void *out, int rowPitch) {
 		}
 		png.format = PNG_FORMAT_RGBA;
 
-		if (!png_image_finish_read(&png, nullptr, out, rowPitch, nullptr)) {
+		out.resize(info.w * info.h * 4);
+		if (!png_image_finish_read(&png, nullptr, &out[0], info.w * 4, nullptr)) {
 			ERROR_LOG(G3D, "Could not load texture replacement: %s - %s", info.file.c_str(), png.message);
 			fclose(fp);
-			return false;
+			out.resize(0);
+			return;
 		}
 		png_image_free(&png);
 
 		if (!checkedAlpha) {
 			// This will only check the hashed bits.
-			CheckAlphaResult res = CheckAlphaRGBA8888Basic((u32 *)out, rowPitch / sizeof(u32), png.width, png.height);
+			CheckAlphaResult res = CheckAlpha32Rect((u32 *)&out[0], info.w, png.width, png.height, 0xFF000000);
 			if (res == CHECKALPHA_ANY || level == 0) {
 				alphaStatus_ = ReplacedTextureAlpha(res);
 			}
@@ -814,6 +975,49 @@ bool ReplacedTexture::Load(int level, void *out, int rowPitch) {
 	}
 
 	fclose(fp);
+}
+
+void ReplacedTexture::PurgeIfOlder(double t) {
+	if (lastUsed_ < t && (!threadWaitable_ || threadWaitable_->WaitFor(0.0))) {
+		levelData_.clear();
+	}
+}
+
+ReplacedTexture::~ReplacedTexture() {
+	if (threadWaitable_) {
+		cancelPrepare_ = true;
+
+		std::unique_lock<std::mutex> lock(mutex_);
+		threadWaitable_->WaitAndRelease();
+		threadWaitable_ = nullptr;
+	}
+}
+
+bool ReplacedTexture::Load(int level, void *out, int rowPitch) {
+	_assert_msg_((size_t)level < levels_.size(), "Invalid miplevel");
+	_assert_msg_(out != nullptr && rowPitch > 0, "Invalid out/pitch");
+
+	if (levelData_.empty())
+		return false;
+
+	const ReplacedTextureLevel &info = levels_[level];
+	const std::vector<uint8_t> &data = levelData_[level];
+
+	if (data.empty())
+		return false;
+	_assert_msg_(data.size() == info.w * info.h * 4, "Data has wrong size");
+
+	if (rowPitch == info.w * 4) {
+		ParallelMemcpy(&g_threadManager, out, &data[0], info.w * 4 * info.h);
+	} else {
+		const int MIN_LINES_PER_THREAD = 4;
+		ParallelRangeLoop(&g_threadManager, [&](int l, int h) {
+			for (int y = l; y < h; ++y) {
+				memcpy((uint8_t *)out + rowPitch * y, &data[0] + info.w * 4 * y, info.w * 4);
+			}
+		}, 0, info.h, MIN_LINES_PER_THREAD);
+	}
+
 	return true;
 }
 

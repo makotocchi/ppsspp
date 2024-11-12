@@ -18,28 +18,36 @@
 #include <cmath>
 #include <algorithm>
 
+#include "Common/Common.h"
 #include "Common/CPUDetect.h"
 #include "Common/Math/math_util.h"
 #include "Common/MemoryUtil.h"
+#include "Common/Profiler/Profiler.h"
 #include "Core/Config.h"
 #include "GPU/GPUState.h"
 #include "GPU/Common/DrawEngineCommon.h"
 #include "GPU/Common/VertexDecoderCommon.h"
 #include "GPU/Common/SplineCommon.h"
+#include "GPU/Common/TextureDecoder.h"
 #include "GPU/Debugger/Debugger.h"
-#include "GPU/Software/TransformUnit.h"
+#include "GPU/Software/BinManager.h"
 #include "GPU/Software/Clipper.h"
+#include "GPU/Software/FuncId.h"
 #include "GPU/Software/Lighting.h"
+#include "GPU/Software/Rasterizer.h"
 #include "GPU/Software/RasterizerRectangle.h"
+#include "GPU/Software/TransformUnit.h"
 
 #define TRANSFORM_BUF_SIZE (65536 * 48)
 
 TransformUnit::TransformUnit() {
-	buf = (u8 *)AllocateMemoryPages(TRANSFORM_BUF_SIZE, MEM_PROT_READ | MEM_PROT_WRITE);
+	decoded_ = (u8 *)AllocateMemoryPages(TRANSFORM_BUF_SIZE, MEM_PROT_READ | MEM_PROT_WRITE);
+	binner_ = new BinManager();
 }
 
 TransformUnit::~TransformUnit() {
-	FreeMemoryPages(buf, DECODED_VERTEX_BUFFER_SIZE);
+	FreeMemoryPages(decoded_, DECODED_VERTEX_BUFFER_SIZE);
+	delete binner_;
 }
 
 SoftwareDrawEngine::SoftwareDrawEngine() {
@@ -54,6 +62,7 @@ SoftwareDrawEngine::~SoftwareDrawEngine() {
 }
 
 void SoftwareDrawEngine::DispatchFlush() {
+	transformUnit.Flush("debug");
 }
 
 void SoftwareDrawEngine::DispatchSubmitPrim(void *verts, void *inds, GEPrimitiveType prim, int vertexCount, u32 vertTypeID, int cullMode, int *bytesRead) {
@@ -61,39 +70,68 @@ void SoftwareDrawEngine::DispatchSubmitPrim(void *verts, void *inds, GEPrimitive
 	transformUnit.SubmitPrimitive(verts, inds, prim, vertexCount, vertTypeID, bytesRead, this);
 }
 
+void SoftwareDrawEngine::DispatchSubmitImm(void *verts, void *inds, GEPrimitiveType prim, int vertexCount, u32 vertTypeID, int cullMode, int *bytesRead) {
+	_assert_msg_(cullMode == gstate.getCullMode(), "Mixed cull mode not supported.");
+	// TODO: For now, just setting all dirty.
+	transformUnit.SetDirty(SoftDirty(-1));
+	transformUnit.SubmitPrimitive(verts, inds, prim, vertexCount, vertTypeID, bytesRead, this);
+	// TODO: Should really clear, but the vertex type is faked so things might need resetting...
+	transformUnit.SetDirty(SoftDirty(-1));
+}
+
 VertexDecoder *SoftwareDrawEngine::FindVertexDecoder(u32 vtype) {
 	const u32 vertTypeID = (vtype & 0xFFFFFF) | (gstate.getUVGenMode() << 24);
 	return DrawEngineCommon::GetVertexDecoder(vertTypeID);
 }
 
-WorldCoords TransformUnit::ModelToWorld(const ModelCoords& coords)
-{
-	Mat3x3<float> world_matrix(gstate.worldMatrix);
-	return WorldCoords(world_matrix * coords) + Vec3<float>(gstate.worldMatrix[9], gstate.worldMatrix[10], gstate.worldMatrix[11]);
+WorldCoords TransformUnit::ModelToWorld(const ModelCoords &coords) {
+	return Vec3ByMatrix43(coords, gstate.worldMatrix);
 }
 
-WorldCoords TransformUnit::ModelToWorldNormal(const ModelCoords& coords)
-{
-	Mat3x3<float> world_matrix(gstate.worldMatrix);
-	return WorldCoords(world_matrix * coords);
+WorldCoords TransformUnit::ModelToWorldNormal(const ModelCoords &coords) {
+	return Norm3ByMatrix43(coords, gstate.worldMatrix);
 }
 
-ViewCoords TransformUnit::WorldToView(const WorldCoords& coords)
-{
-	Mat3x3<float> view_matrix(gstate.viewMatrix);
-	return ViewCoords(view_matrix * coords) + Vec3<float>(gstate.viewMatrix[9], gstate.viewMatrix[10], gstate.viewMatrix[11]);
+ViewCoords TransformUnit::WorldToView(const WorldCoords &coords) {
+	return Vec3ByMatrix43(coords, gstate.viewMatrix);
 }
 
-ClipCoords TransformUnit::ViewToClip(const ViewCoords& coords)
-{
-	Vec4<float> coords4(coords.x, coords.y, coords.z, 1.0f);
-	Mat4x4<float> projection_matrix(gstate.projMatrix);
-	return ClipCoords(projection_matrix * coords4);
+ClipCoords TransformUnit::ViewToClip(const ViewCoords &coords) {
+	return Vec3ByMatrix44(coords, gstate.projMatrix);
 }
 
-static inline ScreenCoords ClipToScreenInternal(const ClipCoords& coords, bool *outside_range_flag) {
+template <bool depthClamp, bool writeOutsideFlag>
+static ScreenCoords ClipToScreenInternal(Vec3f scaled, const ClipCoords &coords, bool *outside_range_flag) {
 	ScreenCoords ret;
 
+	// Account for rounding for X and Y.
+	// TODO: Validate actual rounding range.
+	const float SCREEN_BOUND = 4095.0f + (15.5f / 16.0f);
+
+	// This matches hardware tests - depth is clamped when this flag is on.
+	if (depthClamp) {
+		// Note: if the depth is clipped (z/w <= -1.0), the outside_range_flag should NOT be set, even for x and y.
+		if (writeOutsideFlag && coords.z > -coords.w && (scaled.x >= SCREEN_BOUND || scaled.y >= SCREEN_BOUND || scaled.x < 0 || scaled.y < 0)) {
+			*outside_range_flag = true;
+		}
+
+		if (scaled.z < 0.f)
+			scaled.z = 0.f;
+		else if (scaled.z > 65535.0f)
+			scaled.z = 65535.0f;
+	} else if (writeOutsideFlag && (scaled.x > SCREEN_BOUND || scaled.y >= SCREEN_BOUND || scaled.x < 0 || scaled.y < 0)) {
+		*outside_range_flag = true;
+	}
+
+	// 16 = 0xFFFF / 4095.9375
+	// Round up at 0.625 to the nearest subpixel.
+	static_assert(SCREEN_SCALE_FACTOR == 16, "Currently only supports scale 16");
+	int x = (int)(scaled.x * 16.0f + 0.375f - gstate.getOffsetX16());
+	int y = (int)(scaled.y * 16.0f + 0.375f - gstate.getOffsetY16());
+	return ScreenCoords(x, y, scaled.z);
+}
+
+static inline ScreenCoords ClipToScreenInternal(const ClipCoords &coords, bool *outside_range_flag) {
 	// Parameters here can seem invalid, but the PSP is fine with negative viewport widths etc.
 	// The checking that OpenGL and D3D do is actually quite superflous as the calculations still "work"
 	// with some pretty crazy inputs, which PSP games are happy to do at times.
@@ -108,78 +146,152 @@ static inline ScreenCoords ClipToScreenInternal(const ClipCoords& coords, bool *
 	float y = coords.y * yScale / coords.w + yCenter;
 	float z = coords.z * zScale / coords.w + zCenter;
 
-	// Account for rounding for X and Y.
-	// TODO: Validate actual rounding range.
-	const float SCREEN_BOUND = 4095.0f + (15.5f / 16.0f);
-
-	// This matches hardware tests - depth is clamped when this flag is on.
 	if (gstate.isDepthClampEnabled()) {
-		// Note: if the depth is clipped (z/w <= -1.0), the outside_range_flag should NOT be set, even for x and y.
-		if (outside_range_flag && coords.z > -coords.w && (x >= SCREEN_BOUND || y >= SCREEN_BOUND || x < 0 || y < 0)) {
-			*outside_range_flag = true;
-		}
-
-		if (z < 0.f)
-			z = 0.f;
-		else if (z > 65535.0f)
-			z = 65535.0f;
-	} else if (outside_range_flag && (x > SCREEN_BOUND || y >= SCREEN_BOUND || x < 0 || y < 0)) {
-		*outside_range_flag = true;
+		if (outside_range_flag)
+			return ClipToScreenInternal<true, true>(Vec3f(x, y, z), coords, outside_range_flag);
+		return ClipToScreenInternal<true, false>(Vec3f(x, y, z), coords, outside_range_flag);
 	}
-
-	// 16 = 0xFFFF / 4095.9375
-	// Round up at 0.625 to the nearest subpixel.
-	return ScreenCoords(x * 16.0f + 0.375f, y * 16.0f + 0.375f, z);
+	if (outside_range_flag)
+		return ClipToScreenInternal<false, true>(Vec3f(x, y, z), coords, outside_range_flag);
+	return ClipToScreenInternal<false, false>(Vec3f(x, y, z), coords, outside_range_flag);
 }
 
-ScreenCoords TransformUnit::ClipToScreen(const ClipCoords& coords)
-{
+ScreenCoords TransformUnit::ClipToScreen(const ClipCoords &coords) {
 	return ClipToScreenInternal(coords, nullptr);
 }
 
-DrawingCoords TransformUnit::ScreenToDrawing(const ScreenCoords& coords)
-{
-	DrawingCoords ret;
-	// TODO: What to do when offset > coord?
-	ret.x = ((s32)coords.x - gstate.getOffsetX16()) / 16;
-	ret.y = ((s32)coords.y - gstate.getOffsetY16()) / 16;
-	ret.z = coords.z;
-	return ret;
-}
-
-ScreenCoords TransformUnit::DrawingToScreen(const DrawingCoords& coords)
-{
+ScreenCoords TransformUnit::DrawingToScreen(const DrawingCoords &coords, u16 z) {
 	ScreenCoords ret;
-	ret.x = (u32)coords.x * 16 + gstate.getOffsetX16();
-	ret.y = (u32)coords.y * 16 + gstate.getOffsetY16();
-	ret.z = coords.z;
+	ret.x = (u32)coords.x * SCREEN_SCALE_FACTOR;
+	ret.y = (u32)coords.y * SCREEN_SCALE_FACTOR;
+	ret.z = z;
 	return ret;
 }
 
-VertexData TransformUnit::ReadVertex(VertexReader& vreader)
-{
+enum class MatrixMode {
+	NONE = 0,
+	POS_TO_CLIP = 1,
+	POS_TO_VIEW = 2,
+	WORLD_TO_CLIP = 3,
+};
+
+struct TransformState {
+	Lighting::State lightingState;
+
+	float fogEnd;
+	float fogSlope;
+
+	float matrix[16];
+	Vec3f screenScale;
+	Vec3f screenAdd;
+
+	ScreenCoords(*roundToScreen)(Vec3f scaled, const ClipCoords &coords, bool *outside_range_flag);
+
+	struct {
+		bool enableTransform : 1;
+		bool enableLighting : 1;
+		bool enableFog : 1;
+		bool readUV : 1;
+		bool readWeights : 1;
+		bool negateNormals : 1;
+		uint8_t uvGenMode : 2;
+		uint8_t matrixMode : 2;
+	};
+};
+
+void ComputeTransformState(TransformState *state, const VertexReader &vreader) {
+	state->enableTransform = !gstate.isModeThrough();
+	state->enableLighting = gstate.isLightingEnabled();
+	state->enableFog = gstate.isFogEnabled();
+	state->readUV = !gstate.isModeClear() && gstate.isTextureMapEnabled() && vreader.hasUV();
+	state->readWeights = vertTypeIsSkinningEnabled(gstate.vertType) && state->enableTransform;
+	state->negateNormals = gstate.areNormalsReversed();
+
+	state->uvGenMode = gstate.getUVGenMode();
+
+	if (state->enableTransform) {
+		if (state->enableFog) {
+			state->fogEnd = getFloat24(gstate.fog1);
+			state->fogSlope = getFloat24(gstate.fog2);
+			// Same fixup as in ShaderManagerGLES.cpp
+			if (my_isnanorinf(state->fogEnd)) {
+				state->fogEnd = std::signbit(state->fogEnd) ? -INFINITY : INFINITY;
+			}
+			if (my_isnanorinf(state->fogSlope)) {
+				state->fogSlope = std::signbit(state->fogSlope) ? -INFINITY : INFINITY;
+			}
+		}
+
+		bool canSkipWorldPos = true;
+		bool canSkipViewPos = !state->enableFog;
+		if (state->enableLighting) {
+			Lighting::ComputeState(&state->lightingState, vreader.hasColor0());
+			for (int i = 0; i < 4; ++i) {
+				if (!state->lightingState.lights[i].enabled)
+					continue;
+				if (!state->lightingState.lights[i].directional)
+					canSkipWorldPos = false;
+			}
+		}
+
+		float world[16];
+		float view[16];
+		if (canSkipWorldPos && canSkipViewPos) {
+			state->matrixMode = (uint8_t)MatrixMode::POS_TO_CLIP;
+
+			ConvertMatrix4x3To4x4(world, gstate.worldMatrix);
+			ConvertMatrix4x3To4x4(view, gstate.viewMatrix);
+
+			float worldview[16];
+			Matrix4ByMatrix4(worldview, world, view);
+			Matrix4ByMatrix4(state->matrix, worldview, gstate.projMatrix);
+		} else if (canSkipWorldPos) {
+			state->matrixMode = (uint8_t)MatrixMode::POS_TO_VIEW;
+
+			ConvertMatrix4x3To4x4(world, gstate.worldMatrix);
+			ConvertMatrix4x3To4x4(view, gstate.viewMatrix);
+
+			Matrix4ByMatrix4(state->matrix, world, view);
+		} else if (canSkipViewPos) {
+			state->matrixMode = (uint8_t)MatrixMode::WORLD_TO_CLIP;
+
+			ConvertMatrix4x3To4x4(view, gstate.viewMatrix);
+			Matrix4ByMatrix4(state->matrix, view, gstate.projMatrix);
+		} else {
+			state->matrixMode = (uint8_t)MatrixMode::NONE;
+		}
+
+		state->screenScale = Vec3f(gstate.getViewportXScale(), gstate.getViewportYScale(), gstate.getViewportZScale());
+		state->screenAdd = Vec3f(gstate.getViewportXCenter(), gstate.getViewportYCenter(), gstate.getViewportZCenter());
+	}
+
+	if (gstate.isDepthClampEnabled())
+		state->roundToScreen = &ClipToScreenInternal<true, true>;
+	else
+		state->roundToScreen = &ClipToScreenInternal<false, true>;
+}
+
+VertexData TransformUnit::ReadVertex(VertexReader &vreader, const TransformState &state, bool &outside_range_flag) {
+	PROFILE_THIS_SCOPE("read_vert");
 	VertexData vertex;
 
-	float pos[3];
+	ModelCoords pos;
 	// VertexDecoder normally scales z, but we want it unscaled.
-	vreader.ReadPosThroughZ16(pos);
+	vreader.ReadPosThroughZ16(pos.AsArray());
 
-	if (!gstate.isModeClear() && gstate.isTextureMapEnabled() && vreader.hasUV()) {
-		float uv[2];
-		vreader.ReadUV(uv);
-		vertex.texturecoords = Vec2<float>(uv[0], uv[1]);
+	if (state.readUV) {
+		vreader.ReadUV(vertex.texturecoords.AsArray());
 	}
 
+	Vec3<float> normal;
 	if (vreader.hasNormal()) {
-		float normal[3];
-		vreader.ReadNrm(normal);
-		vertex.normal = Vec3<float>(normal[0], normal[1], normal[2]);
+		vreader.ReadNrm(normal.AsArray());
 
-		if (gstate.areNormalsReversed())
-			vertex.normal = -vertex.normal;
+		if (state.negateNormals)
+			normal = -normal;
 	}
 
-	if (vertTypeIsSkinningEnabled(gstate.vertType) && !gstate.isModeThrough()) {
+	if (state.readWeights) {
 		float W[8] = { 1.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
 		vreader.ReadWeights(W);
 
@@ -187,70 +299,101 @@ VertexData TransformUnit::ReadVertex(VertexReader& vreader)
 		Vec3<float> tmpnrm(0.f, 0.f, 0.f);
 
 		for (int i = 0; i < vertTypeGetNumBoneWeights(gstate.vertType); ++i) {
-			Mat3x3<float> bone(&gstate.boneMatrix[12*i]);
-			tmppos += (bone * ModelCoords(pos[0], pos[1], pos[2]) + Vec3<float>(gstate.boneMatrix[12*i+9], gstate.boneMatrix[12*i+10], gstate.boneMatrix[12*i+11])) * W[i];
-			if (vreader.hasNormal())
-				tmpnrm += (bone * vertex.normal) * W[i];
+			Vec3<float> step = Vec3ByMatrix43(pos, gstate.boneMatrix + i * 12);
+			tmppos += step * W[i];
+			if (vreader.hasNormal()) {
+				step = Norm3ByMatrix43(normal, gstate.boneMatrix + i * 12);
+				tmpnrm += step * W[i];
+			}
 		}
 
-		pos[0] = tmppos.x;
-		pos[1] = tmppos.y;
-		pos[2] = tmppos.z;
+		pos = tmppos;
 		if (vreader.hasNormal())
-			vertex.normal = tmpnrm;
+			normal = tmpnrm;
 	}
 
 	if (vreader.hasColor0()) {
+#ifdef _M_SSE
+		vreader.ReadColor0_8888((u8 *)vertex.color0.AsArray());
+		vertex.color0.ivec = _mm_unpacklo_epi8(vertex.color0.ivec, _mm_setzero_si128());
+		vertex.color0.ivec = _mm_unpacklo_epi16(vertex.color0.ivec, _mm_setzero_si128());
+#else
 		float col[4];
 		vreader.ReadColor0(col);
 		vertex.color0 = Vec4<int>(col[0]*255, col[1]*255, col[2]*255, col[3]*255);
+#endif
 	} else {
-		vertex.color0 = Vec4<int>(gstate.getMaterialAmbientR(), gstate.getMaterialAmbientG(), gstate.getMaterialAmbientB(), gstate.getMaterialAmbientA());
+		vertex.color0 = Vec4<int>::FromRGBA(gstate.getMaterialAmbientRGBA());
 	}
 
-	if (vreader.hasColor1()) {
-		float col[3];
-		vreader.ReadColor1(col);
-		vertex.color1 = Vec3<int>(col[0]*255, col[1]*255, col[2]*255);
-	} else {
-		vertex.color1 = Vec3<int>(0, 0, 0);
-	}
+#ifdef _M_SSE
+	vertex.color1 = _mm_setzero_si128();
+#else
+	vertex.color1 = Vec3<int>(0, 0, 0);
+#endif
 
-	if (!gstate.isModeThrough()) {
-		vertex.modelpos = ModelCoords(pos[0], pos[1], pos[2]);
-		vertex.worldpos = WorldCoords(TransformUnit::ModelToWorld(vertex.modelpos));
-		ModelCoords viewpos = TransformUnit::WorldToView(vertex.worldpos);
-		vertex.clippos = ClipCoords(TransformUnit::ViewToClip(viewpos));
-		if (gstate.isFogEnabled()) {
-			float fog_end = getFloat24(gstate.fog1);
-			float fog_slope = getFloat24(gstate.fog2);
-			// Same fixup as in ShaderManagerGLES.cpp
-			if (my_isnanorinf(fog_end)) {
-				// Not really sure what a sensible value might be, but let's try 64k.
-				fog_end = std::signbit(fog_end) ? -65535.0f : 65535.0f;
-			}
-			if (my_isnanorinf(fog_slope)) {
-				fog_slope = std::signbit(fog_slope) ? -65535.0f : 65535.0f;
-			}
-			vertex.fogdepth = (viewpos.z + fog_end) * fog_slope;
+	if (state.enableTransform) {
+		WorldCoords worldpos;
+		ModelCoords viewpos;
+
+		switch (MatrixMode(state.matrixMode)) {
+		case MatrixMode::NONE:
+			worldpos = TransformUnit::ModelToWorld(pos);
+			viewpos = TransformUnit::WorldToView(worldpos);
+			vertex.clippos = TransformUnit::ViewToClip(viewpos);
+			break;
+
+		case MatrixMode::POS_TO_CLIP:
+			vertex.clippos = Vec3ByMatrix44(pos, state.matrix);
+			break;
+
+		case MatrixMode::POS_TO_VIEW:
+#ifdef _M_SSE
+			viewpos = Vec3ByMatrix44(pos, state.matrix).vec;
+#else
+			viewpos = Vec3ByMatrix44(pos, state.matrix).rgb();
+#endif
+			vertex.clippos = TransformUnit::ViewToClip(viewpos);
+			break;
+
+		case MatrixMode::WORLD_TO_CLIP:
+			worldpos = TransformUnit::ModelToWorld(pos);
+			vertex.clippos = Vec3ByMatrix44(worldpos, state.matrix);
+			break;
+		}
+
+		Vec3f screenScaled;
+#ifdef _M_SSE
+		screenScaled.vec = _mm_mul_ps(vertex.clippos.vec, state.screenScale.vec);
+		screenScaled.vec = _mm_div_ps(screenScaled.vec, _mm_shuffle_ps(vertex.clippos.vec, vertex.clippos.vec, _MM_SHUFFLE(3, 3, 3, 3)));
+		screenScaled.vec = _mm_add_ps(screenScaled.vec, state.screenAdd.vec);
+#else
+		screenScaled = vertex.clippos.xyz() * state.screenScale / vertex.clippos.w + state.screenAdd;
+#endif
+		vertex.screenpos = state.roundToScreen(screenScaled, vertex.clippos, &outside_range_flag);
+		if (outside_range_flag)
+			return vertex;
+
+		if (state.enableFog) {
+			vertex.fogdepth = (viewpos.z + state.fogEnd) * state.fogSlope;
 		} else {
 			vertex.fogdepth = 1.0f;
 		}
-		vertex.screenpos = ClipToScreenInternal(vertex.clippos, &outside_range_flag);
 
+		Vec3<float> worldnormal;
 		if (vreader.hasNormal()) {
-			vertex.worldnormal = TransformUnit::ModelToWorldNormal(vertex.normal);
-			vertex.worldnormal /= vertex.worldnormal.Length();
+			worldnormal = TransformUnit::ModelToWorldNormal(normal);
+			worldnormal.NormalizeOr001();
 		} else {
-			vertex.worldnormal = Vec3<float>(0.0f, 0.0f, 1.0f);
+			worldnormal = Vec3<float>(0.0f, 0.0f, 1.0f);
 		}
 
 		// Time to generate some texture coords.  Lighting will handle shade mapping.
-		if (gstate.getUVGenMode() == GE_TEXMAP_TEXTURE_MATRIX) {
+		if (state.uvGenMode == GE_TEXMAP_TEXTURE_MATRIX) {
 			Vec3f source;
 			switch (gstate.getUVProjMode()) {
 			case GE_PROJMAP_POSITION:
-				source = vertex.modelpos;
+				source = pos;
 				break;
 
 			case GE_PROJMAP_UV:
@@ -258,11 +401,11 @@ VertexData TransformUnit::ReadVertex(VertexReader& vreader)
 				break;
 
 			case GE_PROJMAP_NORMALIZED_NORMAL:
-				source = vertex.normal.NormalizedOr001(cpu_info.bSSE4_1);
+				source = normal.NormalizedOr001(cpu_info.bSSE4_1);
 				break;
 
 			case GE_PROJMAP_NORMAL:
-				source = vertex.normal;
+				source = normal;
 				break;
 
 			default:
@@ -272,16 +415,19 @@ VertexData TransformUnit::ReadVertex(VertexReader& vreader)
 			}
 
 			// TODO: What about uv scale and offset?
-			Mat3x3<float> tgen(gstate.tgenMatrix);
-			Vec3<float> stq = tgen * source + Vec3<float>(gstate.tgenMatrix[9], gstate.tgenMatrix[10], gstate.tgenMatrix[11]);
+			Vec3<float> stq = Vec3ByMatrix43(source, gstate.tgenMatrix);
 			float z_recip = 1.0f / stq.z;
 			vertex.texturecoords = Vec2f(stq.x * z_recip, stq.y * z_recip);
+		} else if (state.uvGenMode == GE_TEXMAP_ENVIRONMENT_MAP) {
+			Lighting::GenerateLightST(vertex, worldnormal);
 		}
 
-		Lighting::Process(vertex, vreader.hasColor0());
+		PROFILE_THIS_SCOPE("light");
+		if (state.enableLighting)
+			Lighting::Process(vertex, worldpos, worldnormal, state.lightingState);
 	} else {
-		vertex.screenpos.x = (int)(pos[0] * 16) + gstate.getOffsetX16();
-		vertex.screenpos.y = (int)(pos[1] * 16) + gstate.getOffsetY16();
+		vertex.screenpos.x = (int)(pos[0] * SCREEN_SCALE_FACTOR);
+		vertex.screenpos.y = (int)(pos[1] * SCREEN_SCALE_FACTOR);
 		vertex.screenpos.z = pos[2];
 		vertex.clippos.w = 1.f;
 		vertex.fogdepth = 1.f;
@@ -290,15 +436,17 @@ VertexData TransformUnit::ReadVertex(VertexReader& vreader)
 	return vertex;
 }
 
-#define START_OPEN_U 1
-#define END_OPEN_U 2
-#define START_OPEN_V 4
-#define END_OPEN_V 8
+void TransformUnit::SetDirty(SoftDirty flags) {
+	binner_->SetDirty(flags);
+}
+SoftDirty TransformUnit::GetDirty() {
+	return binner_->GetDirty();
+}
 
-struct SplinePatch {
-	VertexData points[16];
-	int type;
-	int pad[3];
+enum class CullType {
+	CW,
+	CCW,
+	OFF,
 };
 
 void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveType prim_type, int vertex_count, u32 vertex_type, int *bytesRead, SoftwareDrawEngine *drawEngine)
@@ -313,6 +461,12 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveTy
 	if (gstate_c.skipDrawReason & SKIPDRAW_SKIPFRAME) {
 		return;
 	}
+	// Throughmode never draws 8-bit primitives, maybe because they can't fully specify the screen?
+	if ((vertex_type & GE_VTYPE_THROUGH_MASK) != 0 && (vertex_type & GE_VTYPE_POS_MASK) == GE_VTYPE_POS_8BIT)
+		return;
+	// Vertices without position are just entirely culled.
+	if ((vertex_type & GE_VTYPE_POS_MASK) == 0)
+		return;
 
 	u16 index_lower_bound = 0;
 	u16 index_upper_bound = vertex_count - 1;
@@ -320,9 +474,9 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveTy
 
 	if (indices)
 		GetIndexBounds(indices, vertex_count, vertex_type, &index_lower_bound, &index_upper_bound);
-	vdecoder.DecodeVerts(buf, vertices, index_lower_bound, index_upper_bound);
+	vdecoder.DecodeVerts(decoded_, vertices, index_lower_bound, index_upper_bound);
 
-	VertexReader vreader(buf, vtxfmt, vertex_type);
+	VertexReader vreader(decoded_, vtxfmt, vertex_type);
 
 	static VertexData data[4];  // Normally max verts per prim is 3, but we temporarily need 4 to detect rectangles from strips.
 	// This is the index of the next vert in data (or higher, may need modulus.)
@@ -348,11 +502,22 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveTy
 	// TODO: Do this in two passes - first process the vertices (before indexing/stripping),
 	// then resolve the indices. This lets us avoid transforming shared vertices twice.
 
+	binner_->UpdateState();
+
+	static TransformState transformState;
+	if (binner_->HasDirty(SoftDirty::LIGHT_ALL | SoftDirty::TRANSFORM_ALL)) {
+		ComputeTransformState(&transformState, vreader);
+		binner_->ClearDirty(SoftDirty::LIGHT_ALL | SoftDirty::TRANSFORM_ALL);
+	}
+
+	bool skipCull = !gstate.isCullEnabled() || gstate.isModeClear();
+	const CullType cullType = skipCull ? CullType::OFF : (gstate.getCullMode() ? CullType::CCW : CullType::CW);
+
+	bool outside_range_flag = false;
 	switch (prim_type) {
 	case GE_PRIM_POINTS:
 	case GE_PRIM_LINES:
 	case GE_PRIM_TRIANGLES:
-	case GE_PRIM_RECTANGLES:
 		{
 			for (int vtx = 0; vtx < vertex_count; ++vtx) {
 				if (indices) {
@@ -361,7 +526,7 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveTy
 					vreader.Goto(vtx);
 				}
 
-				data[data_index++] = ReadVertex(vreader);
+				data[data_index++] = ReadVertex(vreader, transformState, outside_range_flag);
 				if (data_index < vtcs_per_prim) {
 					// Keep reading.  Note: an incomplete prim will stay read for GE_PRIM_KEEP_PREVIOUS.
 					continue;
@@ -378,27 +543,23 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveTy
 				switch (prim_type) {
 				case GE_PRIM_TRIANGLES:
 				{
-					if (!gstate.isCullEnabled() || gstate.isModeClear()) {
-						Clipper::ProcessTriangle(data[0], data[1], data[2], data[2]);
-						Clipper::ProcessTriangle(data[2], data[1], data[0], data[2]);
-					} else if (!gstate.getCullMode()) {
-						Clipper::ProcessTriangle(data[2], data[1], data[0], data[2]);
+					if (cullType == CullType::OFF) {
+						Clipper::ProcessTriangle(data[0], data[1], data[2], data[2], *binner_);
+						Clipper::ProcessTriangle(data[2], data[1], data[0], data[2], *binner_);
+					} else if (cullType == CullType::CW) {
+						Clipper::ProcessTriangle(data[2], data[1], data[0], data[2], *binner_);
 					} else {
-						Clipper::ProcessTriangle(data[0], data[1], data[2], data[2]);
+						Clipper::ProcessTriangle(data[0], data[1], data[2], data[2], *binner_);
 					}
 					break;
 				}
 
-				case GE_PRIM_RECTANGLES:
-					Clipper::ProcessRect(data[0], data[1]);
-					break;
-
 				case GE_PRIM_LINES:
-					Clipper::ProcessLine(data[0], data[1]);
+					Clipper::ProcessLine(data[0], data[1], *binner_);
 					break;
 
 				case GE_PRIM_POINTS:
-					Clipper::ProcessPoint(data[0]);
+					Clipper::ProcessPoint(data[0], *binner_);
 					break;
 
 				default:
@@ -407,6 +568,48 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveTy
 			}
 			break;
 		}
+
+	case GE_PRIM_RECTANGLES:
+		for (int vtx = 0; vtx < vertex_count; ++vtx) {
+			if (indices) {
+				vreader.Goto(ConvertIndex(vtx) - index_lower_bound);
+			} else {
+				vreader.Goto(vtx);
+			}
+
+			data[data_index++] = ReadVertex(vreader, transformState, outside_range_flag);
+			if (outside_range_flag) {
+				outside_range_flag = false;
+				// Note: this is the post increment index.  If odd, we set the first vert.
+				if (data_index & 1) {
+					// Skip the next one and forget this one.
+					vtx++;
+					data_index--;
+				} else {
+					// Forget both of the last 2.
+					data_index -= 2;
+				}
+			}
+
+			if (data_index == 4 && gstate.isModeThrough() && cullType == CullType::OFF) {
+				if (Rasterizer::DetectRectangleThroughModeSlices(binner_->State(), data)) {
+					data[1] = data[3];
+					data_index = 2;
+				}
+			}
+
+			if (data_index == 4) {
+				Clipper::ProcessRect(data[0], data[1], *binner_);
+				Clipper::ProcessRect(data[2], data[3], *binner_);
+				data_index = 0;
+			}
+		}
+
+		if (data_index >= 2) {
+			Clipper::ProcessRect(data[0], data[1], *binner_);
+			data_index -= 2;
+		}
+		break;
 
 	case GE_PRIM_LINE_STRIP:
 		{
@@ -420,7 +623,7 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveTy
 					vreader.Goto(vtx);
 				}
 
-				data[(data_index++) & 1] = ReadVertex(vreader);
+				data[(data_index++) & 1] = ReadVertex(vreader, transformState, outside_range_flag);
 				if (outside_range_flag) {
 					// Drop all primitives containing the current vertex
 					skip_count = 2;
@@ -432,7 +635,7 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveTy
 					--skip_count;
 				} else {
 					// We already incremented data_index, so data_index & 1 is previous one.
-					Clipper::ProcessLine(data[data_index & 1], data[(data_index & 1) ^ 1]);
+					Clipper::ProcessLine(data[data_index & 1], data[(data_index & 1) ^ 1], *binner_);
 				}
 			}
 			break;
@@ -445,7 +648,7 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveTy
 
 			// If index count == 4, check if we can convert to a rectangle.
 			// This is for Darkstalkers (and should speed up many 2D games).
-			if (vertex_count == 4 && gstate.isModeThrough()) {
+			if (data_index == 0 && vertex_count == 4 && cullType == CullType::OFF) {
 				for (int vtx = 0; vtx < 4; ++vtx) {
 					if (indices) {
 						vreader.Goto(ConvertIndex(vtx) - index_lower_bound);
@@ -453,16 +656,18 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveTy
 					else {
 						vreader.Goto(vtx);
 					}
-					data[vtx] = ReadVertex(vreader);
+					data[vtx] = ReadVertex(vreader, transformState, outside_range_flag);
 				}
 
 				// If a strip is effectively a rectangle, draw it as such!
-				if (Rasterizer::DetectRectangleFromThroughModeStrip(data)) {
-					Clipper::ProcessRect(data[0], data[3]);
+				int tl = -1, br = -1;
+				if (!outside_range_flag && Rasterizer::DetectRectangleFromStrip(binner_->State(), data, &tl, &br)) {
+					Clipper::ProcessRect(data[tl], data[br], *binner_);
 					break;
 				}
 			}
 
+			outside_range_flag = false;
 			for (int vtx = 0; vtx < vertex_count; ++vtx) {
 				if (indices) {
 					vreader.Goto(ConvertIndex(vtx) - index_lower_bound);
@@ -471,7 +676,7 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveTy
 				}
 
 				int provoking_index = (data_index++) % 3;
-				data[provoking_index] = ReadVertex(vreader);
+				data[provoking_index] = ReadVertex(vreader, transformState, outside_range_flag);
 				if (outside_range_flag) {
 					// Drop all primitives containing the current vertex
 					skip_count = 2;
@@ -484,15 +689,15 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveTy
 					continue;
 				}
 
-				if (!gstate.isCullEnabled() || gstate.isModeClear()) {
-					Clipper::ProcessTriangle(data[0], data[1], data[2], data[provoking_index]);
-					Clipper::ProcessTriangle(data[2], data[1], data[0], data[provoking_index]);
-				} else if ((!gstate.getCullMode()) ^ ((data_index - 1) % 2)) {
+				if (cullType == CullType::OFF) {
+					Clipper::ProcessTriangle(data[0], data[1], data[2], data[provoking_index], *binner_);
+					Clipper::ProcessTriangle(data[2], data[1], data[0], data[provoking_index], *binner_);
+				} else if ((!(int)cullType) ^ ((data_index - 1) % 2)) {
 					// We need to reverse the vertex order for each second primitive,
 					// but we additionally need to do that for every primitive if CCW cullmode is used.
-					Clipper::ProcessTriangle(data[2], data[1], data[0], data[provoking_index]);
+					Clipper::ProcessTriangle(data[2], data[1], data[0], data[provoking_index], *binner_);
 				} else {
-					Clipper::ProcessTriangle(data[0], data[1], data[2], data[provoking_index]);
+					Clipper::ProcessTriangle(data[0], data[1], data[2], data[provoking_index], *binner_);
 				}
 			}
 			break;
@@ -512,11 +717,33 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveTy
 				} else {
 					vreader.Goto(0);
 				}
-				data[0] = ReadVertex(vreader);
+				data[0] = ReadVertex(vreader, transformState, outside_range_flag);
 				data_index++;
 				start_vtx = 1;
+
+				// If the central vertex is outside range, all the points are toast.
+				if (outside_range_flag)
+					break;
 			}
 
+			if (data_index == 1 && vertex_count == 4 && cullType == CullType::OFF) {
+				for (int vtx = start_vtx; vtx < vertex_count; ++vtx) {
+					if (indices) {
+						vreader.Goto(ConvertIndex(vtx) - index_lower_bound);
+					} else {
+						vreader.Goto(vtx);
+					}
+					data[vtx] = ReadVertex(vreader, transformState, outside_range_flag);
+				}
+
+				int tl = -1, br = -1;
+				if (!outside_range_flag && Rasterizer::DetectRectangleFromFan(binner_->State(), data, vertex_count, &tl, &br)) {
+					Clipper::ProcessRect(data[tl], data[br], *binner_);
+					break;
+				}
+			}
+
+			outside_range_flag = false;
 			for (int vtx = start_vtx; vtx < vertex_count; ++vtx) {
 				if (indices) {
 					vreader.Goto(ConvertIndex(vtx) - index_lower_bound);
@@ -525,7 +752,7 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveTy
 				}
 
 				int provoking_index = 2 - ((data_index++) % 2);
-				data[provoking_index] = ReadVertex(vreader);
+				data[provoking_index] = ReadVertex(vreader, transformState, outside_range_flag);
 				if (outside_range_flag) {
 					// Drop all primitives containing the current vertex
 					skip_count = 2;
@@ -538,15 +765,15 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveTy
 					continue;
 				}
 
-				if (!gstate.isCullEnabled() || gstate.isModeClear()) {
-					Clipper::ProcessTriangle(data[0], data[1], data[2], data[provoking_index]);
-					Clipper::ProcessTriangle(data[2], data[1], data[0], data[provoking_index]);
-				} else if ((!gstate.getCullMode()) ^ ((data_index - 1) % 2)) {
+				if (cullType == CullType::OFF) {
+					Clipper::ProcessTriangle(data[0], data[1], data[2], data[provoking_index], *binner_);
+					Clipper::ProcessTriangle(data[2], data[1], data[0], data[provoking_index], *binner_);
+				} else if ((!(int)cullType) ^ ((data_index - 1) % 2)) {
 					// We need to reverse the vertex order for each second primitive,
 					// but we additionally need to do that for every primitive if CCW cullmode is used.
-					Clipper::ProcessTriangle(data[2], data[1], data[0], data[provoking_index]);
+					Clipper::ProcessTriangle(data[2], data[1], data[0], data[provoking_index], *binner_);
 				} else {
-					Clipper::ProcessTriangle(data[0], data[1], data[2], data[provoking_index]);
+					Clipper::ProcessTriangle(data[0], data[1], data[2], data[provoking_index], *binner_);
 				}
 			}
 			break;
@@ -556,8 +783,25 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveTy
 		ERROR_LOG(G3D, "Unexpected prim type: %d", prim_type);
 		break;
 	}
+}
 
+void TransformUnit::Flush(const char *reason) {
+	binner_->Flush(reason);
 	GPUDebug::NotifyDraw();
+}
+
+void TransformUnit::GetStats(char *buffer, size_t bufsize) {
+	// TODO: More stats?
+	binner_->GetStats(buffer, bufsize);
+}
+
+void TransformUnit::FlushIfOverlap(const char *reason, uint32_t addr, uint32_t stride, uint32_t w, uint32_t h) {
+	if (binner_->HasPendingWrite(addr, stride, w, h))
+		Flush(reason);
+}
+
+void TransformUnit::NotifyClutUpdate(const void *src) {
+	binner_->UpdateClut(src);
 }
 
 // TODO: This probably is not the best interface.
@@ -642,11 +886,6 @@ bool TransformUnit::GetCurrentSimpleVertices(int count, std::vector<GPUDebugVert
 			vertices[i].x = vert.pos.x;
 			vertices[i].y = vert.pos.y;
 			vertices[i].z = vert.pos.z;
-			if (gstate.vertType & GE_VTYPE_COL_MASK) {
-				memcpy(vertices[i].c, vert.color, sizeof(vertices[i].c));
-			} else {
-				memset(vertices[i].c, 0, sizeof(vertices[i].c));
-			}
 		} else {
 			float clipPos[4];
 			Vec3ByMatrix44(clipPos, vert.pos.AsArray(), worldviewproj);
@@ -662,13 +901,17 @@ bool TransformUnit::GetCurrentSimpleVertices(int count, std::vector<GPUDebugVert
 			}
 			vertices[i].x = drawPos.x;
 			vertices[i].y = drawPos.y;
-			vertices[i].z = drawPos.z;
-			if (gstate.vertType & GE_VTYPE_COL_MASK) {
-				memcpy(vertices[i].c, vert.color, sizeof(vertices[i].c));
-			} else {
-				memset(vertices[i].c, 0, sizeof(vertices[i].c));
-			}
+			vertices[i].z = screenPos.z;
 		}
+
+		if (gstate.vertType & GE_VTYPE_COL_MASK) {
+			memcpy(vertices[i].c, vert.color, sizeof(vertices[i].c));
+		} else {
+			memset(vertices[i].c, 0, sizeof(vertices[i].c));
+		}
+		vertices[i].nx = vert.nrm.x;
+		vertices[i].ny = vert.nrm.y;
+		vertices[i].nz = vert.nrm.z;
 	}
 
 	// The GE debugger expects these to be set.

@@ -1,7 +1,8 @@
 #include "ppsspp_config.h"
-#include <map>
+#include <algorithm>
 #include <string>
 #include <sstream>
+#include <unordered_map>
 
 #include "CommonWindows.h"
 #include <shellapi.h>
@@ -381,7 +382,7 @@ namespace MainWindow {
 		if (GetUIState() == UISTATE_INGAME) {
 			browsePauseAfter = Core_IsStepping();
 			if (!browsePauseAfter)
-				Core_EnableStepping(true);
+				Core_EnableStepping(true, "ui.boot", 0);
 		}
 
 		W32Util::MakeTopMost(GetHWND(), false);
@@ -601,14 +602,13 @@ namespace MainWindow {
 				if (disasmWindow)
 					SendMessage(disasmWindow->GetDlgHandle(), WM_COMMAND, IDC_STOPGO, 0);
 				else
-					Core_EnableStepping(true);
+					Core_EnableStepping(true, "ui.break", 0);
 			}
 			noFocusPause = !noFocusPause;	// If we pause, override pause on lost focus
 			break;
 
 		case ID_EMULATION_PAUSE:
 			NativeMessageReceived("pause", "");
-			Core_EnableStepping(false);
 			break;
 
 		case ID_EMULATION_STOP:
@@ -880,12 +880,7 @@ namespace MainWindow {
 		case ID_DEBUG_LOADMAPFILE:
 			if (W32Util::BrowseForFileName(true, hWnd, L"Load .ppmap", 0, L"Maps\0*.ppmap\0All files\0*.*\0\0", L"ppmap", fn)) {
 				g_symbolMap->LoadSymbolMap(Path(fn));
-
-				if (disasmWindow)
-					disasmWindow->NotifyMapLoaded();
-
-				if (memoryWindow)
-					memoryWindow->NotifyMapLoaded();
+				NotifyDebuggerMapLoaded();
 			}
 			break;
 
@@ -897,12 +892,7 @@ namespace MainWindow {
 		case ID_DEBUG_LOADSYMFILE:
 			if (W32Util::BrowseForFileName(true, hWnd, L"Load .sym", 0, L"Symbols\0*.sym\0All files\0*.*\0\0", L"sym", fn)) {
 				g_symbolMap->LoadNocashSym(Path(fn));
-
-				if (disasmWindow)
-					disasmWindow->NotifyMapLoaded();
-
-				if (memoryWindow)
-					memoryWindow->NotifyMapLoaded();
+				NotifyDebuggerMapLoaded();
 			}
 			break;
 
@@ -913,27 +903,25 @@ namespace MainWindow {
 
 		case ID_DEBUG_RESETSYMBOLTABLE:
 			g_symbolMap->Clear();
-
-			if (disasmWindow)
-				disasmWindow->NotifyMapLoaded();
-
-			if (memoryWindow)
-				memoryWindow->NotifyMapLoaded();
+			NotifyDebuggerMapLoaded();
 			break;
 
 		case ID_DEBUG_DISASSEMBLY:
+			CreateDisasmWindow();
 			if (disasmWindow)
 				disasmWindow->Show(true);
 			break;
 
 		case ID_DEBUG_GEDEBUGGER:
 #if PPSSPP_API(ANY_GL)
+			CreateGeDebuggerWindow();
 			if (geDebuggerWindow)
 				geDebuggerWindow->Show(true);
 #endif
 			break;
 
 		case ID_DEBUG_MEMORYVIEW:
+			CreateMemoryWindow();
 			if (memoryWindow)
 				memoryWindow->Show(true);
 			break;

@@ -17,24 +17,68 @@
 
 #pragma once
 
-#include "TransformUnit.h" // for DrawingCoords
+#include "GPU/Software/DrawPixel.h"
+#include "GPU/Software/FuncId.h"
+#include "GPU/Software/Sampler.h"
+#include "GPU/Software/TransformUnit.h" // for DrawingCoords
+
+#ifdef _DEBUG
+#define SOFTGPU_MEMORY_TAGGING_BASIC
+#endif
+// #define SOFTGPU_MEMORY_TAGGING_DETAILED
 
 struct GPUDebugBuffer;
+struct BinCoords;
 
 namespace Rasterizer {
 
-// Draws a triangle if its vertices are specified in counter-clockwise order
-void DrawTriangle(const VertexData& v0, const VertexData& v1, const VertexData& v2);
-void DrawPoint(const VertexData &v0);
-void DrawLine(const VertexData &v0, const VertexData &v1);
-void ClearRectangle(const VertexData &v0, const VertexData &v1);
+struct RasterizerState {
+	PixelFuncID pixelID;
+	SamplerID samplerID;
+	SingleFunc drawPixel;
+	Sampler::LinearFunc linear;
+	Sampler::NearestFunc nearest;
+	uint32_t texaddr[8]{};
+	int texbufw[8]{};
+	u8 *texptr[8]{};
+	float textureLodSlope;
+	int screenOffsetX;
+	int screenOffsetY;
 
-bool GetCurrentStencilbuffer(GPUDebugBuffer &buffer);
+	struct {
+		uint8_t maxTexLevel : 3;
+		bool enableTextures : 1;
+		uint8_t texLevelMode : 2;
+		bool shadeGouraud : 1;
+		bool throughMode : 1;
+		int8_t texLevelOffset : 8;
+		bool mipFilt : 1;
+		bool minFilt : 1;
+		bool magFilt : 1;
+		bool antialiasLines : 1;
+	};
+
+#if defined(SOFTGPU_MEMORY_TAGGING_DETAILED) || defined(SOFTGPU_MEMORY_TAGGING_BASIC)
+	uint32_t listPC;
+#endif
+
+	GETexLevelMode TexLevelMode() const {
+		return GETexLevelMode(texLevelMode);
+	}
+};
+
+void ComputeRasterizerState(RasterizerState *state);
+
+// Draws a triangle if its vertices are specified in counter-clockwise order
+void DrawTriangle(const VertexData &v0, const VertexData &v1, const VertexData &v2, const BinCoords &range, const RasterizerState &state);
+void DrawRectangle(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state);
+void DrawPoint(const VertexData &v0, const BinCoords &range, const RasterizerState &state);
+void DrawLine(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state);
+void ClearRectangle(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state);
+
 bool GetCurrentTexture(GPUDebugBuffer &buffer, int level);
 
 // Shared functions with RasterizerRectangle.cpp
-Vec3<int> AlphaBlendingResult(const Vec4<int> &source, const Vec4<int> &dst);
-void DrawSinglePixelNonClear(const DrawingCoords &p, u16 z, u8 fog, const Vec4<int> &color_in);
-Vec4<int> GetTextureFunctionOutput(const Vec4<int>& prim_color, const Vec4<int>& texcolor);
+Vec3<int> AlphaBlendingResult(const PixelFuncID &pixelID, const Vec4<int> &source, const Vec4<int> &dst);
 
 }  // namespace Rasterizer

@@ -95,6 +95,7 @@ CGEDebugger* geDebuggerWindow = nullptr;
 
 CDisasm *disasmWindow = nullptr;
 CMemoryDlg *memoryWindow = nullptr;
+CVFPUDlg *vfpudlg = nullptr;
 
 static std::string langRegion;
 static std::string osName;
@@ -108,10 +109,14 @@ static std::thread inputBoxThread;
 static bool inputBoxRunning = false;
 
 void OpenDirectory(const char *path) {
-	PIDLIST_ABSOLUTE pidl = ILCreateFromPath(ConvertUTF8ToWString(ReplaceAll(path, "/", "\\")).c_str());
+	SFGAOF flags;
+	PIDLIST_ABSOLUTE pidl = nullptr;
+	HRESULT hr = SHParseDisplayName(ConvertUTF8ToWString(ReplaceAll(path, "/", "\\")).c_str(), nullptr, &pidl, 0, &flags);
+
 	if (pidl) {
-		SHOpenFolderAndSelectItems(pidl, 0, NULL, 0);
-		ILFree(pidl);
+		if (SUCCEEDED(hr))
+			SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
+		CoTaskMemFree(pidl);
 	}
 }
 
@@ -274,6 +279,21 @@ int System_GetPropertyInt(SystemProperty prop) {
 		return DEVICE_TYPE_DESKTOP;
 	case SYSPROP_DISPLAY_COUNT:
 		return GetSystemMetrics(SM_CMONITORS);
+	case SYSPROP_KEYBOARD_LAYOUT:
+	{
+		HKL localeId = GetKeyboardLayout(0);
+		// TODO: Is this list complete enough?
+		switch ((int)(intptr_t)localeId & 0xFFFF) {
+		case 0x407:
+			return KEYBOARD_LAYOUT_QWERTZ;
+		case 0x040c:
+		case 0x080c:
+		case 0x1009:
+			return KEYBOARD_LAYOUT_AZERTY;
+		default:
+			return KEYBOARD_LAYOUT_QWERTY;
+		}
+	}
 	default:
 		return -1;
 	}
@@ -311,6 +331,8 @@ bool System_GetPropertyBool(SystemProperty prop) {
 		return false;
 #endif
 	case SYSPROP_CAN_JIT:
+		return true;
+	case SYSPROP_HAS_KEYBOARD:
 		return true;
 	default:
 		return false;
@@ -663,7 +685,8 @@ int WINAPI WinMain(HINSTANCE _hInstance, HINSTANCE hPrevInstance, LPSTR szCmdLin
 		LogManager::GetInstance()->SetAllLogLevels(LogTypes::LDEBUG);
 	}
 
-	timeBeginPeriod(1);  // TODO: Evaluate if this makes sense to keep.
+	// This still seems to improve performance noticeably.
+	timeBeginPeriod(1);
 
 	ContextMenuInit(_hInstance);
 	MainWindow::Init(_hInstance);
@@ -678,9 +701,11 @@ int WINAPI WinMain(HINSTANCE _hInstance, HINSTANCE hPrevInstance, LPSTR szCmdLin
 #if PPSSPP_API(ANY_GL)
 	CGEDebugger::Init();
 #endif
-	DialogManager::AddDlg(vfpudlg = new CVFPUDlg(_hInstance, hwndMain, currentDebugMIPS));
 
-	MainWindow::CreateDebugWindows();
+	if (g_Config.bShowDebuggerOnLoad) {
+		MainWindow::CreateDisasmWindow();
+		disasmWindow->Show(g_Config.bShowDebuggerOnLoad, false);
+	}
 
 	const bool minimized = iCmdShow == SW_MINIMIZE || iCmdShow == SW_SHOWMINIMIZED || iCmdShow == SW_SHOWMINNOACTIVE;
 	if (minimized) {

@@ -22,6 +22,7 @@
 #include "Common/Log.h"
 #include "Core/Core.h"
 #include "Core/Debugger/Breakpoints.h"
+#include "Core/Debugger/MemBlockInfo.h"
 #include "Core/Debugger/SymbolMap.h"
 #include "Core/Host.h"
 #include "Core/MemMap.h"
@@ -68,8 +69,7 @@ BreakAction MemCheck::Action(u32 addr, bool write, int size, u32 pc, const char 
 	if (cond & mask) {
 		Log(addr, write, size, pc, reason);
 		if ((result & BREAK_ACTION_PAUSE) && coreState != CORE_POWERUP) {
-			Core_EnableStepping(true);
-			host->SetDebugMode(true);
+			Core_EnableStepping(true, "memory.breakpoint", start);
 		}
 
 		return result;
@@ -93,7 +93,7 @@ void MemCheck::JitBeforeApply(u32 addr, bool write, int size, u32 pc) {
 void MemCheck::JitBeforeAction(u32 addr, bool write, int size, u32 pc) {
 	if (lastAddr) {
 		// We have to break to find out if it changed.
-		Core_EnableStepping(true);
+		Core_EnableStepping(true, "memory.breakpoint.check", start);
 	} else {
 		Action(addr, write, size, pc, "CPU");
 	}
@@ -125,8 +125,6 @@ void MemCheck::JitCleanup(bool changed)
 		CBreakPoints::SetSkipFirst(lastPC);
 		Core_EnableStepping(false);
 	}
-	else
-		host->SetDebugMode(true);
 }
 
 // Note: must lock while calling this.
@@ -367,8 +365,7 @@ BreakAction CBreakPoints::ExecBreakPoint(u32 addr) {
 			}
 		}
 		if ((info.result & BREAK_ACTION_PAUSE) && coreState != CORE_POWERUP) {
-			Core_EnableStepping(true);
-			host->SetDebugMode(true);
+			Core_EnableStepping(true, "cpu.breakpoint", info.addr);
 		}
 
 		return info.result;
@@ -393,7 +390,9 @@ void CBreakPoints::AddMemCheck(u32 start, u32 end, MemCheckCondition cond, Break
 		check.result = result;
 
 		memChecks_.push_back(check);
-		anyMemChecks_ = true;
+		bool hadAny = anyMemChecks_.exchange(true);
+		if (!hadAny)
+			MemBlockOverrideDetailed();
 		guard.unlock();
 		Update();
 	}
@@ -401,7 +400,9 @@ void CBreakPoints::AddMemCheck(u32 start, u32 end, MemCheckCondition cond, Break
 	{
 		memChecks_[mc].cond = (MemCheckCondition)(memChecks_[mc].cond | cond);
 		memChecks_[mc].result = (BreakAction)(memChecks_[mc].result | result);
-		anyMemChecks_ = true;
+		bool hadAny = anyMemChecks_.exchange(true);
+		if (!hadAny)
+			MemBlockOverrideDetailed();
 		guard.unlock();
 		Update();
 	}
@@ -417,7 +418,9 @@ void CBreakPoints::RemoveMemCheck(u32 start, u32 end)
 	if (mc != INVALID_MEMCHECK)
 	{
 		memChecks_.erase(memChecks_.begin() + mc);
-		anyMemChecks_ = !memChecks_.empty();
+		bool hadAny = anyMemChecks_.exchange(!memChecks_.empty());
+		if (hadAny)
+			MemBlockReleaseDetailed();
 		guard.unlock();
 		Update();
 	}
@@ -445,6 +448,9 @@ void CBreakPoints::ClearAllMemChecks()
 	if (!memChecks_.empty())
 	{
 		memChecks_.clear();
+		bool hadAny = anyMemChecks_.exchange(false);
+		if (hadAny)
+			MemBlockReleaseDetailed();
 		guard.unlock();
 		Update();
 	}
@@ -633,23 +639,25 @@ bool CBreakPoints::HasMemChecks()
 	return !memChecks_.empty();
 }
 
-void CBreakPoints::Update(u32 addr)
-{
-	if (MIPSComp::jit)
-	{
+void CBreakPoints::Update(u32 addr) {
+	if (MIPSComp::jit) {
 		bool resume = false;
-		if (Core_IsStepping() == false)
-		{
-			Core_EnableStepping(true);
+		if (Core_IsStepping() == false) {
+			Core_EnableStepping(true, "cpu.breakpoint.update", addr);
 			Core_WaitInactive(200);
 			resume = true;
 		}
-		
-		// In case this is a delay slot, clear the previous instruction too.
-		if (addr != 0)
-			MIPSComp::jit->InvalidateCacheAt(addr - 4, 8);
-		else
-			MIPSComp::jit->ClearCache();
+
+		{
+			std::lock_guard<std::recursive_mutex> guard(MIPSComp::jitLock);
+			if (MIPSComp::jit) {
+				// In case this is a delay slot, clear the previous instruction too.
+				if (addr != 0)
+					MIPSComp::jit->InvalidateCacheAt(addr - 4, 8);
+				else
+					MIPSComp::jit->ClearCache();
+			}
+		}
 
 		if (resume)
 			Core_EnableStepping(false);

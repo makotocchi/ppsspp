@@ -14,10 +14,12 @@ enum class TaskType {
 class Task {
 public:
 	virtual ~Task() {}
+	virtual TaskType Type() const = 0;
 	virtual void Run() = 0;
 	virtual bool Cancellable() { return false; }
 	virtual void Cancel() {}
 	virtual uint64_t id() { return 0; }
+	virtual void Release() { delete this; }
 };
 
 class Waitable {
@@ -44,8 +46,9 @@ public:
 	// It gets even trickier when you think about mobile chips with BIG/LITTLE, but we'll
 	// just ignore it and let the OS handle it.
 	void Init(int numCores, int numLogicalCoresPerCpu);
-	void EnqueueTask(Task *task, TaskType taskType);
-	void EnqueueTaskOnThread(int threadNum, Task *task, TaskType taskType);
+	void EnqueueTask(Task *task);
+	// Use enforceSequence if this must run after all previously queued tasks.
+	void EnqueueTaskOnThread(int threadNum, Task *task, bool enforceSequence = false);
 	void Teardown();
 
 	bool IsInitialized() const;
@@ -60,6 +63,8 @@ public:
 	int GetNumLooperThreads() const;
 
 private:
+	bool TeardownTask(Task *task, bool enqueue);
+
 	// This is always pointing to a context, initialized in the constructor.
 	GlobalThreadContext *global_;
 

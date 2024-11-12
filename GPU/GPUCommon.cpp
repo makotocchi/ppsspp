@@ -1,4 +1,16 @@
 #include "ppsspp_config.h"
+
+#if defined(_M_SSE)
+#include <emmintrin.h>
+#endif
+#if PPSSPP_ARCH(ARM_NEON)
+#if defined(_MSC_VER) && PPSSPP_ARCH(ARM64)
+#include <arm64_neon.h>
+#else
+#include <arm_neon.h>
+#endif
+#endif
+
 #include <algorithm>
 #include <type_traits>
 #include <mutex>
@@ -27,6 +39,7 @@
 #include "Core/HLE/sceKernelInterrupt.h"
 #include "Core/HLE/sceKernelThread.h"
 #include "Core/HLE/sceGe.h"
+#include "Core/HW/Display.h"
 #include "Core/MemMapHelpers.h"
 #include "Core/Util/PPGeDraw.h"
 #include "GPU/Common/DrawEngineCommon.h"
@@ -43,24 +56,24 @@ const CommonCommandTableEntry commonCommandTable[] = {
 	{ GE_CMD_JUMP, FLAG_EXECUTE | FLAG_READS_PC | FLAG_WRITES_PC, 0, &GPUCommon::Execute_Jump },
 	{ GE_CMD_CALL, FLAG_EXECUTE | FLAG_READS_PC | FLAG_WRITES_PC, 0, &GPUCommon::Execute_Call },
 	{ GE_CMD_RET, FLAG_EXECUTE | FLAG_READS_PC | FLAG_WRITES_PC, 0, &GPUCommon::Execute_Ret },
-	{ GE_CMD_END, FLAG_FLUSHBEFORE | FLAG_EXECUTE | FLAG_READS_PC | FLAG_WRITES_PC, 0, &GPUCommon::Execute_End },
+	{ GE_CMD_END, FLAG_EXECUTE | FLAG_READS_PC | FLAG_WRITES_PC, 0, &GPUCommon::Execute_End },
 	{ GE_CMD_VADDR, FLAG_EXECUTE, 0, &GPUCommon::Execute_Vaddr },
 	{ GE_CMD_IADDR, FLAG_EXECUTE, 0, &GPUCommon::Execute_Iaddr },
 	{ GE_CMD_BJUMP, FLAG_EXECUTE | FLAG_READS_PC | FLAG_WRITES_PC, 0, &GPUCommon::Execute_BJump },  // EXECUTE
-	{ GE_CMD_BOUNDINGBOX, FLAG_EXECUTE, 0, &GPUCommon::Execute_BoundingBox }, // + FLUSHBEFORE when we implement... or not, do we need to?
+	{ GE_CMD_BOUNDINGBOX, FLAG_EXECUTE, 0, &GPUCommon::Execute_BoundingBox }, // Shouldn't need to FLUSHBEFORE.
 
 	{ GE_CMD_PRIM, FLAG_EXECUTE, 0, &GPUCommon::Execute_Prim },
-	{ GE_CMD_BEZIER, FLAG_FLUSHBEFORE | FLAG_EXECUTE, 0, &GPUCommon::Execute_Bezier },
-	{ GE_CMD_SPLINE, FLAG_FLUSHBEFORE | FLAG_EXECUTE, 0, &GPUCommon::Execute_Spline },
+	{ GE_CMD_BEZIER, FLAG_EXECUTE, 0, &GPUCommon::Execute_Bezier },
+	{ GE_CMD_SPLINE, FLAG_EXECUTE, 0, &GPUCommon::Execute_Spline },
 
 	// Changing the vertex type requires us to flush.
 	{ GE_CMD_VERTEXTYPE, FLAG_FLUSHBEFOREONCHANGE | FLAG_EXECUTEONCHANGE, 0, &GPUCommon::Execute_VertexType },
 
 	{ GE_CMD_LOADCLUT, FLAG_FLUSHBEFOREONCHANGE | FLAG_EXECUTE, 0, &GPUCommon::Execute_LoadClut },
 
-	// These two are actually processed in CMD_END. Not sure if FLAG_FLUSHBEFORE matters.
-	{ GE_CMD_SIGNAL, FLAG_FLUSHBEFORE },
-	{ GE_CMD_FINISH, FLAG_FLUSHBEFORE },
+	// These two are actually processed in CMD_END.
+	{ GE_CMD_SIGNAL },
+	{ GE_CMD_FINISH },
 
 	// Changes that dirty the framebuffer
 	{ GE_CMD_FRAMEBUFPTR, FLAG_FLUSHBEFOREONCHANGE, DIRTY_FRAMEBUF | DIRTY_TEXTURE_PARAMS },
@@ -98,7 +111,7 @@ const CommonCommandTableEntry commonCommandTable[] = {
 	{ GE_CMD_LIGHTTYPE1, FLAG_FLUSHBEFOREONCHANGE, DIRTY_VERTEXSHADER_STATE | DIRTY_LIGHT1 },
 	{ GE_CMD_LIGHTTYPE2, FLAG_FLUSHBEFOREONCHANGE, DIRTY_VERTEXSHADER_STATE | DIRTY_LIGHT2 },
 	{ GE_CMD_LIGHTTYPE3, FLAG_FLUSHBEFOREONCHANGE, DIRTY_VERTEXSHADER_STATE | DIRTY_LIGHT3 },
-	{ GE_CMD_MATERIALUPDATE, FLAG_FLUSHBEFOREONCHANGE, DIRTY_VERTEXSHADER_STATE | DIRTY_FRAGMENTSHADER_STATE },
+	{ GE_CMD_MATERIALUPDATE, FLAG_FLUSHBEFOREONCHANGE, DIRTY_VERTEXSHADER_STATE | DIRTY_FRAGMENTSHADER_STATE },  // TODO: This should not need to dirty the fragment shader?
 
 	// These change both shaders so need flushing.
 	{ GE_CMD_LIGHTMODE, FLAG_FLUSHBEFOREONCHANGE, DIRTY_VERTEXSHADER_STATE | DIRTY_FRAGMENTSHADER_STATE },
@@ -300,7 +313,7 @@ const CommonCommandTableEntry commonCommandTable[] = {
 	{ GE_CMD_TRANSFERSRCPOS, 0 },
 	{ GE_CMD_TRANSFERDSTPOS, 0 },
 	{ GE_CMD_TRANSFERSIZE, 0 },
-	{ GE_CMD_TRANSFERSTART, FLAG_FLUSHBEFORE | FLAG_EXECUTE | FLAG_READS_PC, 0, &GPUCommon::Execute_BlockTransferStart },
+	{ GE_CMD_TRANSFERSTART, FLAG_EXECUTE | FLAG_READS_PC, 0, &GPUCommon::Execute_BlockTransferStart },
 
 	// We don't use the dither table.
 	{ GE_CMD_DITH0 },
@@ -358,12 +371,15 @@ const CommonCommandTableEntry commonCommandTable[] = {
 	// Appears to be debugging related or something?  Hit a lot in GoW.
 	{ GE_CMD_NOP_FF, 0 },
 };
-size_t commonCommandTableSize = ARRAY_SIZE(commonCommandTable);
 
 // TODO: Make class member?
 GPUCommon::CommandInfo GPUCommon::cmdInfo_[256];
 
 void GPUCommon::Flush() {
+	drawEngineCommon_->DispatchFlush();
+}
+
+void GPUCommon::DispatchFlush() {
 	drawEngineCommon_->DispatchFlush();
 }
 
@@ -378,7 +394,6 @@ GPUCommon::GPUCommon(GraphicsContext *gfxCtx, Draw::DrawContext *draw) :
 	static_assert(sizeof(DisplayList) == 456, "Bad DisplayList size");
 
 	Reinitialize();
-	SetupColorConv();
 	gstate.Reset();
 	gstate_c.Reset();
 	gpuStats.Reset();
@@ -387,7 +402,7 @@ GPUCommon::GPUCommon(GraphicsContext *gfxCtx, Draw::DrawContext *draw) :
 
 	// Convert the command table to a faster format, and check for dupes.
 	std::set<u8> dupeCheck;
-	for (size_t i = 0; i < commonCommandTableSize; i++) {
+	for (size_t i = 0; i < ARRAY_SIZE(commonCommandTable); i++) {
 		const u8 cmd = commonCommandTable[i].cmd;
 		if (dupeCheck.find(cmd) != dupeCheck.end()) {
 			ERROR_LOG(G3D, "Command table Dupe: %02x (%i)", (int)cmd, (int)cmd);
@@ -989,9 +1004,9 @@ bool GPUCommon::InterpretList(DisplayList &list) {
 
 	gpuState = list.pc == list.stall ? GPUSTATE_STALL : GPUSTATE_RUNNING;
 
-	debugRecording_ = GPURecord::IsActive();
-	const bool useDebugger = GPUDebug::IsActive() || debugRecording_;
-	const bool useFastRunLoop = !dumpThisFrame_ && !useDebugger;
+	// To enable breakpoints, we don't do fast matrix loads while debugger active.
+	debugRecording_ = GPUDebug::IsActive() || GPURecord::IsActive();
+	const bool useFastRunLoop = !dumpThisFrame_ && !debugRecording_;
 	while (gpuState == GPUSTATE_RUNNING) {
 		{
 			if (list.pc == list.stall) {
@@ -1017,6 +1032,8 @@ bool GPUCommon::InterpretList(DisplayList &list) {
 	}
 
 	FinishDeferred();
+	if (debugRecording_)
+		GPURecord::NotifyCPU();
 
 	// We haven't run the op at list.pc, so it shouldn't count.
 	if (cycleLastPC != list.pc) {
@@ -1029,6 +1046,7 @@ bool GPUCommon::InterpretList(DisplayList &list) {
 		double total = time_now_d() - start - timeSpentStepping_;
 		_dbg_assert_msg_(total >= 0.0, "Time spent DL processing became negative");
 		hleSetSteppingTime(timeSpentStepping_);
+		DisplayNotifySleep(timeSpentStepping_);
 		timeSpentStepping_ = 0.0;
 		gpuStats.msProcessingDisplayLists += total;
 	}
@@ -1092,27 +1110,29 @@ void GPUCommon::SlowRunLoop(DisplayList &list)
 	const bool dumpThisFrame = dumpThisFrame_;
 	while (downcount > 0)
 	{
-		GPUDebug::NotifyCommand(list.pc);
-		GPURecord::NotifyCommand(list.pc);
-		u32 op = Memory::ReadUnchecked_U32(list.pc);
-		u32 cmd = op >> 24;
+		bool process = GPUDebug::NotifyCommand(list.pc);
+		if (process) {
+			GPURecord::NotifyCommand(list.pc);
+			u32 op = Memory::ReadUnchecked_U32(list.pc);
+			u32 cmd = op >> 24;
 
-		u32 diff = op ^ gstate.cmdmem[cmd];
-		PreExecuteOp(op, diff);
-		if (dumpThisFrame) {
-			char temp[256];
-			u32 prev;
-			if (Memory::IsValidAddress(list.pc - 4)) {
-				prev = Memory::ReadUnchecked_U32(list.pc - 4);
-			} else {
-				prev = 0;
+			u32 diff = op ^ gstate.cmdmem[cmd];
+			PreExecuteOp(op, diff);
+			if (dumpThisFrame) {
+				char temp[256];
+				u32 prev;
+				if (Memory::IsValidAddress(list.pc - 4)) {
+					prev = Memory::ReadUnchecked_U32(list.pc - 4);
+				} else {
+					prev = 0;
+				}
+				GeDisassembleOp(list.pc, op, prev, temp, 256);
+				NOTICE_LOG(G3D, "%08x: %s", op, temp);
 			}
-			GeDisassembleOp(list.pc, op, prev, temp, 256);
-			NOTICE_LOG(G3D, "%08x: %s", op, temp);
-		}
-		gstate.cmdmem[cmd] = op;
+			gstate.cmdmem[cmd] = op;
 
-		ExecuteOp(op, diff);
+			ExecuteOp(op, diff);
+		}
 
 		list.pc += 4;
 		--downcount;
@@ -1301,7 +1321,8 @@ void GPUCommon::DoExecuteCall(u32 target) {
 	if (!debugRecording_ && (Memory::ReadUnchecked_U32(target) >> 24) == GE_CMD_BONEMATRIXDATA) {
 		// Check for the end
 		if ((Memory::ReadUnchecked_U32(target + 11 * 4) >> 24) == GE_CMD_BONEMATRIXDATA &&
-				(Memory::ReadUnchecked_U32(target + 12 * 4) >> 24) == GE_CMD_RET) {
+				(Memory::ReadUnchecked_U32(target + 12 * 4) >> 24) == GE_CMD_RET &&
+				(gstate.boneMatrixNumber & 0x7F) <= 96 - 12) {
 			// Yep, pretty sure this is a bone matrix call.  Double check stall first.
 			if (target > currentList->stall || target + 12 * 4 < currentList->stall) {
 				FastLoadBoneMatrix(target);
@@ -1342,7 +1363,8 @@ void GPUCommon::Execute_Ret(u32 op, u32 diff) {
 }
 
 void GPUCommon::Execute_End(u32 op, u32 diff) {
-	Flush();
+	if (flushOnParams_)
+		Flush();
 
 	const u32 prev = Memory::ReadUnchecked_U32(currentList->pc - 4);
 	UpdatePC(currentList->pc, currentList->pc);
@@ -1392,31 +1414,53 @@ void GPUCommon::Execute_End(u32 op, u32 diff) {
 				DEBUG_LOG(G3D, "Signal with Sync. signal/end: %04x %04x", signal, enddata);
 				break;
 			case PSP_GE_SIGNAL_JUMP:
+			case PSP_GE_SIGNAL_RJUMP:
+			case PSP_GE_SIGNAL_OJUMP:
 				{
 					trigger = false;
 					currentList->signal = behaviour;
 					// pc will be increased after we return, counteract that.
 					u32 target = (((signal << 16) | enddata) & 0xFFFFFFFC) - 4;
+					const char *targetType = "absolute";
+					if (behaviour == PSP_GE_SIGNAL_RJUMP) {
+						target += currentList->pc - 4;
+						targetType = "relative";
+					} else if (behaviour == PSP_GE_SIGNAL_OJUMP) {
+						target = gstate_c.getRelativeAddress(target);
+						targetType = "origin";
+					}
+
 					if (!Memory::IsValidAddress(target)) {
-						ERROR_LOG_REPORT(G3D, "Signal with Jump: bad address. signal/end: %04x %04x", signal, enddata);
+						ERROR_LOG_REPORT(G3D, "Signal with Jump (%s): bad address. signal/end: %04x %04x", targetType, signal, enddata);
 						UpdateState(GPUSTATE_ERROR);
 					} else {
 						UpdatePC(currentList->pc, target);
 						currentList->pc = target;
-						DEBUG_LOG(G3D, "Signal with Jump. signal/end: %04x %04x", signal, enddata);
+						DEBUG_LOG(G3D, "Signal with Jump (%s). signal/end: %04x %04x", targetType, signal, enddata);
 					}
 				}
 				break;
 			case PSP_GE_SIGNAL_CALL:
+			case PSP_GE_SIGNAL_RCALL:
+			case PSP_GE_SIGNAL_OCALL:
 				{
 					trigger = false;
 					currentList->signal = behaviour;
 					// pc will be increased after we return, counteract that.
 					u32 target = (((signal << 16) | enddata) & 0xFFFFFFFC) - 4;
+					const char *targetType = "absolute";
+					if (behaviour == PSP_GE_SIGNAL_RCALL) {
+						target += currentList->pc - 4;
+						targetType = "relative";
+					} else if (behaviour == PSP_GE_SIGNAL_OCALL) {
+						target = gstate_c.getRelativeAddress(target);
+						targetType = "origin";
+					}
+
 					if (currentList->stackptr == ARRAY_SIZE(currentList->stack)) {
-						ERROR_LOG_REPORT(G3D, "Signal with Call: stack full. signal/end: %04x %04x", signal, enddata);
+						ERROR_LOG_REPORT(G3D, "Signal with Call (%s): stack full. signal/end: %04x %04x", targetType, signal, enddata);
 					} else if (!Memory::IsValidAddress(target)) {
-						ERROR_LOG_REPORT(G3D, "Signal with Call: bad address. signal/end: %04x %04x", signal, enddata);
+						ERROR_LOG_REPORT(G3D, "Signal with Call (%s): bad address. signal/end: %04x %04x", targetType, signal, enddata);
 						UpdateState(GPUSTATE_ERROR);
 					} else {
 						// TODO: This might save/restore other state...
@@ -1426,7 +1470,7 @@ void GPUCommon::Execute_End(u32 op, u32 diff) {
 						stackEntry.baseAddr = gstate.base;
 						UpdatePC(currentList->pc, target);
 						currentList->pc = target;
-						DEBUG_LOG(G3D, "Signal with Call. signal/end: %04x %04x", signal, enddata);
+						DEBUG_LOG(G3D, "Signal with Call (%s). signal/end: %04x %04x", targetType, signal, enddata);
 					}
 				}
 				break;
@@ -1589,8 +1633,9 @@ void GPUCommon::Execute_Prim(u32 op, u32 diff) {
 			return;
 	}
 
-	// This also makes skipping drawing very effective.
-	framebufferManager_->SetRenderFrameBuffer(gstate_c.IsDirty(DIRTY_FRAMEBUF), gstate_c.skipDrawReason);
+	// Update cached framebuffer format.
+	// We store it in the cache so it can be modified for blue-to-alpha, next.
+	gstate_c.framebufFormat = gstate.FrameBufFormat();
 
 	if (gstate_c.skipDrawReason & (SKIPDRAW_SKIPFRAME | SKIPDRAW_NON_DISPLAYED_FB)) {
 		// Rough estimate, not sure what's correct.
@@ -1604,6 +1649,24 @@ void GPUCommon::Execute_Prim(u32 op, u32 diff) {
 	if (!Memory::IsValidAddress(gstate_c.vertexAddr)) {
 		ERROR_LOG(G3D, "Bad vertex address %08x!", gstate_c.vertexAddr);
 		return;
+	}
+
+	// See the documentation for gstate_c.blueToAlpha.
+	bool blueToAlpha = false;
+	if (PSP_CoreParameter().compat.flags().BlueToAlpha) {
+		if (gstate_c.framebufFormat == GEBufferFormat::GE_FORMAT_565 && gstate.getColorMask() == 0x0FFFFF) {
+			blueToAlpha = true;
+		}
+		if (blueToAlpha != gstate_c.blueToAlpha) {
+			gstate_c.blueToAlpha = blueToAlpha;
+			gstate_c.Dirty(DIRTY_FRAGMENTSHADER_STATE | DIRTY_BLEND_STATE);
+		}
+	}
+
+	// This also makes skipping drawing very effective.
+	VirtualFramebuffer *vfb = framebufferManager_->SetRenderFrameBuffer(gstate_c.IsDirty(DIRTY_FRAMEBUF), gstate_c.skipDrawReason);
+	if (blueToAlpha) {
+		vfb->usageFlags |= FB_USAGE_BLUE_TO_ALPHA;
 	}
 
 	void *verts = Memory::GetPointerUnchecked(gstate_c.vertexAddr);
@@ -1650,7 +1713,7 @@ void GPUCommon::Execute_Prim(u32 op, u32 diff) {
 	if (!g_Config.bSoftwareSkinning)
 		vtypeCheckMask = 0xFFFFFFFF;
 
-	if (debugRecording_ || GPUDebug::IsActive())
+	if (debugRecording_)
 		goto bail;
 
 	while (src != stall) {
@@ -1753,7 +1816,8 @@ void GPUCommon::Execute_Prim(u32 op, u32 diff) {
 			if ((Memory::ReadUnchecked_U32(target) >> 24) == GE_CMD_BONEMATRIXDATA &&
 				(Memory::ReadUnchecked_U32(target + 11 * 4) >> 24) == GE_CMD_BONEMATRIXDATA &&
 				(Memory::ReadUnchecked_U32(target + 12 * 4) >> 24) == GE_CMD_RET &&
-				(target > currentList->stall || target + 12 * 4 < currentList->stall)) {
+				(target > currentList->stall || target + 12 * 4 < currentList->stall) &&
+				(gstate.boneMatrixNumber & 0x7F) <= 96 - 12) {
 				FastLoadBoneMatrix(target);
 			} else {
 				goto bail;
@@ -1799,6 +1863,8 @@ bail:
 void GPUCommon::Execute_Bezier(u32 op, u32 diff) {
 	// We don't dirty on normal changes anymore as we prescale, but it's needed for splines/bezier.
 	gstate_c.Dirty(DIRTY_UVSCALEOFFSET);
+
+	gstate_c.framebufFormat = gstate.FrameBufFormat();
 
 	// This also make skipping drawing very effective.
 	framebufferManager_->SetRenderFrameBuffer(gstate_c.IsDirty(DIRTY_FRAMEBUF), gstate_c.skipDrawReason);
@@ -1867,6 +1933,8 @@ void GPUCommon::Execute_Bezier(u32 op, u32 diff) {
 void GPUCommon::Execute_Spline(u32 op, u32 diff) {
 	// We don't dirty on normal changes anymore as we prescale, but it's needed for splines/bezier.
 	gstate_c.Dirty(DIRTY_UVSCALEOFFSET);
+
+	gstate_c.framebufFormat = gstate.FrameBufFormat();
 
 	// This also make skipping drawing very effective.
 	framebufferManager_->SetRenderFrameBuffer(gstate_c.IsDirty(DIRTY_FRAMEBUF), gstate_c.skipDrawReason);
@@ -1944,6 +2012,8 @@ void GPUCommon::Execute_BoundingBox(u32 op, u32 diff) {
 	if (((count & 7) == 0) && count <= 64) {  // Sanity check
 		void *control_points = Memory::GetPointer(gstate_c.vertexAddr);
 		if (!control_points) {
+			ERROR_LOG_REPORT_ONCE(boundingbox, G3D, "Invalid verts in bounding box check");
+			currentList->bboxResult = true;
 			return;
 		}
 
@@ -1966,8 +2036,12 @@ void GPUCommon::Execute_BoundingBox(u32 op, u32 diff) {
 }
 
 void GPUCommon::Execute_BlockTransferStart(u32 op, u32 diff) {
-	PROFILE_THIS_SCOPE("block");
 	Flush();
+
+	PROFILE_THIS_SCOPE("block");  // don't include the flush in the profile, would be misleading.
+
+	gstate_c.framebufFormat = gstate.FrameBufFormat();
+
 	// and take appropriate action. This is a block transfer between RAM and VRAM, or vice versa.
 	// Can we skip this on SkipDraw?
 	DoBlockTransfer(gstate_c.skipDrawReason);
@@ -2259,9 +2333,10 @@ void GPUCommon::Execute_ImmVertexAlphaPrim(u32 op, u32 diff) {
 	v.x = ((gstate.imm_vscx & 0xFFFFFF) - offsetX) / 16.0f;
 	v.y = ((gstate.imm_vscy & 0xFFFFFF) - offsetY) / 16.0f;
 	v.z = gstate.imm_vscz & 0xFFFF;
+	v.pos_w = 1.0f;
 	v.u = getFloat24(gstate.imm_vtcs);
 	v.v = getFloat24(gstate.imm_vtct);
-	v.w = getFloat24(gstate.imm_vtcq);
+	v.uv_w = getFloat24(gstate.imm_vtcq);
 	v.color0_32 = (gstate.imm_cv & 0xFFFFFF) | (gstate.imm_ap << 24);
 	v.fog = 0.0f; // we have no information about the scale here
 	v.color1_32 = gstate.imm_scv & 0xFFFFFF;
@@ -2307,8 +2382,7 @@ void GPUCommon::FlushImm() {
 
 	int bytesRead;
 	uint32_t vertTypeID = GetVertTypeID(vtype, 0);
-	drawEngineCommon_->DispatchSubmitPrim(temp, nullptr, immPrim_, immCount_, vertTypeID, gstate.getCullMode(), &bytesRead);
-	drawEngineCommon_->DispatchFlush();
+	drawEngineCommon_->DispatchSubmitImm(temp, nullptr, immPrim_, immCount_, vertTypeID, gstate.getCullMode(), &bytesRead);
 	// TOOD: In the future, make a special path for these.
 	// drawEngineCommon_->DispatchSubmitImm(immBuffer_, immCount_);
 }
@@ -2367,6 +2441,7 @@ void GPUCommon::Execute_Unknown(u32 op, u32 diff) {
 
 void GPUCommon::FastLoadBoneMatrix(u32 target) {
 	const u32 num = gstate.boneMatrixNumber & 0x7F;
+	_dbg_assert_msg_(num + 12 <= 96, "FastLoadBoneMatrix would corrupt memory");
 	const u32 mtxNum = num / 12;
 	u32 uniformsToDirty = DIRTY_BONEMATRIX0 << mtxNum;
 	if (num != 12 * mtxNum) {
@@ -2374,7 +2449,8 @@ void GPUCommon::FastLoadBoneMatrix(u32 target) {
 	}
 
 	if (!g_Config.bSoftwareSkinning) {
-		Flush();
+		if (flushOnParams_)
+			Flush();
 		gstate_c.Dirty(uniformsToDirty);
 	} else {
 		gstate_c.deferredVertTypeDirty |= uniformsToDirty;
@@ -2566,6 +2642,7 @@ void GPUCommon::ResetListPC(int listID, u32 pc) {
 	}
 
 	dls[listID].pc = pc;
+	downcount = 0;
 }
 
 void GPUCommon::ResetListStall(int listID, u32 stall) {
@@ -2575,6 +2652,7 @@ void GPUCommon::ResetListStall(int listID, u32 stall) {
 	}
 
 	dls[listID].stall = stall;
+	downcount = 0;
 }
 
 void GPUCommon::ResetListState(int listID, DisplayListState state) {
@@ -2584,6 +2662,7 @@ void GPUCommon::ResetListState(int listID, DisplayListState state) {
 	}
 
 	dls[listID].state = state;
+	downcount = 0;
 }
 
 GPUDebugOp GPUCommon::DissassembleOp(u32 pc, u32 op) {
@@ -2642,6 +2721,7 @@ void GPUCommon::SetCmdValue(u32 op) {
 	PreExecuteOp(op, diff);
 	gstate.cmdmem[cmd] = op;
 	ExecuteOp(op, diff);
+	downcount = 0;
 }
 
 void GPUCommon::DoBlockTransfer(u32 skipDrawReason) {
@@ -2727,11 +2807,18 @@ void GPUCommon::DoBlockTransfer(u32 skipDrawReason) {
 		framebufferManager_->NotifyBlockTransferAfter(dstBasePtr, dstStride, dstX, dstY, srcBasePtr, srcStride, srcX, srcY, width, height, bpp, skipDrawReason);
 	}
 
-	const uint32_t src = srcBasePtr + (srcY * srcStride + srcX) * bpp;
+	const uint32_t numBytes = width * height * bpp;
 	const uint32_t srcSize = height * srcStride * bpp;
-	const std::string tag = "GPUBlockTransfer/" + GetMemWriteTagAt(src, srcSize);
-	NotifyMemInfo(MemBlockFlags::READ, src, srcSize, tag.c_str(), tag.size());
-	NotifyMemInfo(MemBlockFlags::WRITE, dstBasePtr + (dstY * dstStride + dstX) * bpp, height * dstStride * bpp, tag.c_str(), tag.size());
+	const uint32_t dstSize = height * dstStride * bpp;
+	// We do the check here on the number of bytes to avoid marking really tiny images.
+	// Helps perf in GT menu which does insane amounts of these, one for each text character per frame.
+	if (MemBlockInfoDetailed(numBytes, numBytes)) {
+		const uint32_t src = srcBasePtr + (srcY * srcStride + srcX) * bpp;
+		const uint32_t dst = dstBasePtr + (dstY * dstStride + dstX) * bpp;
+		const std::string tag = "GPUBlockTransfer/" + GetMemWriteTagAt(src, srcSize);
+		NotifyMemInfo(MemBlockFlags::READ, src, srcSize, tag.c_str(), tag.size());
+		NotifyMemInfo(MemBlockFlags::WRITE, dst, dstSize, tag.c_str(), tag.size());
+	}
 
 	// TODO: Correct timing appears to be 1.9, but erring a bit low since some of our other timing is inaccurate.
 	cyclesExecuted += ((height * width * bpp) * 16) / 10;
@@ -2744,17 +2831,23 @@ bool GPUCommon::PerformMemoryCopy(u32 dest, u32 src, int size) {
 			// We use a little hack for PerformMemoryDownload/PerformMemoryUpload using a VRAM mirror.
 			// Since they're identical we don't need to copy.
 			if (!Memory::IsVRAMAddress(dest) || (dest ^ 0x00400000) != src) {
-				const std::string tag = "GPUMemcpy/" + GetMemWriteTagAt(src, size);
-				Memory::Memcpy(dest, src, size, tag.c_str(), tag.size());
+				if (MemBlockInfoDetailed(size)) {
+					const std::string tag = "GPUMemcpy/" + GetMemWriteTagAt(src, size);
+					Memory::Memcpy(dest, src, size, tag.c_str(), tag.size());
+				} else {
+					Memory::Memcpy(dest, src, size, "GPUMemcpy");
+				}
 			}
 		}
 		InvalidateCache(dest, size, GPU_INVALIDATE_HINT);
 		return true;
 	}
 
-	const std::string tag = "GPUMemcpy/" + GetMemWriteTagAt(src, size);
-	NotifyMemInfo(MemBlockFlags::READ, src, size, tag.c_str(), tag.size());
-	NotifyMemInfo(MemBlockFlags::WRITE, dest, size, tag.c_str(), tag.size());
+	if (MemBlockInfoDetailed(size)) {
+		const std::string tag = "GPUMemcpy/" + GetMemWriteTagAt(src, size);
+		NotifyMemInfo(MemBlockFlags::READ, src, size, tag.c_str(), tag.size());
+		NotifyMemInfo(MemBlockFlags::WRITE, dest, size, tag.c_str(), tag.size());
+	}
 	InvalidateCache(dest, size, GPU_INVALIDATE_HINT);
 	GPURecord::NotifyMemcpy(dest, src, size);
 	return false;
@@ -2829,7 +2922,7 @@ bool GPUCommon::PerformStencilUpload(u32 dest, int size) {
 bool GPUCommon::GetCurrentFramebuffer(GPUDebugBuffer &buffer, GPUDebugFramebufferType type, int maxRes) {
 	u32 fb_address = type == GPU_DBG_FRAMEBUF_RENDER ? (gstate.getFrameBufRawAddress() | 0x04000000) : framebufferManager_->DisplayFramebufAddr();
 	int fb_stride = type == GPU_DBG_FRAMEBUF_RENDER ? gstate.FrameBufStride() : framebufferManager_->DisplayFramebufStride();
-	GEBufferFormat format = type == GPU_DBG_FRAMEBUF_RENDER ? gstate.FrameBufFormat() : framebufferManager_->DisplayFramebufFormat();
+	GEBufferFormat format = type == GPU_DBG_FRAMEBUF_RENDER ? gstate_c.framebufFormat : framebufferManager_->DisplayFramebufFormat();
 	return framebufferManager_->GetFramebuffer(fb_address, fb_stride, format, buffer, maxRes);
 }
 
@@ -2901,6 +2994,21 @@ bool GPUCommon::FramebufferReallyDirty() {
 		return dirty;
 	}
 	return true;
+}
+
+void GPUCommon::UpdateUVScaleOffset() {
+#ifdef _M_SSE
+	__m128i values = _mm_slli_epi32(_mm_load_si128((const __m128i *) & gstate.texscaleu), 8);
+	_mm_storeu_si128((__m128i *)&gstate_c.uv, values);
+#elif PPSSPP_ARCH(ARM_NEON)
+	const uint32x4_t values = vshlq_n_u32(vld1q_u32((const u32 *)&gstate.texscaleu), 8);
+	vst1q_u32((u32 *)&gstate_c.uv, values);
+#else
+	gstate_c.uv.uScale = getFloat24(gstate.texscaleu);
+	gstate_c.uv.vScale = getFloat24(gstate.texscalev);
+	gstate_c.uv.uOff = getFloat24(gstate.texoffsetu);
+	gstate_c.uv.vOff = getFloat24(gstate.texoffsetv);
+#endif
 }
 
 size_t GPUCommon::FormatGPUStatsCommon(char *buffer, size_t size) {

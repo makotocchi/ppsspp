@@ -40,8 +40,8 @@
 #include "Core/FileSystems/MetaFileSystem.h"
 #include "Core/ELF/ParamSFO.h"
 #include "Core/HLE/HLE.h"
-#include "Core/HLE/sceDisplay.h"
 #include "Core/HLE/ReplaceTables.h"
+#include "Core/HLE/sceDisplay.h"
 #include "Core/HLE/sceKernel.h"
 #include "Core/HLE/sceUtility.h"
 #include "Core/MemMap.h"
@@ -303,15 +303,19 @@ namespace SaveState
 
 		// Memory is a bit tricky when jit is enabled, since there's emuhacks in it.
 		auto savedReplacements = SaveAndClearReplacements();
-		if (MIPSComp::jit && p.mode == p.MODE_WRITE)
-		{
-			std::vector<u32> savedBlocks;
-			savedBlocks = MIPSComp::jit->SaveAndClearEmuHackOps();
+		if (MIPSComp::jit && p.mode == p.MODE_WRITE) {
+			std::lock_guard<std::recursive_mutex> guard(MIPSComp::jitLock);
+			if (MIPSComp::jit) {
+				std::vector<u32> savedBlocks;
+				savedBlocks = MIPSComp::jit->SaveAndClearEmuHackOps();
+				Memory::DoState(p);
+				MIPSComp::jit->RestoreSavedEmuHackOps(savedBlocks);
+			} else {
+				Memory::DoState(p);
+			}
+		} else {
 			Memory::DoState(p);
-			MIPSComp::jit->RestoreSavedEmuHackOps(savedBlocks);
 		}
-		else
-			Memory::DoState(p);
 		RestoreSavedReplacements(savedReplacements);
 
 		MemoryStick_DoState(p);
@@ -336,14 +340,14 @@ namespace SaveState
 	void Load(const Path &filename, int slot, Callback callback, void *cbUserData)
 	{
 		if (coreState == CoreState::CORE_RUNTIME_ERROR)
-			Core_EnableStepping(true);
+			Core_EnableStepping(true, "savestate.load", 0);
 		Enqueue(Operation(SAVESTATE_LOAD, filename, slot, callback, cbUserData));
 	}
 
 	void Save(const Path &filename, int slot, Callback callback, void *cbUserData)
 	{
 		if (coreState == CoreState::CORE_RUNTIME_ERROR)
-			Core_EnableStepping(true);
+			Core_EnableStepping(true, "savestate.save", 0);
 		Enqueue(Operation(SAVESTATE_SAVE, filename, slot, callback, cbUserData));
 	}
 
@@ -355,7 +359,7 @@ namespace SaveState
 	void Rewind(Callback callback, void *cbUserData)
 	{
 		if (coreState == CoreState::CORE_RUNTIME_ERROR)
-			Core_EnableStepping(true);
+			Core_EnableStepping(true, "savestate.rewind", 0);
 		Enqueue(Operation(SAVESTATE_REWIND, Path(), -1, callback, cbUserData));
 	}
 

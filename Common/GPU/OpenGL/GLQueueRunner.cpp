@@ -17,6 +17,13 @@
 #include "GLRenderManager.h"
 #include "DataFormatGL.h"
 
+// These are the same value, alias for simplicity.
+#if defined(GL_CLIP_DISTANCE0_EXT) && !defined(GL_CLIP_DISTANCE0)
+#define GL_CLIP_DISTANCE0 GL_CLIP_DISTANCE0_EXT
+#elif !defined(GL_CLIP_DISTANCE0)
+#define GL_CLIP_DISTANCE0 0x3000
+#endif
+
 static constexpr int TEXCACHE_NAME_CACHE_SIZE = 16;
 
 #if PPSSPP_PLATFORM(IOS)
@@ -196,6 +203,7 @@ void GLQueueRunner::RunInitSteps(const std::vector<GLRInitStep> &steps, bool ski
 
 #if !defined(USING_GLES2)
 			if (step.create_program.support_dual_source) {
+				_dbg_assert_msg_(gl_extensions.ARB_blend_func_extended, "ARB_blend_func_extended required for dual src");
 				// Dual source alpha
 				glBindFragDataLocationIndexed(program->program, 0, 0, "fragColor0");
 				glBindFragDataLocationIndexed(program->program, 0, 1, "fragColor1");
@@ -204,6 +212,8 @@ void GLQueueRunner::RunInitSteps(const std::vector<GLRInitStep> &steps, bool ski
 			}
 #elif !PPSSPP_PLATFORM(IOS)
 			if (gl_extensions.GLES3 && step.create_program.support_dual_source) {
+				// For GLES2, we use gl_SecondaryFragColorEXT as fragColor1.
+				_dbg_assert_msg_(gl_extensions.EXT_blend_func_extended, "EXT_blend_func_extended required for dual src");
 				glBindFragDataLocationIndexedEXT(program->program, 0, 0, "fragColor0");
 				glBindFragDataLocationIndexedEXT(program->program, 0, 1, "fragColor1");
 			}
@@ -624,45 +634,6 @@ void GLQueueRunner::RunSteps(const std::vector<GLRStep *> &steps, bool skipGLCal
 		}
 	}
 
-	auto ignoresContents = [](GLRRenderPassAction act) {
-		return act == GLRRenderPassAction::CLEAR || act == GLRRenderPassAction::DONT_CARE;
-	};
-	int invalidateAllMask = GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
-
-	/*
-	for (int j = 0; j < (int)steps.size() - 1; ++j) {
-		GLRStep &primaryStep = *steps[j];
-		if (primaryStep.stepType == GLRStepType::RENDER) {
-			const GLRFramebuffer *fb = primaryStep.render.framebuffer;
-
-			// Let's see if we can invalidate it...
-			int invalidateMask = 0;
-			for (int i = j + 1; i < (int)steps.size(); ++i) {
-				const GLRStep &secondaryStep = *steps[i];
-				if (secondaryStep.stepType == GLRStepType::RENDER && secondaryStep.render.framebuffer == fb) {
-					if (ignoresContents(secondaryStep.render.color))
-						invalidateMask |= GL_COLOR_BUFFER_BIT;
-					if (ignoresContents(secondaryStep.render.depth))
-						invalidateMask |= GL_DEPTH_BUFFER_BIT;
-					if (ignoresContents(secondaryStep.render.stencil))
-						invalidateMask |= GL_STENCIL_BUFFER_BIT;
-
-					if (invalidateMask == invalidateAllMask)
-						break;
-				} else if (secondaryStep.dependencies.contains(fb)) {
-					// Can't do it, this step may depend on fb's data.
-					break;
-				}
-			}
-
-			if (invalidateMask) {
-				GLRRenderData data{ GLRRenderCommand::INVALIDATE };
-				data.clear.clearMask = invalidateMask;
-				primaryStep.commands.push_back(data);
-			}
-		}
-	}*/
-
 	CHECK_GL_ERROR_IF_DEBUG();
 	size_t renderCount = 0;
 	for (size_t i = 0; i < steps.size(); i++) {
@@ -760,18 +731,6 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step, bool first, bool last
 #endif
 	}
 
-	/*
-#ifndef USING_GLES2
-	if (g_Config.iInternalResolution == 0) {
-		glLineWidth(std::max(1, (int)(renderWidth_ / 480)));
-		glPointSize(std::max(1.0f, (float)(renderWidth_ / 480.f)));
-	} else {
-		glLineWidth(g_Config.iInternalResolution);
-		glPointSize((float)g_Config.iInternalResolution);
-	}
-#endif
-	*/
-
 	if (first && gl_extensions.ARB_vertex_array_object) {
 		glBindVertexArray(globalVAO_);
 	}
@@ -798,6 +757,7 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step, bool first, bool last
 	int logicOp = -1;
 	bool logicEnabled = false;
 #endif
+	bool clipDistance0Enabled = false;
 	GLuint blendEqColor = (GLuint)-1;
 	GLuint blendEqAlpha = (GLuint)-1;
 
@@ -922,23 +882,6 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step, bool first, bool last
 			}
 			CHECK_GL_ERROR_IF_DEBUG();
 			break;
-		case GLRRenderCommand::INVALIDATE:
-		{
-			GLenum attachments[3];
-			int count = 0;
-			bool isFBO = step.render.framebuffer != nullptr;
-			bool hasDepth = isFBO ? step.render.framebuffer->z_stencil_ : false;
-			if (c.clear.clearMask & GL_COLOR_BUFFER_BIT)
-				attachments[count++] = isFBO ? GL_COLOR_ATTACHMENT0 : GL_COLOR;
-			if (hasDepth && (c.clear.clearMask & GL_DEPTH_BUFFER_BIT))
-				attachments[count++] = isFBO ? GL_DEPTH_ATTACHMENT : GL_DEPTH;
-			if (hasDepth && (c.clear.clearMask & GL_STENCIL_BUFFER_BIT))
-				attachments[count++] = isFBO ? GL_STENCIL_ATTACHMENT : GL_STENCIL;
-			if (glInvalidateFramebuffer != nullptr && count != 0)
-				glInvalidateFramebuffer(GL_FRAMEBUFFER, count, attachments);
-			CHECK_GL_ERROR_IF_DEBUG();
-			break;
-		}
 		case GLRRenderCommand::BLENDCOLOR:
 			glBlendColor(c.blendColor.color[0], c.blendColor.color[1], c.blendColor.color[2], c.blendColor.color[3]);
 			break;
@@ -1106,6 +1049,13 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step, bool first, bool last
 		{
 			if (curProgram != c.program.program) {
 				glUseProgram(c.program.program->program);
+				if (c.program.program->use_clip_distance0 != clipDistance0Enabled) {
+					if (c.program.program->use_clip_distance0)
+						glEnable(GL_CLIP_DISTANCE0);
+					else
+						glDisable(GL_CLIP_DISTANCE0);
+					clipDistance0Enabled = c.program.program->use_clip_distance0;
+				}
 				curProgram = c.program.program;
 			}
 			CHECK_GL_ERROR_IF_DEBUG();
@@ -1116,7 +1066,7 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step, bool first, bool last
 			// TODO: Add fast path for glBindVertexBuffer
 			GLRInputLayout *layout = c.bindVertexBuffer.inputLayout;
 			GLuint buf = c.bindVertexBuffer.buffer ? c.bindVertexBuffer.buffer->buffer_ : 0;
-			_dbg_assert_(!c.bindVertexBuffer.buffer->Mapped());
+			_dbg_assert_(!c.bindVertexBuffer.buffer || !c.bindVertexBuffer.buffer->Mapped());
 			if (buf != curArrayBuffer) {
 				glBindBuffer(GL_ARRAY_BUFFER, buf);
 				curArrayBuffer = buf;
@@ -1340,6 +1290,8 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step, bool first, bool last
 		glDisable(GL_COLOR_LOGIC_OP);
 	}
 #endif
+	if (clipDistance0Enabled)
+		glDisable(GL_CLIP_DISTANCE0);
 	if ((colorMask & 15) != 15)
 		glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 	CHECK_GL_ERROR_IF_DEBUG();

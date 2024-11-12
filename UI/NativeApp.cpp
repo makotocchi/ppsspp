@@ -115,6 +115,7 @@
 #include "UI/RemoteISOScreen.h"
 #include "UI/TiltEventProcessor.h"
 #include "UI/TextureUtil.h"
+#include "UI/Theme.h"
 
 #if !defined(MOBILE_DEVICE) && defined(USING_QT_UI)
 #include "Qt/QtHost.h"
@@ -128,12 +129,6 @@
 #if PPSSPP_PLATFORM(ANDROID)
 #include "android/jni/app-android.h"
 #endif
-
-// The new UI framework, for initialization
-
-static UI::Theme ui_theme;
-
-Atlas g_ui_atlas;
 
 #if PPSSPP_ARCH(ARM) && defined(__ANDROID__)
 #include "../../android/jni/ArmEmitterTest.h"
@@ -389,6 +384,15 @@ static void CheckFailedGPUBackends() {
 	return;
 #endif
 
+#if PPSSPP_PLATFORM(ANDROID)
+	if (System_GetPropertyInt(SYSPROP_SYSTEMVERSION) >= 30) {
+		// In Android 11 or later, Vulkan is as stable as OpenGL, so let's not even bother.
+		// Have also seen unexplained issues with random fallbacks to OpenGL for no good reason,
+		// especially when debugging.
+		return;
+	}
+#endif
+
 	// We only want to do this once per process run and backend, to detect process crashes.
 	// If NativeShutdown is called before we finish, we might call this multiple times.
 	static int lastBackend = -1;
@@ -455,10 +459,8 @@ void NativeInit(int argc, const char *argv[], const char *savegame_dir, const ch
 
 	ShaderTranslationInit();
 
-	InitFastMath(cpu_info.bNEON);
+	InitFastMath();
 	g_threadManager.Init(cpu_info.num_cores, cpu_info.logical_cpu_count);
-
-	SetupAudioFormats();
 
 	g_Discord.SetPresenceMenu();
 
@@ -475,7 +477,7 @@ void NativeInit(int argc, const char *argv[], const char *savegame_dir, const ch
 	// on iOS it's even the path to bundled app assets. It's a mess.
 
 	// We want this to be FIRST.
-#if PPSSPP_PLATFORM(IOS)
+#if PPSSPP_PLATFORM(IOS) || PPSSPP_PLATFORM(MAC)
 	// Packed assets are included in app
 	VFSRegister("", new DirectoryAssetReader(Path(external_dir)));
 #endif
@@ -556,6 +558,10 @@ void NativeInit(int argc, const char *argv[], const char *savegame_dir, const ch
 	g_Config.defaultCurrentDirectory = g_Config.internalDataDirectory;
 	g_Config.memStickDirectory = Path(user_data_path);
 	g_Config.flash0Directory = Path(std::string(external_dir)) / "flash0";
+#elif PPSSPP_PLATFORM(MAC)
+	g_Config.defaultCurrentDirectory = Path(getenv("HOME"));
+	g_Config.memStickDirectory = g_Config.defaultCurrentDirectory / ".config/ppsspp";
+	g_Config.flash0Directory = Path(std::string(external_dir)) / "flash0";
 #elif PPSSPP_PLATFORM(SWITCH)
 	g_Config.memStickDirectory = g_Config.internalDataDirectory / "config/ppsspp";
 	g_Config.flash0Directory = g_Config.internalDataDirectory / "assets/flash0";
@@ -576,6 +582,12 @@ void NativeInit(int argc, const char *argv[], const char *savegame_dir, const ch
 		// Hm, should probably actually explicitly set the current directory..
 		// Though it's not many platforms that'll land us here.
 		g_Config.currentDirectory = Path(".");
+	}
+#endif
+
+#if (PPSSPP_PLATFORM(WINDOWS) && !PPSSPP_PLATFORM(UWP)) || PPSSPP_PLATFORM(MAC)
+	if (g_Config.currentDirectory.empty()) {
+		g_Config.currentDirectory = Path("/");
 	}
 #endif
 
@@ -854,49 +866,6 @@ void NativeInit(int argc, const char *argv[], const char *savegame_dir, const ch
 	restarting = false;
 }
 
-static UI::Style MakeStyle(uint32_t fg, uint32_t bg) {
-	UI::Style s;
-	s.background = UI::Drawable(bg);
-	s.fgColor = fg;
-	return s;
-}
-
-static void UIThemeInit() {
-#if defined(USING_WIN_UI) || PPSSPP_PLATFORM(UWP) || defined(USING_QT_UI)
-	ui_theme.uiFont = UI::FontStyle(FontID("UBUNTU24"), g_Config.sFont.c_str(), 22);
-	ui_theme.uiFontSmall = UI::FontStyle(FontID("UBUNTU24"), g_Config.sFont.c_str(), 15);
-	ui_theme.uiFontSmaller = UI::FontStyle(FontID("UBUNTU24"), g_Config.sFont.c_str(), 12);
-#else
-	ui_theme.uiFont = UI::FontStyle(FontID("UBUNTU24"), "", 20);
-	ui_theme.uiFontSmall = UI::FontStyle(FontID("UBUNTU24"), "", 14);
-	ui_theme.uiFontSmaller = UI::FontStyle(FontID("UBUNTU24"), "", 11);
-#endif
-
-	ui_theme.checkOn = ImageID("I_CHECKEDBOX");
-	ui_theme.checkOff = ImageID("I_SQUARE");
-	ui_theme.whiteImage = ImageID("I_SOLIDWHITE");
-	ui_theme.sliderKnob = ImageID("I_CIRCLE");
-	ui_theme.dropShadow4Grid = ImageID("I_DROP_SHADOW");
-
-	ui_theme.itemStyle = MakeStyle(g_Config.uItemStyleFg, g_Config.uItemStyleBg);
-	ui_theme.itemFocusedStyle = MakeStyle(g_Config.uItemFocusedStyleFg, g_Config.uItemFocusedStyleBg);
-	ui_theme.itemDownStyle = MakeStyle(g_Config.uItemDownStyleFg, g_Config.uItemDownStyleBg);
-	ui_theme.itemDisabledStyle = MakeStyle(g_Config.uItemDisabledStyleFg, g_Config.uItemDisabledStyleBg);
-	ui_theme.itemHighlightedStyle = MakeStyle(g_Config.uItemHighlightedStyleFg, g_Config.uItemHighlightedStyleBg);
-
-	ui_theme.buttonStyle = MakeStyle(g_Config.uButtonStyleFg, g_Config.uButtonStyleBg);
-	ui_theme.buttonFocusedStyle = MakeStyle(g_Config.uButtonFocusedStyleFg, g_Config.uButtonFocusedStyleBg);
-	ui_theme.buttonDownStyle = MakeStyle(g_Config.uButtonDownStyleFg, g_Config.uButtonDownStyleBg);
-	ui_theme.buttonDisabledStyle = MakeStyle(g_Config.uButtonDisabledStyleFg, g_Config.uButtonDisabledStyleBg);
-	ui_theme.buttonHighlightedStyle = MakeStyle(g_Config.uButtonHighlightedStyleFg, g_Config.uButtonHighlightedStyleBg);
-
-	ui_theme.headerStyle.fgColor = g_Config.uHeaderStyleFg;
-	ui_theme.infoStyle = MakeStyle(g_Config.uInfoStyleFg, g_Config.uInfoStyleBg);
-
-	ui_theme.popupTitle.fgColor = g_Config.uPopupTitleStyleFg;
-	ui_theme.popupStyle = MakeStyle(g_Config.uPopupStyleFg, g_Config.uPopupStyleBg);
-}
-
 void RenderOverlays(UIContext *dc, void *userdata);
 bool CreateGlobalPipelines();
 
@@ -914,25 +883,14 @@ bool NativeInitGraphics(GraphicsContext *graphicsContext) {
 		return false;
 	}
 
-	// Load the atlas.
-	size_t atlas_data_size = 0;
-	if (!g_ui_atlas.IsMetadataLoaded()) {
-		const uint8_t *atlas_data = VFSReadFile("ui_atlas.meta", &atlas_data_size);
-		bool load_success = atlas_data != nullptr && g_ui_atlas.Load(atlas_data, atlas_data_size);
-		if (!load_success) {
-			ERROR_LOG(G3D, "Failed to load ui_atlas.meta - graphics will be broken.");
-			// Stumble along with broken visuals instead of dying.
-		}
-		delete[] atlas_data;
-	}
-
-	ui_draw2d.SetAtlas(&g_ui_atlas);
-	ui_draw2d_front.SetAtlas(&g_ui_atlas);
-
-	UIThemeInit();
+	ui_draw2d.SetAtlas(GetUIAtlas());
+	ui_draw2d.SetFontAtlas(GetFontAtlas());
+	ui_draw2d_front.SetAtlas(GetUIAtlas());
+	ui_draw2d_front.SetFontAtlas(GetFontAtlas());
 
 	uiContext = new UIContext();
-	uiContext->theme = &ui_theme;
+	uiContext->theme = GetTheme();
+	UpdateTheme(uiContext);
 
 	ui_draw2d.Init(g_draw, texColorPipeline);
 	ui_draw2d_front.Init(g_draw, texColorPipeline);
@@ -1015,12 +973,12 @@ bool CreateGlobalPipelines() {
 }
 
 void NativeShutdownGraphics() {
+	INFO_LOG(SYSTEM, "NativeShutdownGraphics");
+
 	screenManager->deviceLost();
 
 	if (gpu)
 		gpu->DeviceLost();
-
-	INFO_LOG(SYSTEM, "NativeShutdownGraphics");
 
 #if PPSSPP_PLATFORM(WINDOWS)
 	delete winAudioBackend;
@@ -1184,13 +1142,11 @@ void NativeRender(GraphicsContext *graphicsContext) {
 			// Modifying the bounds here can be used to "inset" the whole image to gain borders for TV overscan etc.
 			// The UI now supports any offset but not the EmuScreen yet.
 			uiContext->SetBounds(Bounds(0, 0, dp_xres, dp_yres));
-			// uiContext->SetBounds(Bounds(dp_xres/2, 0, dp_xres / 2, dp_yres / 2));
 
 			// OSX 10.6 and SDL 1.2 bug.
 #if defined(__APPLE__) && !defined(USING_QT_UI)
 			static int dp_xres_old = dp_xres;
 			if (dp_xres != dp_xres_old) {
-				// uiTexture->Load("ui_atlas.zim");
 				dp_xres_old = dp_xres;
 			}
 #endif

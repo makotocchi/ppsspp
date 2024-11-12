@@ -20,125 +20,112 @@
 #include "ppsspp_config.h"
 
 #include <unordered_map>
-#if PPSSPP_ARCH(ARM)
-#include "Common/ArmEmitter.h"
-#elif PPSSPP_ARCH(ARM64)
-#include "Common/Arm64Emitter.h"
-#elif PPSSPP_ARCH(X86) || PPSSPP_ARCH(AMD64)
-#include "Common/x64Emitter.h"
-#elif PPSSPP_ARCH(MIPS)
-#include "Common/MipsEmitter.h"
-#else
-#include "Common/FakeEmitter.h"
-#endif
 #include "GPU/Math3D.h"
-
-struct SamplerID {
-	SamplerID() : fullKey(0) {
-	}
-
-	union {
-		u32 fullKey;
-		struct {
-			uint8_t texfmt : 4;
-			uint8_t clutfmt : 2;
-			uint8_t : 2;
-			bool swizzle : 1;
-			bool useSharedClut : 1;
-			bool hasClutMask : 1;
-			bool hasClutShift : 1;
-			bool hasClutOffset : 1;
-			bool hasInvalidPtr : 1;
-			bool linear : 1;
-		};
-	};
-
-	bool operator == (const SamplerID &other) const {
-		return fullKey == other.fullKey;
-	}
-};
-
-namespace std {
-
-template <>
-struct hash<SamplerID> {
-	std::size_t operator()(const SamplerID &k) const {
-		return hash<u32>()(k.fullKey);
-	}
-};
-
-};
+#include "GPU/Software/FuncId.h"
+#include "GPU/Software/RasterizerRegCache.h"
 
 namespace Sampler {
 
-typedef u32 (*NearestFunc)(int u, int v, const u8 *tptr, int bufw, int level);
-NearestFunc GetNearestFunc();
+// Our std::unordered_map argument will ignore the alignment attribute, but that doesn't matter.
+// We'll still have and want it for the actual function call, to keep the args in vector registers.
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wignored-attributes"
+#endif
 
-typedef u32 (*LinearFunc)(int u[4], int v[4], int frac_u, int frac_v, const u8 *tptr, int bufw, int level);
-LinearFunc GetLinearFunc();
+typedef Rasterizer::Vec4IntResult(SOFTRAST_CALL *FetchFunc)(int u, int v, const u8 *tptr, int bufw, int level, const SamplerID &samplerID);
+FetchFunc GetFetchFunc(SamplerID id);
 
-struct Funcs {
-	NearestFunc nearest;
-	LinearFunc linear;
-};
-static inline Funcs GetFuncs() {
-	Funcs f;
-	f.nearest = GetNearestFunc();
-	f.linear = GetLinearFunc();
-	return f;
-}
+typedef Rasterizer::Vec4IntResult (SOFTRAST_CALL *NearestFunc)(float s, float t, int x, int y, Rasterizer::Vec4IntArg prim_color, const u8 *const *tptr, const int *bufw, int level, int levelFrac, const SamplerID &samplerID);
+NearestFunc GetNearestFunc(SamplerID id);
+
+typedef Rasterizer::Vec4IntResult (SOFTRAST_CALL *LinearFunc)(float s, float t, int x, int y, Rasterizer::Vec4IntArg prim_color, const u8 *const *tptr, const int *bufw, int level, int levelFrac, const SamplerID &samplerID);
+LinearFunc GetLinearFunc(SamplerID id);
 
 void Init();
 void Shutdown();
 
 bool DescribeCodePtr(const u8 *ptr, std::string &name);
 
-#if PPSSPP_ARCH(ARM)
-class SamplerJitCache : public ArmGen::ARMXCodeBlock {
-#elif PPSSPP_ARCH(ARM64)
-class SamplerJitCache : public Arm64Gen::ARM64CodeBlock {
-#elif PPSSPP_ARCH(X86) || PPSSPP_ARCH(AMD64)
-class SamplerJitCache : public Gen::XCodeBlock {
-#elif PPSSPP_ARCH(MIPS)
-class SamplerJitCache : public MIPSGen::MIPSCodeBlock {
-#else
-class SamplerJitCache : public FakeGen::FakeXCodeBlock {
-#endif
+class SamplerJitCache : public Rasterizer::CodeBlock {
 public:
 	SamplerJitCache();
-
-	void ComputeSamplerID(SamplerID *id_out, bool linear);
 
 	// Returns a pointer to the code to run.
 	NearestFunc GetNearest(const SamplerID &id);
 	LinearFunc GetLinear(const SamplerID &id);
-	void Clear();
+	FetchFunc GetFetch(const SamplerID &id);
+	void Clear() override;
 
-	std::string DescribeCodePtr(const u8 *ptr);
-	std::string DescribeSamplerID(const SamplerID &id);
+	std::string DescribeCodePtr(const u8 *ptr) override;
 
 private:
-	NearestFunc Compile(const SamplerID &id);
+	void Compile(const SamplerID &id);
+	FetchFunc CompileFetch(const SamplerID &id);
+	NearestFunc CompileNearest(const SamplerID &id);
 	LinearFunc CompileLinear(const SamplerID &id);
+
+	Rasterizer::RegCache::Reg GetSamplerID();
+	void UnlockSamplerID(Rasterizer::RegCache::Reg &r);
+
+	void WriteConstantPool(const SamplerID &id);
 
 	bool Jit_ReadTextureFormat(const SamplerID &id);
 	bool Jit_GetTexData(const SamplerID &id, int bitsPerTexel);
 	bool Jit_GetTexDataSwizzled(const SamplerID &id, int bitsPerTexel);
-	bool Jit_GetTexDataSwizzled4();
-	bool Jit_Decode5650();
-	bool Jit_Decode5551();
-	bool Jit_Decode4444();
+	bool Jit_GetTexDataSwizzled4(const SamplerID &id);
+	bool Jit_Decode5650(const SamplerID &id);
+	bool Jit_Decode5551(const SamplerID &id);
+	bool Jit_Decode4444(const SamplerID &id);
 	bool Jit_TransformClutIndex(const SamplerID &id, int bitsPerIndex);
 	bool Jit_ReadClutColor(const SamplerID &id);
 	bool Jit_GetDXT1Color(const SamplerID &id, int blockSize, int alpha);
 	bool Jit_ApplyDXTAlpha(const SamplerID &id);
+	bool Jit_GetTexelCoords(const SamplerID &id);
 
-#if PPSSPP_ARCH(ARM64)
-	Arm64Gen::ARM64FloatEmitter fp;
+	bool Jit_GetTexelCoordsQuad(const SamplerID &id);
+	bool Jit_PrepareDataOffsets(const SamplerID &id, Rasterizer::RegCache::Reg uReg, Rasterizer::RegCache::Reg vReg, bool level1);
+	bool Jit_PrepareDataDirectOffsets(const SamplerID &id, Rasterizer::RegCache::Reg uReg, Rasterizer::RegCache::Reg vReg, bool level1, int bitsPerTexel);
+	bool Jit_PrepareDataSwizzledOffsets(const SamplerID &id, Rasterizer::RegCache::Reg uReg, Rasterizer::RegCache::Reg vReg, bool level1, int bitsPerTexel);
+	bool Jit_PrepareDataDXTOffsets(const SamplerID &id, Rasterizer::RegCache::Reg uReg, Rasterizer::RegCache::Reg vReg, bool level1, int blockSize);
+	bool Jit_FetchQuad(const SamplerID &id, bool level1);
+	bool Jit_GetDataQuad(const SamplerID &id, bool level1, int bitsPerTexel);
+	bool Jit_TransformClutIndexQuad(const SamplerID &id, int bitsPerIndex);
+	bool Jit_ReadClutQuad(const SamplerID &id, bool level1);
+	bool Jit_BlendQuad(const SamplerID &id, bool level1);
+	bool Jit_DecodeQuad(const SamplerID &id, bool level1);
+	bool Jit_Decode5650Quad(const SamplerID &id, Rasterizer::RegCache::Reg quadReg);
+	bool Jit_Decode5551Quad(const SamplerID &id, Rasterizer::RegCache::Reg quadReg);
+	bool Jit_Decode4444Quad(const SamplerID &id, Rasterizer::RegCache::Reg quadReg);
+
+	bool Jit_ApplyTextureFunc(const SamplerID &id);
+
+#if PPSSPP_ARCH(AMD64) || PPSSPP_ARCH(X86)
+	int stackArgPos_ = 0;
+	int stackIDOffset_ = -1;
+	int stackLevelOffset_ = -1;
+	int stackUV1Offset_ = 0;
 #endif
+
+	const u8 *constWidthHeight256f_ = nullptr;
+	const u8 *constWidthMinus1i_ = nullptr;
+	const u8 *constHeightMinus1i_ = nullptr;
+	const u8 *constUNext_ = nullptr;
+	const u8 *constVNext_ = nullptr;
+	const u8 *constOnes32_ = nullptr;
+	const u8 *constOnes16_ = nullptr;
+	const u8 *const10All16_ = nullptr;
+	const u8 *const10Low_ = nullptr;
+	const u8 *const10All8_ = nullptr;
+	const u8 *const5551Swizzle_ = nullptr;
+	const u8 *const5650Swizzle_ = nullptr;
 
 	std::unordered_map<SamplerID, NearestFunc> cache_;
 	std::unordered_map<SamplerID, const u8 *> addresses_;
 };
+
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 };

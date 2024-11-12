@@ -193,6 +193,9 @@ SOURCES_C += \
 	$(EXTDIR)/libpng17/pngwtran.c \
 	$(EXTDIR)/libpng17/pngwutil.c
 
+SOURCES_CXX += \
+    $(EXTDIR)/vma/vk_mem_alloc.cpp
+
 SOURCES_C += $(EXTDIR)/sfmt19937/SFMT.c
 SOURCES_C   += $(EXTDIR)/xxhash.c
 
@@ -259,6 +262,8 @@ SOURCES_CXX += \
 	$(COMMONDIR)/GPU/Vulkan/VulkanDebug.cpp \
 	$(COMMONDIR)/GPU/Vulkan/VulkanImage.cpp \
 	$(COMMONDIR)/GPU/Vulkan/VulkanMemory.cpp \
+	$(COMMONDIR)/GPU/Vulkan/VulkanProfiler.cpp \
+	$(COMMONDIR)/GPU/Vulkan/VulkanBarrier.cpp \
 	$(COMMONDIR)/Input/GestureDetector.cpp \
 	$(COMMONDIR)/Input/InputState.cpp \
 	$(COMMONDIR)/Math/curves.cpp \
@@ -347,10 +352,14 @@ SOURCES_CXX += \
 	$(GPUDIR)/GPU.cpp \
 	$(GPUDIR)/GPUState.cpp \
 	$(GPUDIR)/Math3D.cpp \
+	$(GPUDIR)/Software/BinManager.cpp \
 	$(GPUDIR)/Software/Clipper.cpp \
+	$(GPUDIR)/Software/DrawPixel.cpp \
+	$(GPUDIR)/Software/FuncId.cpp \
 	$(GPUDIR)/Software/Lighting.cpp \
 	$(GPUDIR)/Software/Rasterizer.cpp \
 	$(GPUDIR)/Software/RasterizerRectangle.cpp \
+	$(GPUDIR)/Software/RasterizerRegCache.cpp \
 	$(GPUDIR)/GLES/DepalettizeShaderGLES.cpp \
 	$(GPUDIR)/GLES/DepthBufferGLES.cpp \
 	$(GPUDIR)/GLES/DrawEngineGLES.cpp \
@@ -542,6 +551,7 @@ SOURCES_CXX += \
 	       $(COREDIR)/HLE/sceUsbGps.cpp \
 	       $(COREDIR)/HW/BufferQueue.cpp \
 	       $(COREDIR)/HW/Camera.cpp \
+	       $(COREDIR)/HW/Display.cpp \
 	       $(COREDIR)/HW/SimpleAudioDec.cpp \
 	       $(COREDIR)/HW/AsyncIOManager.cpp \
 	       $(COREDIR)/HW/MediaEngine.cpp \
@@ -618,10 +628,7 @@ ifeq ($(WITH_DYNAREC),1)
 		ifeq ($(HAVE_NEON),1)
 			SOURCES_CXX   += \
 					 $(COREDIR)/MIPS/ARM/ArmCompVFPUNEON.cpp \
-					 $(COREDIR)/MIPS/ARM/ArmCompVFPUNEONUtil.cpp \
-					 $(COREDIR)/Util/AudioFormatNEON.cpp \
-					 $(COMMONDIR)/Data/Convert/ColorConvNEON.cpp \
-					 $(GPUDIR)/Common/TextureDecoderNEON.cpp
+					 $(COREDIR)/MIPS/ARM/ArmCompVFPUNEONUtil.cpp
 
 			SOURCES_C += $(EXTDIR)/libpng17/arm/arm_init.c \
 				     $(EXTDIR)/libpng17/arm/filter_neon_intrinsics.c
@@ -647,10 +654,7 @@ ifeq ($(WITH_DYNAREC),1)
 		ifeq ($(HAVE_NEON),1)
 			SOURCES_CXX   += \
 					 $(COREDIR)/MIPS/ARM/ArmCompVFPUNEON.cpp \
-					 $(COREDIR)/MIPS/ARM/ArmCompVFPUNEONUtil.cpp \
-					 $(COREDIR)/Util/AudioFormatNEON.cpp \
-					 $(COMMONDIR)/Data/Convert/ColorConvNEON.cpp \
-					 $(GPUDIR)/Common/TextureDecoderNEON.cpp
+					 $(COREDIR)/MIPS/ARM/ArmCompVFPUNEONUtil.cpp
 
 			SOURCES_C += $(EXTDIR)/libpng17/arm/arm_init.c \
 				     $(EXTDIR)/libpng17/arm/filter_neon_intrinsics.c
@@ -674,7 +678,7 @@ ifeq ($(WITH_DYNAREC),1)
             CPUFLAGS += -m32
          endif
       endif
-	   SOURCES_CXX += $(GPUDIR)/Software/SamplerX86.cpp
+	   SOURCES_CXX += $(GPUDIR)/Software/DrawPixelX86.cpp $(GPUDIR)/Software/SamplerX86.cpp
 	   SOURCES_CXX += $(COMMONDIR)/x64Emitter.cpp \
 						$(COMMONDIR)/x64Analyzer.cpp \
 						$(COMMONDIR)/ABI.cpp \

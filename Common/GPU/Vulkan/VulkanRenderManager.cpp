@@ -6,8 +6,10 @@
 #include "Common/Log.h"
 #include "Common/StringUtils.h"
 
+#include "Common/GPU/Vulkan/VulkanAlloc.h"
 #include "Common/GPU/Vulkan/VulkanContext.h"
 #include "Common/GPU/Vulkan/VulkanRenderManager.h"
+
 #include "Common/Thread/ThreadUtil.h"
 
 #if 0 // def _DEBUG
@@ -21,6 +23,57 @@
 #endif
 
 using namespace PPSSPP_VK;
+
+bool VKRGraphicsPipeline::Create(VulkanContext *vulkan) {
+	if (!desc) {
+		// Already failed to create this one.
+		return false;
+	}
+	VkPipeline vkpipeline;
+	VkResult result = vkCreateGraphicsPipelines(vulkan->GetDevice(), desc->pipelineCache, 1, &desc->pipe, nullptr, &vkpipeline);
+
+	bool success = true;
+	if (result == VK_INCOMPLETE) {
+		// Bad (disallowed by spec) return value seen on Adreno in Burnout :(  Try to ignore?
+		// Would really like to log more here, we could probably attach more info to desc.
+		//
+		// At least create a null placeholder to avoid creating over and over if something is broken.
+		pipeline = VK_NULL_HANDLE;
+		success = false;
+	} else if (result != VK_SUCCESS) {
+		pipeline = VK_NULL_HANDLE;
+		ERROR_LOG(G3D, "Failed creating graphics pipeline! result='%s'", VulkanResultToString(result));
+		success = false;
+	} else {
+		pipeline = vkpipeline;
+	}
+
+	delete desc;
+	desc = nullptr;
+	return success;
+}
+
+bool VKRComputePipeline::Create(VulkanContext *vulkan) {
+	if (!desc) {
+		// Already failed to create this one.
+		return false;
+	}
+	VkPipeline vkpipeline;
+	VkResult result = vkCreateComputePipelines(vulkan->GetDevice(), desc->pipelineCache, 1, &desc->pipe, nullptr, &vkpipeline);
+
+	bool success = true;
+	if (result != VK_SUCCESS) {
+		pipeline = VK_NULL_HANDLE;
+		ERROR_LOG(G3D, "Failed creating compute pipeline! result='%s'", VulkanResultToString(result));
+		success = false;
+	} else {
+		pipeline = vkpipeline;
+	}
+
+	delete desc;
+	desc = nullptr;
+	return success;
+}
 
 VKRFramebuffer::VKRFramebuffer(VulkanContext *vk, VkCommandBuffer initCmd, VkRenderPass renderPass, int _width, int _height, const char *tag) : vulkan_(vk) {
 	width = _width;
@@ -53,20 +106,20 @@ VKRFramebuffer::VKRFramebuffer(VulkanContext *vk, VkCommandBuffer initCmd, VkRen
 }
 
 VKRFramebuffer::~VKRFramebuffer() {
-	if (color.image)
-		vulkan_->Delete().QueueDeleteImage(color.image);
-	if (depth.image)
-		vulkan_->Delete().QueueDeleteImage(depth.image);
 	if (color.imageView)
 		vulkan_->Delete().QueueDeleteImageView(color.imageView);
 	if (depth.imageView)
 		vulkan_->Delete().QueueDeleteImageView(depth.imageView);
+	if (color.image) {
+		_dbg_assert_(color.alloc);
+		vulkan_->Delete().QueueDeleteImageAllocation(color.image, color.alloc);
+	}
+	if (depth.image) {
+		_dbg_assert_(depth.alloc);
+		vulkan_->Delete().QueueDeleteImageAllocation(depth.image, depth.alloc);
+	}
 	if (depth.depthSampleView)
 		vulkan_->Delete().QueueDeleteImageView(depth.depthSampleView);
-	if (color.memory)
-		vulkan_->Delete().QueueDeleteDeviceMemory(color.memory);
-	if (depth.memory)
-		vulkan_->Delete().QueueDeleteDeviceMemory(depth.memory);
 	if (framebuf)
 		vulkan_->Delete().QueueDeleteFramebuffer(framebuf);
 }
@@ -91,27 +144,11 @@ void CreateImage(VulkanContext *vulkan, VkCommandBuffer cmd, VKRImage &img, int 
 		ici.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
 	}
 
-	VkResult res = vkCreateImage(vulkan->GetDevice(), &ici, nullptr, &img.image);
-	_dbg_assert_(res == VK_SUCCESS);
+	VmaAllocationCreateInfo allocCreateInfo{};
+	allocCreateInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+	VmaAllocationInfo allocInfo{};
 
-	VkMemoryRequirements memreq;
-	bool dedicatedAllocation = false;
-	vulkan->GetImageMemoryRequirements(img.image, &memreq, &dedicatedAllocation);
-
-	VkMemoryAllocateInfo alloc{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-	alloc.allocationSize = memreq.size;
-	VkMemoryDedicatedAllocateInfoKHR dedicatedAllocateInfo{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_KHR};
-	if (dedicatedAllocation) {
-		dedicatedAllocateInfo.image = img.image;
-		alloc.pNext = &dedicatedAllocateInfo;
-	}
-
-	vulkan->MemoryTypeFromProperties(memreq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &alloc.memoryTypeIndex);
-
-	res = vkAllocateMemory(vulkan->GetDevice(), &alloc, nullptr, &img.memory);
-	_dbg_assert_(res == VK_SUCCESS);
-
-	res = vkBindImageMemory(vulkan->GetDevice(), img.image, img.memory, 0);
+	VkResult res = vmaCreateImage(vulkan->Allocator(), &ici, &allocCreateInfo, &img.image, &img.alloc, &allocInfo);
 	_dbg_assert_(res == VK_SUCCESS);
 
 	VkImageAspectFlags aspects = color ? VK_IMAGE_ASPECT_COLOR_BIT : (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
@@ -158,7 +195,7 @@ void CreateImage(VulkanContext *vulkan, VkCommandBuffer cmd, VKRImage &img, int 
 
 	TransitionImageLayout2(cmd, img.image, 0, 1, aspects,
 		VK_IMAGE_LAYOUT_UNDEFINED, initialLayout,
-		VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, dstStage,
+		VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, dstStage,
 		0, dstAccessMask);
 	img.layout = initialLayout;
 
@@ -178,7 +215,7 @@ VulkanRenderManager::VulkanRenderManager(VulkanContext *vulkan) : vulkan_(vulkan
 	for (int i = 0; i < inflightFramesAtStart_; i++) {
 		VkCommandPoolCreateInfo cmd_pool_info = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
 		cmd_pool_info.queueFamilyIndex = vulkan_->GetGraphicsQueueFamilyIndex();
-		cmd_pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+		cmd_pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
 		VkResult res = vkCreateCommandPool(vulkan_->GetDevice(), &cmd_pool_info, nullptr, &frameData_[i].cmdPoolInit);
 		_dbg_assert_(res == VK_SUCCESS);
 		res = vkCreateCommandPool(vulkan_->GetDevice(), &cmd_pool_info, nullptr, &frameData_[i].cmdPoolMain);
@@ -289,6 +326,8 @@ bool VulkanRenderManager::CreateBackbuffers() {
 		threadInitFrame_ = vulkan_->GetCurFrame();
 		INFO_LOG(G3D, "Starting Vulkan submission thread (threadInitFrame_ = %d)", vulkan_->GetCurFrame());
 		thread_ = std::thread(&VulkanRenderManager::ThreadFunc, this);
+		INFO_LOG(G3D, "Starting Vulkan compiler thread");
+		compileThread_ = std::thread(&VulkanRenderManager::CompileThreadFunc, this);
 	}
 	return true;
 }
@@ -312,6 +351,9 @@ void VulkanRenderManager::StopThread() {
 		}
 		thread_.join();
 		INFO_LOG(G3D, "Vulkan submission thread joined. Frame=%d", vulkan_->GetCurFrame());
+		compileCond_.notify_all();
+		compileThread_.join();
+		INFO_LOG(G3D, "Vulkan compiler thread joined.");
 
 		// Eat whatever has been queued up for this frame if anything.
 		Wipe();
@@ -358,10 +400,8 @@ void VulkanRenderManager::DestroyBackbuffers() {
 		vulkan_->Delete().QueueDeleteImageView(depth_.view);
 	}
 	if (depth_.image) {
-		vulkan_->Delete().QueueDeleteImage(depth_.image);
-	}
-	if (depth_.mem) {
-		vulkan_->Delete().QueueDeleteDeviceMemory(depth_.mem);
+		_dbg_assert_(depth_.alloc);
+		vulkan_->Delete().QueueDeleteImageAllocation(depth_.image, depth_.alloc);
 	}
 	depth_ = {};
 	for (uint32_t i = 0; i < framebuffers_.size(); i++) {
@@ -378,6 +418,7 @@ VulkanRenderManager::~VulkanRenderManager() {
 	StopThread();
 	vulkan_->WaitUntilQueueIdle();
 
+	DrainCompileQueue();
 	VkDevice device = vulkan_->GetDevice();
 	vkDestroySemaphore(device, acquireSemaphore_, nullptr);
 	vkDestroySemaphore(device, renderingCompleteSemaphore_, nullptr);
@@ -391,6 +432,42 @@ VulkanRenderManager::~VulkanRenderManager() {
 		vkDestroyQueryPool(device, frameData_[i].profile.queryPool, nullptr);
 	}
 	queueRunner_.DestroyDeviceObjects();
+}
+
+void VulkanRenderManager::CompileThreadFunc() {
+	SetCurrentThreadName("ShaderCompile");
+	while (true) {
+		std::vector<CompileQueueEntry> toCompile;
+		{
+			std::unique_lock<std::mutex> lock(compileMutex_);
+			if (compileQueue_.empty()) {
+				compileCond_.wait(lock);
+			}
+			toCompile = std::move(compileQueue_);
+			compileQueue_.clear();
+		}
+		if (!run_) {
+			break;
+		}
+		for (auto &entry : toCompile) {
+			switch (entry.type) {
+			case CompileQueueEntry::Type::GRAPHICS:
+				entry.graphics->Create(vulkan_);
+				break;
+			case CompileQueueEntry::Type::COMPUTE:
+				entry.compute->Create(vulkan_);
+				break;
+			}
+		}
+		queueRunner_.NotifyCompileDone();
+	}
+}
+
+void VulkanRenderManager::DrainCompileQueue() {
+	std::unique_lock<std::mutex> lock(compileMutex_);
+	while (!compileQueue_.empty()) {
+		queueRunner_.WaitForCompileNotification();
+	}
 }
 
 void VulkanRenderManager::ThreadFunc() {
@@ -439,7 +516,7 @@ void VulkanRenderManager::ThreadFunc() {
 	VLOG("PULL: Quitting");
 }
 
-void VulkanRenderManager::BeginFrame(bool enableProfiling) {
+void VulkanRenderManager::BeginFrame(bool enableProfiling, bool enableLogProfiler) {
 	VLOG("BeginFrame");
 	VkDevice device = vulkan_->GetDevice();
 
@@ -506,7 +583,8 @@ void VulkanRenderManager::BeginFrame(bool enableProfiling) {
 	if (!run_) {
 		WARN_LOG(G3D, "BeginFrame while !run_!");
 	}
-	vulkan_->BeginFrame();
+
+	vulkan_->BeginFrame(enableLogProfiler ? GetInitCmd() : VK_NULL_HANDLE);
 
 	insideFrame_ = true;
 	renderStepOffset_ = 0;
@@ -534,6 +612,7 @@ VkCommandBuffer VulkanRenderManager::GetInitCmd() {
 			nullptr,
 			VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
 		};
+		vkResetCommandPool(vulkan_->GetDevice(), frameData.cmdPoolInit, 0);
 		VkResult res = vkBeginCommandBuffer(frameData.initCmd, &begin);
 		if (res != VK_SUCCESS) {
 			return VK_NULL_HANDLE;
@@ -808,9 +887,6 @@ bool VulkanRenderManager::InitBackbufferFramebuffers(int width, int height) {
 }
 
 bool VulkanRenderManager::InitDepthStencilBuffer(VkCommandBuffer cmd) {
-	VkResult res;
-	bool pass;
-
 	const VkFormat depth_format = vulkan_->GetDeviceInfo().preferredDepthStencilFormat;
 	int aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
 	VkImageCreateInfo image_info = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
@@ -830,50 +906,23 @@ bool VulkanRenderManager::InitDepthStencilBuffer(VkCommandBuffer cmd) {
 
 	depth_.format = depth_format;
 
-	VkDevice device = vulkan_->GetDevice();
-	res = vkCreateImage(device, &image_info, nullptr, &depth_.image);
+	VmaAllocationCreateInfo allocCreateInfo{};
+	VmaAllocationInfo allocInfo{};
+
+	allocCreateInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+
+	VkResult res = vmaCreateImage(vulkan_->Allocator(), &image_info, &allocCreateInfo, &depth_.image, &depth_.alloc, &allocInfo);
 	_dbg_assert_(res == VK_SUCCESS);
 	if (res != VK_SUCCESS)
 		return false;
 
 	vulkan_->SetDebugName(depth_.image, VK_OBJECT_TYPE_IMAGE, "BackbufferDepth");
 
-	bool dedicatedAllocation = false;
-	VkMemoryRequirements mem_reqs;
-	vulkan_->GetImageMemoryRequirements(depth_.image, &mem_reqs, &dedicatedAllocation);
-
-	VkMemoryAllocateInfo mem_alloc = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-	mem_alloc.allocationSize = mem_reqs.size;
-	mem_alloc.memoryTypeIndex = 0;
-
-	VkMemoryDedicatedAllocateInfoKHR dedicatedAllocateInfo{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_KHR};
-	if (dedicatedAllocation) {
-		dedicatedAllocateInfo.image = depth_.image;
-		mem_alloc.pNext = &dedicatedAllocateInfo;
-	}
-
-	// Use the memory properties to determine the type of memory required
-	pass = vulkan_->MemoryTypeFromProperties(mem_reqs.memoryTypeBits,
-		0, /* No requirements */
-		&mem_alloc.memoryTypeIndex);
-	_dbg_assert_(pass);
-	if (!pass)
-		return false;
-
-	res = vkAllocateMemory(device, &mem_alloc, NULL, &depth_.mem);
-	_dbg_assert_(res == VK_SUCCESS);
-	if (res != VK_SUCCESS)
-		return false;
-
-	res = vkBindImageMemory(device, depth_.image, depth_.mem, 0);
-	_dbg_assert_(res == VK_SUCCESS);
-	if (res != VK_SUCCESS)
-		return false;
-
 	TransitionImageLayout2(cmd, depth_.image, 0, 1,
 		aspectMask,
 		VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-		VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+		VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+		VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
 		0, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
 
 	VkImageViewCreateInfo depth_view_info = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
@@ -890,6 +939,8 @@ bool VulkanRenderManager::InitDepthStencilBuffer(VkCommandBuffer cmd) {
 	depth_view_info.subresourceRange.layerCount = 1;
 	depth_view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
 	depth_view_info.flags = 0;
+
+	VkDevice device = vulkan_->GetDevice();
 
 	res = vkCreateImageView(device, &depth_view_info, NULL, &depth_.view);
 	_dbg_assert_(res == VK_SUCCESS);
@@ -1184,7 +1235,6 @@ void VulkanRenderManager::BeginSubmitFrame(int frame) {
 	FrameData &frameData = frameData_[frame];
 	if (!frameData.hasBegun) {
 		// Get the index of the next available swapchain image, and a semaphore to block command buffer execution on.
-		// Now, I wonder if we should do this early in the frame or late? Right now we do it early, which should be fine.
 		VkResult res = vkAcquireNextImageKHR(vulkan_->GetDevice(), vulkan_->GetSwapchain(), UINT64_MAX, acquireSemaphore_, (VkFence)VK_NULL_HANDLE, &frameData.curSwapchainImage);
 		if (res == VK_SUBOPTIMAL_KHR) {
 			// Hopefully the resize will happen shortly. Ignore - one frame might look bad or something.
@@ -1196,6 +1246,7 @@ void VulkanRenderManager::BeginSubmitFrame(int frame) {
 			_assert_msg_(res == VK_SUCCESS, "vkAcquireNextImageKHR failed! result=%s", VulkanResultToString(res));
 		}
 
+		vkResetCommandPool(vulkan_->GetDevice(), frameData.cmdPoolMain, 0);
 		VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
 		begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 		res = vkBeginCommandBuffer(frameData.mainCmd, &begin);
@@ -1355,6 +1406,7 @@ void VulkanRenderManager::EndSyncFrame(int frame) {
 		nullptr,
 		VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
 	};
+	vkResetCommandPool(vulkan_->GetDevice(), frameData.cmdPoolMain, 0);
 	VkResult res = vkBeginCommandBuffer(frameData.mainCmd, &begin);
 	_assert_(res == VK_SUCCESS);
 

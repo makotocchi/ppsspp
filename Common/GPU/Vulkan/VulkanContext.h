@@ -8,6 +8,16 @@
 #include "Common/Log.h"
 #include "Common/GPU/Vulkan/VulkanLoader.h"
 #include "Common/GPU/Vulkan/VulkanDebug.h"
+#include "Common/GPU/Vulkan/VulkanAlloc.h"
+#include "Common/GPU/Vulkan/VulkanProfiler.h"
+
+// Enable or disable a simple logging profiler for Vulkan.
+// Mostly useful for profiling texture uploads currently, but could be useful for
+// other things as well. We also have a nice integrated render pass profiler in the queue
+// runner, but this one is more convenient for transient events.
+
+#define VK_PROFILE_BEGIN(vulkan, cmd, stage, ...) vulkan->GetProfiler()->Begin(cmd, stage, __VA_ARGS__);
+#define VK_PROFILE_END(vulkan, cmd, stage) vulkan->GetProfiler()->End(cmd, stage);
 
 enum {
 	VULKAN_FLAG_VALIDATE = 1,
@@ -25,6 +35,9 @@ enum {
 	VULKAN_VENDOR_QUALCOMM = 0x00005143,
 	VULKAN_VENDOR_IMGTEC = 0x00001010,  // PowerVR
 };
+
+VK_DEFINE_HANDLE(VmaAllocator);
+VK_DEFINE_HANDLE(VmaAllocation);
 
 std::string VulkanVendorString(uint32_t vendorId);
 
@@ -58,8 +71,25 @@ struct VulkanPhysicalDeviceInfo {
 	bool canBlitToPreferredDepthStencilFormat;
 };
 
+class VulkanProfiler;
+
+// Extremely rough split of capabilities.
+enum class PerfClass {
+	SLOW,
+	FAST,
+};
+
 // This is a bit repetitive...
 class VulkanDeleteList {
+	struct BufferWithAlloc {
+		VkBuffer buffer;
+		VmaAllocation alloc;
+	};
+	struct ImageWithAlloc {
+		VkImage image;
+		VmaAllocation alloc;
+	};
+
 	struct Callback {
 		explicit Callback(void(*f)(void *userdata), void *u)
 			: func(f), userdata(u) {
@@ -76,7 +106,6 @@ public:
 	void QueueDeleteShaderModule(VkShaderModule &module) { _dbg_assert_(module != VK_NULL_HANDLE); modules_.push_back(module); module = VK_NULL_HANDLE; }
 	void QueueDeleteBuffer(VkBuffer &buffer) { _dbg_assert_(buffer != VK_NULL_HANDLE); buffers_.push_back(buffer); buffer = VK_NULL_HANDLE; }
 	void QueueDeleteBufferView(VkBufferView &bufferView) { _dbg_assert_(bufferView != VK_NULL_HANDLE); bufferViews_.push_back(bufferView); bufferView = VK_NULL_HANDLE; }
-	void QueueDeleteImage(VkImage &image) { _dbg_assert_(image != VK_NULL_HANDLE); images_.push_back(image); image = VK_NULL_HANDLE; }
 	void QueueDeleteImageView(VkImageView &imageView) { _dbg_assert_(imageView != VK_NULL_HANDLE); imageViews_.push_back(imageView); imageView = VK_NULL_HANDLE; }
 	void QueueDeleteDeviceMemory(VkDeviceMemory &deviceMemory) { _dbg_assert_(deviceMemory != VK_NULL_HANDLE); deviceMemory_.push_back(deviceMemory); deviceMemory = VK_NULL_HANDLE; }
 	void QueueDeleteSampler(VkSampler &sampler) { _dbg_assert_(sampler != VK_NULL_HANDLE); samplers_.push_back(sampler); sampler = VK_NULL_HANDLE; }
@@ -88,16 +117,30 @@ public:
 	void QueueDeleteDescriptorSetLayout(VkDescriptorSetLayout &descSetLayout) { _dbg_assert_(descSetLayout != VK_NULL_HANDLE); descSetLayouts_.push_back(descSetLayout); descSetLayout = VK_NULL_HANDLE; }
 	void QueueCallback(void(*func)(void *userdata), void *userdata) { callbacks_.push_back(Callback(func, userdata)); }
 
+	void QueueDeleteBufferAllocation(VkBuffer &buffer, VmaAllocation &alloc) { 
+		_dbg_assert_(buffer != VK_NULL_HANDLE); 
+		buffersWithAllocs_.push_back(BufferWithAlloc{ buffer, alloc });
+		buffer = VK_NULL_HANDLE;
+		alloc = VK_NULL_HANDLE;
+	}
+	void QueueDeleteImageAllocation(VkImage &image, VmaAllocation &alloc) {
+		_dbg_assert_(image != VK_NULL_HANDLE && alloc != VK_NULL_HANDLE);
+		imagesWithAllocs_.push_back(ImageWithAlloc{ image, alloc });
+		image = VK_NULL_HANDLE;
+		alloc = VK_NULL_HANDLE;
+	}
+
 	void Take(VulkanDeleteList &del);
-	void PerformDeletes(VkDevice device);
+	void PerformDeletes(VkDevice device, VmaAllocator allocator);
 
 private:
 	std::vector<VkCommandPool> cmdPools_;
 	std::vector<VkDescriptorPool> descPools_;
 	std::vector<VkShaderModule> modules_;
 	std::vector<VkBuffer> buffers_;
+	std::vector<BufferWithAlloc> buffersWithAllocs_;
 	std::vector<VkBufferView> bufferViews_;
-	std::vector<VkImage> images_;
+	std::vector<ImageWithAlloc> imagesWithAllocs_;
 	std::vector<VkImageView> imageViews_;
 	std::vector<VkDeviceMemory> deviceMemory_;
 	std::vector<VkSampler> samplers_;
@@ -128,6 +171,7 @@ public:
 	int GetBestPhysicalDevice();
 	int GetPhysicalDeviceByName(std::string name);
 	void ChooseDevice(int physical_device);
+	bool EnableInstanceExtension(const char *extension);
 	bool EnableDeviceExtension(const char *extension);
 	VkResult CreateDevice();
 
@@ -162,8 +206,12 @@ public:
 	int GetBackbufferWidth() { return (int)swapChainExtent_.width; }
 	int GetBackbufferHeight() { return (int)swapChainExtent_.height; }
 
-	void BeginFrame();
+	void BeginFrame(VkCommandBuffer firstCommandBuffer);
 	void EndFrame();
+
+	VulkanProfiler *GetProfiler() {
+		return &frame_[curFrame_].profiler;
+	}
 
 	// Simple workaround for the casting warning.
 	template <class T>
@@ -267,6 +315,12 @@ public:
 		return swapchainFormat_;
 	}
 
+	void SetProfilerEnabledPtr(bool *enabled) {
+		for (auto &frame : frame_) {
+			frame.profiler.SetEnabledPtr(enabled);
+		}
+	}
+
 	// 1 for no frame overlap and thus minimal latency but worst performance.
 	// 2 is an OK compromise, while 3 performs best but risks slightly higher latency.
 	enum {
@@ -275,7 +329,19 @@ public:
 
 	const VulkanExtensions &Extensions() { return extensionsLookup_; }
 
+	PerfClass DevicePerfClass() const {
+		return devicePerfClass_;
+	}
+
 	void GetImageMemoryRequirements(VkImage image, VkMemoryRequirements *mem_reqs, bool *dedicatedAllocation);
+
+	VmaAllocator Allocator() const {
+		return allocator_;
+	}
+
+	const std::vector<VkSurfaceFormatKHR> &SurfaceFormats() {
+		return surfFormats_;
+	}
 
 private:
 	bool ChooseQueue();
@@ -333,12 +399,14 @@ private:
 	VkExtent2D swapChainExtent_{};
 
 	int flags_ = 0;
+	PerfClass devicePerfClass_ = PerfClass::SLOW;
 
 	int inflightFrames_ = MAX_INFLIGHT_FRAMES;
 
 	struct FrameData {
 		FrameData() {}
 		VulkanDeleteList deleteList;
+		VulkanProfiler profiler;
 	};
 	FrameData frame_[MAX_INFLIGHT_FRAMES];
 	int curFrame_ = 0;
@@ -357,8 +425,11 @@ private:
 	PhysicalDeviceFeatures deviceFeatures_;
 
 	VkSurfaceCapabilitiesKHR surfCapabilities_{};
+	std::vector<VkSurfaceFormatKHR> surfFormats_{};
 
 	std::vector<VkCommandBuffer> cmdQueue_;
+
+	VmaAllocator allocator_ = VK_NULL_HANDLE;
 };
 
 // Detailed control.
@@ -380,6 +451,9 @@ enum class GLSLVariant {
 bool GLSLtoSPV(const VkShaderStageFlagBits shader_type, const char *sourceCode, GLSLVariant variant, std::vector<uint32_t> &spirv, std::string *errorMessage);
 
 const char *VulkanResultToString(VkResult res);
+const char *VulkanColorSpaceToString(VkColorSpaceKHR colorSpace);
+const char *VulkanFormatToString(VkFormat format);
+
 std::string FormatDriverVersion(const VkPhysicalDeviceProperties &props);
 
 // Simple heuristic.

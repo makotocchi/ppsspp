@@ -14,6 +14,12 @@
 #include "Common/System/NativeApp.h"
 #include "Common/System/System.h"
 
+#include "Common/CommonWindows.h"
+#if PPSSPP_PLATFORM(WINDOWS)
+#include <timeapi.h>
+#else
+#include <csignal>
+#endif
 #include "Common/CPUDetect.h"
 #include "Common/File/VFS/VFS.h"
 #include "Common/File/VFS/AssetReader.h"
@@ -161,7 +167,7 @@ bool RunAutoTest(HeadlessHost *headlessHost, CoreParameter &coreParameter, bool 
 		coreParameter.collectEmuLog = &output;
 
 	std::string error_string;
-	if (!PSP_Init(coreParameter, &error_string)) {
+	if (!PSP_InitStart(coreParameter, &error_string)) {
 		fprintf(stderr, "Failed to start '%s'. Error: %s\n", coreParameter.fileToStart.c_str(), error_string.c_str());
 		printf("TESTERROR\n");
 		TeamCityPrint("testIgnored name='%s' message='PRX/ELF missing'", currentTestName.c_str());
@@ -176,10 +182,17 @@ bool RunAutoTest(HeadlessHost *headlessHost, CoreParameter &coreParameter, bool 
 	if (autoCompare)
 		headlessHost->SetComparisonScreenshot(ExpectedScreenshotFromFilename(coreParameter.fileToStart));
 
+	while (!PSP_InitUpdate(&error_string))
+		sleep_ms(1);
+	if (!PSP_IsInited()) {
+		TeamCityPrint("testFailed name='%s' message='Startup failed'", currentTestName.c_str());
+		TeamCityPrint("testFinished name='%s'", currentTestName.c_str());
+		GitHubActionsPrint("error", "Test timeout for %s", currentTestName.c_str());
+		return false;
+	}
+
 	bool passed = true;
-	// TODO: We must have some kind of stack overflow or we're not following the ABI right.
-	// This gets trashed if it's not static.
-	static double deadline;
+	double deadline;
 	deadline = time_now_d() + timeout;
 
 	Core_UpdateDebugStats(g_Config.bShowDebugStats || g_Config.bLogFrameDrops);
@@ -191,7 +204,7 @@ bool RunAutoTest(HeadlessHost *headlessHost, CoreParameter &coreParameter, bool 
 	coreState = coreParameter.startBreak ? CORE_STEPPING : CORE_RUNNING;
 	while (coreState == CORE_RUNNING || coreState == CORE_STEPPING)
 	{
-		int blockTicks = usToCycles(1000000 / 10);
+		int blockTicks = (int)usToCycles(1000000 / 10);
 		PSP_RunLoopFor(blockTicks);
 
 		// If we were rendering, this might be a nice time to do something about it.
@@ -233,6 +246,14 @@ bool RunAutoTest(HeadlessHost *headlessHost, CoreParameter &coreParameter, bool 
 int main(int argc, const char* argv[])
 {
 	PROFILE_INIT();
+#if PPSSPP_PLATFORM(WINDOWS)
+	timeBeginPeriod(1);
+#else
+	// Ignore sigpipe.
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+		perror("Unable to ignore SIGPIPE");
+	}
+#endif
 
 #if defined(_DEBUG) && defined(_MSC_VER)
 	_CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
@@ -305,7 +326,7 @@ int main(int argc, const char* argv[])
 		} else if (!strncmp(argv[i], "--screenshot=", strlen("--screenshot=")) && strlen(argv[i]) > strlen("--screenshot="))
 			screenshotFilename = argv[i] + strlen("--screenshot=");
 		else if (!strncmp(argv[i], "--timeout=", strlen("--timeout=")) && strlen(argv[i]) > strlen("--timeout="))
-			timeout = strtod(argv[i] + strlen("--timeout="), NULL);
+			timeout = (float)strtod(argv[i] + strlen("--timeout="), NULL);
 		else if (!strncmp(argv[i], "--debugger=", strlen("--debugger=")) && strlen(argv[i]) > strlen("--debugger="))
 			debuggerPort = (int)strtoul(argv[i] + strlen("--debugger="), NULL, 10);
 		else if (!strcmp(argv[i], "--teamcity"))
@@ -395,6 +416,7 @@ int main(int argc, const char* argv[])
 	g_Config.bEnableLogging = fullLog;
 	g_Config.bSoftwareSkinning = true;
 	g_Config.bVertexDecoderJit = true;
+	g_Config.bSoftwareRenderingJit = true;
 	g_Config.bBlockTransferGPU = true;
 	g_Config.iSplineBezierQuality = 2;
 	g_Config.bHighQualityDepth = true;
@@ -408,13 +430,14 @@ int main(int argc, const char* argv[])
 	g_Config.iGlobalVolume = VOLUME_FULL;
 	g_Config.iReverbVolume = VOLUME_FULL;
 
-#ifdef _WIN32
+#if PPSSPP_PLATFORM(WINDOWS)
 	g_Config.internalDataDirectory.clear();
 	InitSysDirectories();
 #endif
 
-#if !defined(__ANDROID__) && !defined(_WIN32)
+#if !PPSSPP_PLATFORM(ANDROID) && !PPSSPP_PLATFORM(WINDOWS)
 	g_Config.memStickDirectory = Path(std::string(getenv("HOME"))) / ".ppsspp";
+	g_Config.flash0Directory = File::GetExeDirectory() / "assets/flash0";
 #endif
 
 	// Try to find the flash0 directory.  Often this is from a subdirectory.
@@ -431,7 +454,7 @@ int main(int argc, const char* argv[])
 	if (screenshotFilename != 0)
 		headlessHost->SetComparisonScreenshot(Path(std::string(screenshotFilename)));
 
-#ifdef __ANDROID__
+#if PPSSPP_PLATFORM(ANDROID)
 	// For some reason the debugger installs it with this name?
 	if (File::Exists(Path("/data/app/org.ppsspp.ppsspp-2.apk"))) {
 		VFSRegister("", new ZipAssetReader("/data/app/org.ppsspp.ppsspp-2.apk", "assets/"));
@@ -439,6 +462,8 @@ int main(int argc, const char* argv[])
 	if (File::Exists(Path("/data/app/org.ppsspp.ppsspp.apk"))) {
 		VFSRegister("", new ZipAssetReader("/data/app/org.ppsspp.ppsspp.apk", "assets/"));
 	}
+#elif !PPSSPP_PLATFORM(WINDOWS)
+	VFSRegister("", new DirectoryAssetReader(g_Config.flash0Directory / ".."));
 #endif
 
 	UpdateUIState(UISTATE_INGAME);
@@ -498,5 +523,11 @@ int main(int argc, const char* argv[])
 	LogManager::Shutdown();
 	delete printfLogger;
 
+#if PPSSPP_PLATFORM(WINDOWS)
+	timeEndPeriod(1);
+#endif
+
+	if (!failedTests.empty() && !teamCityMode)
+		return 1;
 	return 0;
 }

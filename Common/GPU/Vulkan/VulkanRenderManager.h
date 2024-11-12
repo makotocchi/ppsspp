@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <mutex>
 #include <thread>
+#include <queue>
 
 #include "Common/System/Display.h"
 #include "Common/GPU/Vulkan/VulkanContext.h"
@@ -18,6 +19,9 @@
 #include "Common/GPU/DataFormat.h"
 #include "Common/GPU/Vulkan/VulkanQueueRunner.h"
 
+// Forward declaration
+VK_DEFINE_HANDLE(VmaAllocation);
+
 // Simple independent framebuffer image. Gets its own allocation, we don't have that many framebuffers so it's fine
 // to let them have individual non-pooled allocations. Until it's not fine. We'll see.
 struct VKRImage {
@@ -25,7 +29,7 @@ struct VKRImage {
 	VkImage image;
 	VkImageView imageView;
 	VkImageView depthSampleView;
-	VkDeviceMemory memory;
+	VmaAllocation alloc;
 	VkFormat format;
 
 	// This one is used by QueueRunner's Perform functions to keep track. CANNOT be used anywhere else due to sync issues.
@@ -109,15 +113,81 @@ struct BoundingRect {
 	}
 };
 
+// All the data needed to create a graphics pipeline.
+struct VKRGraphicsPipelineDesc {
+	VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+	VkPipelineColorBlendStateCreateInfo cbs{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+	VkPipelineColorBlendAttachmentState blend0{};
+	VkPipelineDepthStencilStateCreateInfo dss{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+	VkDynamicState dynamicStates[6]{};
+	VkPipelineDynamicStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+	VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+	VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+	VkPipelineShaderStageCreateInfo shaderStageInfo[2]{};
+	VkPipelineInputAssemblyStateCreateInfo inputAssembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+	VkVertexInputAttributeDescription attrs[8]{};
+	VkVertexInputBindingDescription ibd{};
+	VkPipelineVertexInputStateCreateInfo vis{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+	VkPipelineViewportStateCreateInfo views{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+	VkGraphicsPipelineCreateInfo pipe{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+};
+
+// All the data needed to create a compute pipeline.
+struct VKRComputePipelineDesc {
+	VkPipelineCache pipelineCache;
+	VkComputePipelineCreateInfo pipe{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+};
+
+// Wrapped pipeline, which will later allow for background compilation while emulating the rest of the frame.
+struct VKRGraphicsPipeline {
+	VKRGraphicsPipeline() {
+		pipeline = VK_NULL_HANDLE;
+	}
+	VKRGraphicsPipelineDesc *desc = nullptr;  // While non-zero, is pending and pipeline isn't valid.
+	std::atomic<VkPipeline> pipeline;
+
+	bool Create(VulkanContext *vulkan);
+	bool Pending() const {
+		return pipeline == VK_NULL_HANDLE && desc != nullptr;
+	}
+};
+
+struct VKRComputePipeline {
+	VKRComputePipeline() {
+		pipeline = VK_NULL_HANDLE;
+	}
+	VKRComputePipelineDesc *desc = nullptr;
+	std::atomic<VkPipeline> pipeline;
+
+	bool Create(VulkanContext *vulkan);
+	bool Pending() const {
+		return pipeline == VK_NULL_HANDLE && desc != nullptr;
+	}
+};
+
+struct CompileQueueEntry {
+	CompileQueueEntry(VKRGraphicsPipeline *p) : type(Type::GRAPHICS), graphics(p) {}
+	CompileQueueEntry(VKRComputePipeline *p) : type(Type::COMPUTE), compute(p) {}
+	enum class Type {
+		GRAPHICS,
+		COMPUTE,
+	};
+	Type type;
+	VKRGraphicsPipeline *graphics = nullptr;
+	VKRComputePipeline *compute = nullptr;
+};
+
 class VulkanRenderManager {
 public:
 	VulkanRenderManager(VulkanContext *vulkan);
 	~VulkanRenderManager();
 
 	void ThreadFunc();
+	void CompileThreadFunc();
+	void DrainCompileQueue();
 
 	// Makes sure that the GPU has caught up enough that we can start writing buffers of this frame again.
-	void BeginFrame(bool enableProfiling);
+	void BeginFrame(bool enableProfiling, bool enableLogProfiler);
 	// Can run on a different thread!
 	void Finish();
 	void Run(int frame);
@@ -152,11 +222,51 @@ public:
 	void CopyFramebuffer(VKRFramebuffer *src, VkRect2D srcRect, VKRFramebuffer *dst, VkOffset2D dstPos, VkImageAspectFlags aspectMask, const char *tag);
 	void BlitFramebuffer(VKRFramebuffer *src, VkRect2D srcRect, VKRFramebuffer *dst, VkRect2D dstRect, VkImageAspectFlags aspectMask, VkFilter filter, const char *tag);
 
+	// Deferred creation, like in GL. Unlike GL though, the purpose is to allow background creation and avoiding
+	// stalling the emulation thread as much as possible.
+	VKRGraphicsPipeline *CreateGraphicsPipeline(VKRGraphicsPipelineDesc *desc) {
+		VKRGraphicsPipeline *pipeline = new VKRGraphicsPipeline();
+		pipeline->desc = desc;
+		compileMutex_.lock();
+		compileQueue_.push_back(CompileQueueEntry(pipeline));
+		compileCond_.notify_one();
+		compileMutex_.unlock();
+		return pipeline;
+	}
+
+	VKRComputePipeline *CreateComputePipeline(VKRComputePipelineDesc *desc) {
+		VKRComputePipeline *pipeline = new VKRComputePipeline();
+		pipeline->desc = desc;
+		compileMutex_.lock();
+		compileQueue_.push_back(CompileQueueEntry(pipeline));
+		compileCond_.notify_one();
+		compileMutex_.unlock();
+		return pipeline;
+	}
+
 	void BindPipeline(VkPipeline pipeline, PipelineFlags flags) {
 		_dbg_assert_(curRenderStep_ && curRenderStep_->stepType == VKRStepType::RENDER);
 		_dbg_assert_(pipeline != VK_NULL_HANDLE);
 		VkRenderData data{ VKRRenderCommand::BIND_PIPELINE };
 		data.pipeline.pipeline = pipeline;
+		curPipelineFlags_ |= flags;
+		curRenderStep_->commands.push_back(data);
+	}
+
+	void BindPipeline(VKRGraphicsPipeline *pipeline, PipelineFlags flags) {
+		_dbg_assert_(curRenderStep_ && curRenderStep_->stepType == VKRStepType::RENDER);
+		_dbg_assert_(pipeline != nullptr);
+		VkRenderData data{ VKRRenderCommand::BIND_GRAPHICS_PIPELINE };
+		data.graphics_pipeline.pipeline = pipeline;
+		curPipelineFlags_ |= flags;
+		curRenderStep_->commands.push_back(data);
+	}
+
+	void BindPipeline(VKRComputePipeline *pipeline, PipelineFlags flags) {
+		_dbg_assert_(curRenderStep_ && curRenderStep_->stepType == VKRStepType::RENDER);
+		_dbg_assert_(pipeline != nullptr);
+		VkRenderData data{ VKRRenderCommand::BIND_COMPUTE_PIPELINE };
+		data.compute_pipeline.pipeline = pipeline;
 		curPipelineFlags_ |= flags;
 		curRenderStep_->commands.push_back(data);
 	}
@@ -179,29 +289,42 @@ public:
 		curStepHasViewport_ = true;
 	}
 
-	void SetScissor(VkRect2D rc) {
+	// It's OK to set scissor outside the valid range - the function will automatically clip.
+	void SetScissor(int x, int y, int width, int height) {
 		_dbg_assert_(curRenderStep_ && curRenderStep_->stepType == VKRStepType::RENDER);
-		_dbg_assert_((int)rc.extent.width >= 0);
-		_dbg_assert_((int)rc.extent.height >= 0);
 
-		// Clamp to curWidth_/curHeight_. Apparently an issue.
-		if ((int)(rc.offset.x + rc.extent.width) > curWidth_) {
-			int newWidth = curWidth_ - rc.offset.x;
-			rc.extent.width = std::max(1, newWidth);
-			if (rc.offset.x >= curWidth_) {
-				// Fallback.
-				rc.offset.x = curWidth_ - rc.extent.width;
-			}
+		if (x < 0) {
+			width += x;  // since x is negative, this shrinks width.
+			x = 0;
+		}
+		if (y < 0) {
+			height += y;
+			y = 0;
 		}
 
-		if ((int)(rc.offset.y + rc.extent.height) > curHeight_) {
-			int newHeight = curHeight_ - rc.offset.y;
-			rc.extent.height = std::max(1, newHeight);
-			if (rc.offset.y >= curHeight_) {
-				// Fallback.
-				rc.offset.y = curHeight_ - rc.extent.height;
-			}
+		if (x + width > curWidth_) {
+			width = curWidth_ - x;
 		}
+		if (y + height > curHeight_) {
+			height = curHeight_ - y;
+		}
+
+		// Check validity.
+		if (width < 0 || height < 0 || x >= curWidth_ || y >= curHeight_) {
+			// TODO: If any of the dimensions are now zero or negative, we should flip a flag and not do draws, probably.
+			// Instead, if we detect an invalid scissor rectangle, we just put a 1x1 rectangle in the upper left corner.
+			x = 0;
+			y = 0;
+			width = 1;
+			height = 1;
+		}
+
+		VkRect2D rc;
+		rc.offset.x = x;
+		rc.offset.y = y;
+		rc.extent.width = width;
+		rc.extent.height = height;
+
 		curRenderArea_.Apply(rc);
 
 		VkRenderData data{ VKRRenderCommand::SCISSOR };
@@ -421,6 +544,14 @@ private:
 	int threadInitFrame_ = 0;
 	VulkanQueueRunner queueRunner_;
 
+	// Shader compilation thread to compile while emulating the rest of the frame.
+	// Only one right now but we could use more.
+	std::thread compileThread_;
+	// Sync
+	std::condition_variable compileCond_;
+	std::mutex compileMutex_;
+	std::vector<CompileQueueEntry> compileQueue_;
+
 	// Swap chain management
 	struct SwapchainImageData {
 		VkImage image;
@@ -432,7 +563,7 @@ private:
 	struct DepthBufferInfo {
 		VkFormat format = VK_FORMAT_UNDEFINED;
 		VkImage image = VK_NULL_HANDLE;
-		VkDeviceMemory mem = VK_NULL_HANDLE;
+		VmaAllocation alloc = VK_NULL_HANDLE;
 		VkImageView view = VK_NULL_HANDLE;
 	};
 	DepthBufferInfo depth_;

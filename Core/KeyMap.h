@@ -63,7 +63,11 @@ enum {
 	VIRTKEY_OPENCHAT = 0x4000001D,
 	VIRTKEY_ANALOG_ROTATE_CW = 0x4000001E,
 	VIRTKEY_ANALOG_ROTATE_CCW = 0x4000001F,
-	VIRTKEY_PREVIOUS_SLOT = 0x40000020,
+	VIRTKEY_SCREEN_ROTATION_VERTICAL = 0x40000020,
+	VIRTKEY_SCREEN_ROTATION_VERTICAL180 = 0x40000021,
+	VIRTKEY_SCREEN_ROTATION_HORIZONTAL = 0x40000022,
+	VIRTKEY_SCREEN_ROTATION_HORIZONTAL180 = 0x40000023,
+	VIRTKEY_PREVIOUS_SLOT = 0x40000024,
 	VIRTKEY_LAST,
 	VIRTKEY_COUNT = VIRTKEY_LAST - VIRTKEY_FIRST
 };
@@ -156,6 +160,7 @@ namespace KeyMap {
 	bool IsXperiaPlay(const std::string &name);
 	bool IsOuya(const std::string &name);
 	bool IsMOQII7S(const std::string &name);
+	bool IsRetroid(const std::string &name);
 	bool HasBuiltinController(const std::string &name);
 
 	const std::set<std::string> &GetSeenPads();

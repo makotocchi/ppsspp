@@ -4,7 +4,6 @@
 
 #include "Windows/W32Util/DialogManager.h"
 #include "Windows/W32Util/TabControl.h"
-#include "Windows/Debugger/CtrlDisAsmView.h"
 #include "Windows/Debugger/Debugger_Lists.h"
 #include "Core/Core.h"
 #include "Core/MIPS/MIPSDebugInterface.h"
@@ -12,6 +11,8 @@
 #include <vector>
 
 #include "Common/CommonWindows.h"
+
+class CtrlDisAsmView;
 
 class CDisasm : public Dialog
 {
@@ -52,14 +53,19 @@ public:
 	void Show(bool bShow, bool includeToTop = true) override;
 
 	void Update() override {
-		UpdateDialog(true);
+		UpdateDialog();
 		SetDebugMode(Core_IsStepping(), false);
 		breakpointList->reloadBreakpoints();
 	};
-	void UpdateDialog(bool _bComplete = false);
-	// SetDebugMode 
+	void UpdateDialog();
 	void SetDebugMode(bool _bDebug, bool switchPC);
 
 	void Goto(u32 addr);
 	void NotifyMapLoaded();
+
+private:
+	CtrlDisAsmView *DisAsmView();
+	void ProcessUpdateDialog();
+
+	bool updateDialogScheduled_ = false;
 };

@@ -47,6 +47,12 @@ enum SystemDeviceType {
 	DEVICE_TYPE_DESKTOP = 2,  // Desktop computer
 };
 
+enum SystemKeyboardLayout {
+	KEYBOARD_LAYOUT_QWERTY = 0,
+	KEYBOARD_LAYOUT_QWERTZ = 1,
+	KEYBOARD_LAYOUT_AZERTY = 2,
+};
+
 enum SystemProperty {
 	SYSPROP_NAME,
 	SYSPROP_LANGREGION,
@@ -65,6 +71,7 @@ enum SystemProperty {
 	SYSPROP_HAS_FOLDER_BROWSER,
 	SYSPROP_HAS_IMAGE_BROWSER,
 	SYSPROP_HAS_BACK_BUTTON,
+	SYSPROP_HAS_KEYBOARD,
 
 	// Available as Int:
 	SYSPROP_SYSTEMVERSION,
@@ -103,6 +110,8 @@ enum SystemProperty {
 	SYSPROP_ANDROID_SCOPED_STORAGE,
 
 	SYSPROP_CAN_JIT,
+
+	SYSPROP_KEYBOARD_LAYOUT,
 };
 
 std::string System_GetProperty(SystemProperty prop);

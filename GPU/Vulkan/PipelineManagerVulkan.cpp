@@ -34,8 +34,17 @@ void PipelineManagerVulkan::Clear() {
 	// store the keys.
 
 	pipelines_.Iterate([&](const VulkanPipelineKey &key, VulkanPipeline *value) {
-		if (value->pipeline)
-			vulkan_->Delete().QueueDeletePipeline(value->pipeline);
+		if (value->pipeline) {
+			VkPipeline pipeline = value->pipeline->pipeline;
+			vulkan_->Delete().QueueDeletePipeline(pipeline);
+			vulkan_->Delete().QueueCallback([](void *p) {
+				VKRGraphicsPipeline *pipeline = (VKRGraphicsPipeline *)p;
+				delete pipeline;
+			}, value->pipeline);
+		} else {
+			// Something went wrong.
+			ERROR_LOG(G3D, "Null pipeline found in PipelineManagerVulkan::Clear - didn't wait for asyncs?");
+		}
 		delete value;
 	});
 
@@ -115,15 +124,18 @@ static int SetupVertexAttribs(VkVertexInputAttributeDescription attrs[], const D
 	return count;
 }
 
-static int SetupVertexAttribsPretransformed(VkVertexInputAttributeDescription attrs[], bool needsUV, bool needsColor1) {
+static int SetupVertexAttribsPretransformed(VkVertexInputAttributeDescription attrs[], bool needsUV, bool needsColor1, bool needsFog) {
 	int count = 0;
-	VertexAttribSetup(&attrs[count++], DEC_FLOAT_4, 0, PspAttributeLocation::POSITION);
+	VertexAttribSetup(&attrs[count++], DEC_FLOAT_4, offsetof(TransformedVertex, pos), PspAttributeLocation::POSITION);
 	if (needsUV) {
-		VertexAttribSetup(&attrs[count++], DEC_FLOAT_3, 16, PspAttributeLocation::TEXCOORD);
+		VertexAttribSetup(&attrs[count++], DEC_FLOAT_3, offsetof(TransformedVertex, uv), PspAttributeLocation::TEXCOORD);
 	}
-	VertexAttribSetup(&attrs[count++], DEC_U8_4, 28, PspAttributeLocation::COLOR0);
+	VertexAttribSetup(&attrs[count++], DEC_U8_4, offsetof(TransformedVertex, color0), PspAttributeLocation::COLOR0);
 	if (needsColor1) {
-		VertexAttribSetup(&attrs[count++], DEC_U8_4, 32, PspAttributeLocation::COLOR1);
+		VertexAttribSetup(&attrs[count++], DEC_U8_4, offsetof(TransformedVertex, color1), PspAttributeLocation::COLOR1);
+	}
+	if (needsFog) {
+		VertexAttribSetup(&attrs[count++], DEC_FLOAT_1, offsetof(TransformedVertex, fog), PspAttributeLocation::NORMAL);
 	}
 	return count;
 }
@@ -160,13 +172,16 @@ static std::string CutFromMain(std::string str) {
 	return rebuilt;
 }
 
-static VulkanPipeline *CreateVulkanPipeline(VkDevice device, VkPipelineCache pipelineCache, 
+static VulkanPipeline *CreateVulkanPipeline(VulkanRenderManager *renderManager, VkPipelineCache pipelineCache,
 		VkPipelineLayout layout, VkRenderPass renderPass, const VulkanPipelineRasterStateKey &key,
-		const DecVtxFormat *decFmt, VulkanVertexShader *vs, VulkanFragmentShader *fs, bool useHwTransform, float lineWidth) {
+		const DecVtxFormat *decFmt, VulkanVertexShader *vs, VulkanFragmentShader *fs, bool useHwTransform) {
+	VKRGraphicsPipelineDesc *desc = new VKRGraphicsPipelineDesc();
+	desc->pipelineCache = pipelineCache;
+
 	PROFILE_THIS_SCOPE("pipelinebuild");
 	bool useBlendConstant = false;
 
-	VkPipelineColorBlendAttachmentState blend0{};
+	VkPipelineColorBlendAttachmentState &blend0 = desc->blend0;
 	blend0.blendEnable = key.blendEnable;
 	if (key.blendEnable) {
 		blend0.colorBlendOp = (VkBlendOp)key.blendOpColor;
@@ -178,7 +193,7 @@ static VulkanPipeline *CreateVulkanPipeline(VkDevice device, VkPipelineCache pip
 	}
 	blend0.colorWriteMask = key.colorWriteMask;
 
-	VkPipelineColorBlendStateCreateInfo cbs{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+	VkPipelineColorBlendStateCreateInfo &cbs = desc->cbs;
 	cbs.flags = 0;
 	cbs.pAttachments = &blend0;
 	cbs.attachmentCount = 1;
@@ -188,7 +203,7 @@ static VulkanPipeline *CreateVulkanPipeline(VkDevice device, VkPipelineCache pip
 	else
 		cbs.logicOp = VK_LOGIC_OP_COPY;
 
-	VkPipelineDepthStencilStateCreateInfo dss{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+	VkPipelineDepthStencilStateCreateInfo &dss = desc->dss;
 	dss.depthBoundsTestEnable = false;
 	dss.stencilTestEnable = key.stencilTestEnable;
 	if (key.stencilTestEnable) {
@@ -205,7 +220,7 @@ static VulkanPipeline *CreateVulkanPipeline(VkDevice device, VkPipelineCache pip
 		dss.depthWriteEnable = key.depthWriteEnable;
 	}
 
-	VkDynamicState dynamicStates[8]{};
+	VkDynamicState *dynamicStates = &desc->dynamicStates[0];
 	int numDyn = 0;
 	if (key.blendEnable &&
 		  (UsesBlendConstant(key.srcAlpha) || UsesBlendConstant(key.srcColor) || UsesBlendConstant(key.destAlpha) || UsesBlendConstant(key.destColor))) {
@@ -220,26 +235,26 @@ static VulkanPipeline *CreateVulkanPipeline(VkDevice device, VkPipelineCache pip
 		dynamicStates[numDyn++] = VK_DYNAMIC_STATE_STENCIL_REFERENCE;
 	}
 	
-	VkPipelineDynamicStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+	VkPipelineDynamicStateCreateInfo &ds = desc->ds;
 	ds.flags = 0;
 	ds.pDynamicStates = dynamicStates;
 	ds.dynamicStateCount = numDyn;
 	
-	VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+	VkPipelineRasterizationStateCreateInfo &rs = desc->rs;
 	rs.flags = 0;
 	rs.depthBiasEnable = false;
 	rs.cullMode = key.cullMode;
 	rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-	rs.lineWidth = lineWidth;
+	rs.lineWidth = 1.0f;
 	rs.rasterizerDiscardEnable = false;
 	rs.polygonMode = VK_POLYGON_MODE_FILL;
 	rs.depthClampEnable = key.depthClampEnable;
 
-	VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+	VkPipelineMultisampleStateCreateInfo &ms = desc->ms;
 	ms.pSampleMask = nullptr;
 	ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-	VkPipelineShaderStageCreateInfo ss[2]{};
+	VkPipelineShaderStageCreateInfo *ss = &desc->shaderStageInfo[0];
 	ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 	ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
 	ss[0].pSpecializationInfo = nullptr;
@@ -262,13 +277,14 @@ static VulkanPipeline *CreateVulkanPipeline(VkDevice device, VkPipelineCache pip
 		return nullPipeline;
 	}
 
-	VkPipelineInputAssemblyStateCreateInfo inputAssembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+	VkPipelineInputAssemblyStateCreateInfo &inputAssembly = desc->inputAssembly;
 	inputAssembly.flags = 0;
 	inputAssembly.topology = (VkPrimitiveTopology)key.topology;
 	inputAssembly.primitiveRestartEnable = false;
 	int vertexStride = 0;
 
-	VkVertexInputAttributeDescription attrs[8];
+	VkVertexInputAttributeDescription *attrs = &desc->attrs[0];
+
 	int attributeCount;
 	if (useHwTransform) {
 		attributeCount = SetupVertexAttribs(attrs, *decFmt);
@@ -276,70 +292,54 @@ static VulkanPipeline *CreateVulkanPipeline(VkDevice device, VkPipelineCache pip
 	} else {
 		bool needsUV = vs->GetID().Bit(VS_BIT_DO_TEXTURE);
 		bool needsColor1 = vs->GetID().Bit(VS_BIT_LMODE);
-		attributeCount = SetupVertexAttribsPretransformed(attrs, needsUV, needsColor1);
-		vertexStride = 36;
+		bool needsFog = vs->GetID().Bit(VS_BIT_ENABLE_FOG);
+		attributeCount = SetupVertexAttribsPretransformed(attrs, needsUV, needsColor1, needsFog);
+		vertexStride = (int)sizeof(TransformedVertex);
 	}
 
-	VkVertexInputBindingDescription ibd{};
+	VkVertexInputBindingDescription &ibd = desc->ibd;
 	ibd.binding = 0;
 	ibd.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 	ibd.stride = vertexStride;
 
-	VkPipelineVertexInputStateCreateInfo vis{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+	VkPipelineVertexInputStateCreateInfo &vis = desc->vis;
 	vis.flags = 0;
 	vis.vertexBindingDescriptionCount = 1;
-	vis.pVertexBindingDescriptions = &ibd;
+	vis.pVertexBindingDescriptions = &desc->ibd;
 	vis.vertexAttributeDescriptionCount = attributeCount;
 	vis.pVertexAttributeDescriptions = attrs;
 
-	VkPipelineViewportStateCreateInfo views{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+	VkPipelineViewportStateCreateInfo &views = desc->views;
 	views.flags = 0;
 	views.viewportCount = 1;
 	views.scissorCount = 1;
 	views.pViewports = nullptr;  // dynamic
 	views.pScissors = nullptr;  // dynamic
 
-	VkGraphicsPipelineCreateInfo pipe{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+	VkGraphicsPipelineCreateInfo &pipe = desc->pipe;
 	pipe.flags = 0;
 	pipe.stageCount = 2;
 	pipe.pStages = ss;
 	pipe.basePipelineIndex = 0;
 
-	pipe.pColorBlendState = &cbs;
-	pipe.pDepthStencilState = &dss;
-	pipe.pRasterizationState = &rs;
+	pipe.pColorBlendState = &desc->cbs;
+	pipe.pDepthStencilState = &desc->dss;
+	pipe.pRasterizationState = &desc->rs;
 
 	// We will use dynamic viewport state.
-	pipe.pVertexInputState = &vis;
-	pipe.pViewportState = &views;
+	pipe.pVertexInputState = &desc->vis;
+	pipe.pViewportState = &desc->views;
 	pipe.pTessellationState = nullptr;
-	pipe.pDynamicState = &ds;
-	pipe.pInputAssemblyState = &inputAssembly;
-	pipe.pMultisampleState = &ms;
+	pipe.pDynamicState = &desc->ds;
+	pipe.pInputAssemblyState = &desc->inputAssembly;
+	pipe.pMultisampleState = &desc->ms;
 	pipe.layout = layout;
 	pipe.basePipelineHandle = VK_NULL_HANDLE;
 	pipe.basePipelineIndex = 0;
 	pipe.renderPass = renderPass;
 	pipe.subpass = 0;
 
-	VkPipeline pipeline;
-	VkResult result = vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipe, nullptr, &pipeline);
-	if (result != VK_SUCCESS) {
-		ERROR_LOG(G3D, "Failed creating graphics pipeline! result='%s'", VulkanResultToString(result));
-		if (result == VK_INCOMPLETE) {
-			// Typical Adreno return value. It'll usually also log something vague, like "Failed to link shaders".
-			// Let's log some stuff and try to stumble along.
-			ERROR_LOG(G3D, "VS source code:\n%s\n", CutFromMain(vs->GetShaderString(SHADER_STRING_SOURCE_CODE)).c_str());
-			ERROR_LOG(G3D, "FS source code:\n%s\n", CutFromMain(fs->GetShaderString(SHADER_STRING_SOURCE_CODE)).c_str());
-		} else {
-			_dbg_assert_msg_(false, "Failed creating graphics pipeline! result='%s'", VulkanResultToString(result));
-		}
-		// Create a placeholder to avoid creating over and over if something is broken.
-		VulkanPipeline *nullPipeline = new VulkanPipeline();
-		nullPipeline->pipeline = VK_NULL_HANDLE;
-		nullPipeline->flags = 0;
-		return nullPipeline;
-	}
+	VKRGraphicsPipeline *pipeline = renderManager->CreateGraphicsPipeline(desc);
 
 	VulkanPipeline *vulkanPipeline = new VulkanPipeline();
 	vulkanPipeline->pipeline = pipeline;
@@ -354,7 +354,7 @@ static VulkanPipeline *CreateVulkanPipeline(VkDevice device, VkPipelineCache pip
 	return vulkanPipeline;
 }
 
-VulkanPipeline *PipelineManagerVulkan::GetOrCreatePipeline(VkPipelineLayout layout, VkRenderPass renderPass, const VulkanPipelineRasterStateKey &rasterKey, const DecVtxFormat *decFmt, VulkanVertexShader *vs, VulkanFragmentShader *fs, bool useHwTransform) {
+VulkanPipeline *PipelineManagerVulkan::GetOrCreatePipeline(VulkanRenderManager *renderManager, VkPipelineLayout layout, VkRenderPass renderPass, const VulkanPipelineRasterStateKey &rasterKey, const DecVtxFormat *decFmt, VulkanVertexShader *vs, VulkanFragmentShader *fs, bool useHwTransform) {
 	if (!pipelineCache_) {
 		VkPipelineCacheCreateInfo pc{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
 		VkResult res = vkCreatePipelineCache(vulkan_->GetDevice(), &pc, nullptr, &pipelineCache_);
@@ -376,8 +376,8 @@ VulkanPipeline *PipelineManagerVulkan::GetOrCreatePipeline(VkPipelineLayout layo
 		return iter;
 
 	VulkanPipeline *pipeline = CreateVulkanPipeline(
-		vulkan_->GetDevice(), pipelineCache_, layout, renderPass, 
-		rasterKey, decFmt, vs, fs, useHwTransform, lineWidth_);
+		renderManager, pipelineCache_, layout, renderPass,
+		rasterKey, decFmt, vs, fs, useHwTransform);
 	pipelines_.Insert(key, pipeline);
 
 	// Don't return placeholder null pipelines.
@@ -567,22 +567,6 @@ std::string VulkanPipelineKey::GetDescription(DebugShaderStringType stringType) 
 	default:
 		return "N/A";
 	}
-}
-
-void PipelineManagerVulkan::SetLineWidth(float lineWidth) {
-	if (lineWidth_ == lineWidth)
-		return;
-	lineWidth_ = lineWidth;
-
-	// Wipe all line-drawing pipelines.
-	pipelines_.Iterate([&](const VulkanPipelineKey &key, VulkanPipeline *value) {
-		if (value->flags & PIPELINE_FLAG_USES_LINES) {
-			if (value->pipeline)
-				vulkan_->Delete().QueueDeletePipeline(value->pipeline);
-			delete value;
-			pipelines_.Remove(key);
-		}
-	});
 }
 
 // For some reason this struct is only defined in the spec, not in the headers.
@@ -784,7 +768,7 @@ bool PipelineManagerVulkan::LoadCache(FILE *file, bool loadRawPipelineCache, Sha
 
 		DecVtxFormat fmt;
 		fmt.InitializeFromID(key.vtxFmtId);
-		VulkanPipeline *pipeline = GetOrCreatePipeline(layout, rp, key.raster,
+		VulkanPipeline *pipeline = GetOrCreatePipeline(rm, layout, rp, key.raster,
 			key.useHWTransform ? &fmt : 0,
 			vs, fs, key.useHWTransform);
 		if (!pipeline) {

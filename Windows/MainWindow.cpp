@@ -28,7 +28,6 @@
 #include <Windowsx.h>
 #include <shellapi.h>
 #include <commctrl.h>
-#include <map>
 #include <string>
 
 #include "Common/System/Display.h"
@@ -133,6 +132,9 @@ namespace MainWindow
 	static bool inResizeMove = false;
 	static bool hasFocus = true;
 	static bool g_isFullscreen = false;
+
+	static bool disasmMapLoadPending = false;
+	static bool memoryMapLoadPending = false;
 
 	// gross hack
 	bool noFocusPause = false;	// TOGGLE_PAUSE state to override pause on lost focus
@@ -533,36 +535,73 @@ namespace MainWindow
 		return TRUE;
 	}
 
-	void CreateDebugWindows() {
-		disasmWindow = new CDisasm(MainWindow::GetHInstance(), MainWindow::GetHWND(), currentDebugMIPS);
-		DialogManager::AddDlg(disasmWindow);
-		disasmWindow->Show(g_Config.bShowDebuggerOnLoad, false);
+	void CreateDisasmWindow() {
+		if (!disasmWindow) {
+			disasmWindow = new CDisasm(MainWindow::GetHInstance(), MainWindow::GetHWND(), currentDebugMIPS);
+			DialogManager::AddDlg(disasmWindow);
+		}
+		if (disasmMapLoadPending)
+			disasmWindow->NotifyMapLoaded();
+		disasmMapLoadPending = false;
+	}
 
+	void CreateGeDebuggerWindow() {
 #if PPSSPP_API(ANY_GL)
-		geDebuggerWindow = new CGEDebugger(MainWindow::GetHInstance(), MainWindow::GetHWND());
-		DialogManager::AddDlg(geDebuggerWindow);
+		if (!geDebuggerWindow) {
+			geDebuggerWindow = new CGEDebugger(MainWindow::GetHInstance(), MainWindow::GetHWND());
+			DialogManager::AddDlg(geDebuggerWindow);
+		}
 #endif
-		memoryWindow = new CMemoryDlg(MainWindow::GetHInstance(), MainWindow::GetHWND(), currentDebugMIPS);
-		DialogManager::AddDlg(memoryWindow);
+	}
+
+	void CreateMemoryWindow() {
+		if (!memoryWindow) {
+			memoryWindow = new CMemoryDlg(MainWindow::GetHInstance(), MainWindow::GetHWND(), currentDebugMIPS);
+			DialogManager::AddDlg(memoryWindow);
+		}
+		if (memoryMapLoadPending)
+			memoryWindow->NotifyMapLoaded();
+		memoryMapLoadPending = false;
+	}
+
+	void CreateVFPUWindow() {
+		if (!vfpudlg) {
+			vfpudlg = new CVFPUDlg(MainWindow::GetHInstance(), MainWindow::GetHWND(), currentDebugMIPS);
+			DialogManager::AddDlg(vfpudlg);
+		}
+	}
+
+	void NotifyDebuggerMapLoaded() {
+		disasmMapLoadPending = disasmWindow == nullptr;
+		memoryMapLoadPending = memoryWindow == nullptr;
+		if (!disasmMapLoadPending)
+			disasmWindow->NotifyMapLoaded();
+		if (!memoryMapLoadPending)
+			memoryWindow->NotifyMapLoaded();
 	}
 
 	void DestroyDebugWindows() {
 		DialogManager::RemoveDlg(disasmWindow);
 		if (disasmWindow)
 			delete disasmWindow;
-		disasmWindow = 0;
+		disasmWindow = nullptr;
 
 #if PPSSPP_API(ANY_GL)
 		DialogManager::RemoveDlg(geDebuggerWindow);
 		if (geDebuggerWindow)
 			delete geDebuggerWindow;
-		geDebuggerWindow = 0;
+		geDebuggerWindow = nullptr;
 #endif
 
 		DialogManager::RemoveDlg(memoryWindow);
 		if (memoryWindow)
 			delete memoryWindow;
-		memoryWindow = 0;
+		memoryWindow = nullptr;
+
+		DialogManager::RemoveDlg(vfpudlg);
+		if (vfpudlg)
+			delete vfpudlg;
+		vfpudlg = nullptr;
 	}
 
 	LRESULT CALLBACK DisplayProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -724,7 +763,7 @@ namespace MainWindow
 						if (disasmWindow)
 							SendMessage(disasmWindow->GetDlgHandle(), WM_COMMAND, IDC_STOPGO, 0);
 						else
-							Core_EnableStepping(pause);
+							Core_EnableStepping(pause, "ui.lost_focus", 0);
 					}
 				}
 
@@ -873,6 +912,7 @@ namespace MainWindow
 					const u8 *ptr = (const u8 *)info->addr;
 					std::string name;
 
+					std::lock_guard<std::recursive_mutex> guard(MIPSComp::jitLock);
 					if (MIPSComp::jit && MIPSComp::jit->DescribeCodePtr(ptr, name)) {
 						swprintf_s(info->name, L"Jit::%S", name.c_str());
 						return TRUE;
@@ -924,11 +964,7 @@ namespace MainWindow
 			break;
 
 		case WM_USER + 1:
-			if (disasmWindow)
-				disasmWindow->NotifyMapLoaded();
-			if (memoryWindow)
-				memoryWindow->NotifyMapLoaded();
-
+			NotifyDebuggerMapLoaded();
 			if (disasmWindow)
 				disasmWindow->UpdateDialog();
 			break;

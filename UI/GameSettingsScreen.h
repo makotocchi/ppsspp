@@ -47,6 +47,8 @@ protected:
 	void RecreateViews() override;
 
 private:
+	UI::LinearLayout *AddTab(const char *tag, const std::string &title, bool isSearch = false);
+	void ApplySearchFilter();
 	void TriggerRestart(const char *why);
 
 	std::string gameID_;
@@ -59,6 +61,8 @@ private:
 	UI::PopupMultiChoice *resolutionChoice_;
 	UI::CheckBox *frameSkipAuto_;
 	SettingInfoMessage *settingInfo_;
+	UI::Choice *clearSearchChoice_;
+	UI::TextView *noSearchResults_;
 #ifdef _WIN32
 	UI::CheckBox *SavePathInMyDocumentChoice;
 	UI::CheckBox *SavePathInOtherChoice;
@@ -68,6 +72,10 @@ private:
 #endif
 
 	std::string memstickDisplay_;
+
+	UI::TabHolder *tabHolder_;
+	std::vector<UI::LinearLayout *> settingTabContents_;
+	std::vector<UI::TextView *> settingTabFilterNotices_;
 
 	// Event handlers
 	UI::EventReturn OnControlMapping(UI::EventParams &e);
@@ -109,13 +117,11 @@ private:
 	UI::EventReturn OnAudioDevice(UI::EventParams &e);
 	UI::EventReturn OnJitAffectingSetting(UI::EventParams &e);
 	UI::EventReturn OnChangeMemStickDir(UI::EventParams &e);
+	UI::EventReturn OnOpenMemStick(UI::EventParams &e);
 #if defined(_WIN32) && !PPSSPP_PLATFORM(UWP)
 	UI::EventReturn OnSavePathMydoc(UI::EventParams &e);
 	UI::EventReturn OnSavePathOther(UI::EventParams &e);
 #endif
-	UI::EventReturn OnSoftwareRendering(UI::EventParams &e);
-	UI::EventReturn OnHardwareTransform(UI::EventParams &e);
-
 	UI::EventReturn OnScreenRotation(UI::EventParams &e);
 	UI::EventReturn OnImmersiveModeChange(UI::EventParams &e);
 	UI::EventReturn OnSustainedPerformanceModeChange(UI::EventParams &e);
@@ -124,6 +130,8 @@ private:
 
 	UI::EventReturn OnSavedataManager(UI::EventParams &e);
 	UI::EventReturn OnSysInfo(UI::EventParams &e);
+	UI::EventReturn OnChangeSearchFilter(UI::EventParams &e);
+	UI::EventReturn OnClearSearchFilter(UI::EventParams &e);
 
 	// Temporaries to convert setting types, cache enabled, etc.
 	int iAlternateSpeedPercent1_;
@@ -131,8 +139,8 @@ private:
 	int prevInflightFrames_;
 	bool enableReports_ = false;
 	bool enableReportsSet_ = false;
-	bool tessHWEnable_;
 	std::string shaderNames_[256];
+	std::string searchFilter_;
 
 	//edit the game-specific settings and restore the global settings after exiting
 	bool editThenRestore_;

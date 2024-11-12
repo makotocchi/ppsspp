@@ -85,7 +85,7 @@ Path DirectoryFileHandle::GetLocalPath(const Path &basePath, std::string localpa
 		localpath.erase(0, 1);
 
 	if (fileSystemFlags_ & FileSystemFlags::STRIP_PSP) {
-		if (startsWith(localpath, "PSP/")) {
+		if (startsWithNoCase(localpath, "PSP/")) {
 			localpath = localpath.substr(4);
 		}
 	}
@@ -101,7 +101,7 @@ Path DirectoryFileSystem::GetLocalPath(std::string internalPath) const {
 		internalPath.erase(0, 1);
 
 	if (flags & FileSystemFlags::STRIP_PSP) {
-		if (startsWith(internalPath, "PSP/")) {
+		if (startsWithNoCase(internalPath, "PSP/")) {
 			internalPath = internalPath.substr(4);
 		}
 	}
@@ -201,12 +201,14 @@ bool DirectoryFileHandle::Open(const Path &basePath, std::string &fileName, File
 			flags |= File::OPEN_APPEND;
 		if (access & FILEACCESS_CREATE)
 			flags |= File::OPEN_CREATE;
+		// Important: don't pass TRUNCATE here, the PSP truncates weirdly.  See #579.
+		// See above about truncate behavior.  Just add READ to preserve data here.
 		if (access & FILEACCESS_TRUNCATE)
-			flags |= File::OPEN_TRUNCATE;
+			flags |= File::OPEN_READ;
 
 		int fd = File::OpenFD(fullName, (File::OpenFlag)flags);
 		// Try to detect reads/writes to PSP/GAME to avoid them in replays.
-		if (fullName.FilePathContains("PSP/GAME/")) {
+		if (fullName.FilePathContainsNoCase("PSP/GAME/")) {
 			inGameDir_ = true;
 		}
 		hFile = fd;
@@ -287,7 +289,7 @@ bool DirectoryFileHandle::Open(const Path &basePath, std::string &fileName, File
 #endif
 
 	// Try to detect reads/writes to PSP/GAME to avoid them in replays.
-	if (fullName.FilePathContains("PSP/GAME/")) {
+	if (fullName.FilePathContainsNoCase("PSP/GAME/")) {
 		inGameDir_ = true;
 	}
 	if (access & (FILEACCESS_APPEND | FILEACCESS_CREATE | FILEACCESS_WRITE)) {

@@ -42,9 +42,9 @@
 #include "Core/HLE/HLE.h"
 #include "Core/HLE/HLEHelperThread.h"
 #include "Core/HLE/FunctionWrappers.h"
-#include "Core/HLE/sceDisplay.h"
 #include "Core/HLE/sceKernel.h"
 #include "Core/HLE/sceUmd.h"
+#include "Core/HW/Display.h"
 #include "Core/MIPS/MIPS.h"
 #include "Core/HW/MemoryStick.h"
 #include "Core/HW/AsyncIOManager.h"
@@ -665,12 +665,10 @@ void __IoInit() {
 
 	memset(fds, 0, sizeof(fds));
 
-	ioManagerThreadEnabled = g_Config.bSeparateIOThread;
-	ioManager.SetThreadEnabled(ioManagerThreadEnabled);
-	if (ioManagerThreadEnabled) {
-		Core_ListenLifecycle(&__IoWakeManager);
-		ioManagerThread = new std::thread(&__IoManagerThread);
-	}
+	ioManagerThreadEnabled = true;
+	ioManager.SetThreadEnabled(true);
+	Core_ListenLifecycle(&__IoWakeManager);
+	ioManagerThread = new std::thread(&__IoManagerThread);
 
 	__KernelRegisterWaitTypeFuncs(WAITTYPE_ASYNCIO, __IoAsyncBeginCallback, __IoAsyncEndCallback);
 
@@ -1962,7 +1960,7 @@ static u32 sceIoDevctl(const char *name, int cmd, u32 argAddr, int argLen, u32 o
 		switch (cmd) {
 		case 1:	// EMULATOR_DEVCTL__GET_HAS_DISPLAY
 			if (Memory::IsValidAddress(outPtr))
-				Memory::Write_U32(0, outPtr);	 // TODO: Make a headless mode for running tests!
+				Memory::Write_U32(PSP_CoreParameter().headLess ? 0 : 1, outPtr);
 			return 0;
 		case 2:	// EMULATOR_DEVCTL__SEND_OUTPUT
 			{
@@ -1991,9 +1989,9 @@ static u32 sceIoDevctl(const char *name, int cmd, u32 argAddr, int argLen, u32 o
 		case 0x20: // EMULATOR_DEVCTL__EMIT_SCREENSHOT
 		{
 			PSPPointer<u8> topaddr;
-			u32 linesize, pixelFormat;
+			u32 linesize;
 
-			__DisplayGetFramebuf(&topaddr, &linesize, &pixelFormat, 0);
+			__DisplayGetFramebuf(&topaddr, &linesize, nullptr, 0);
 			// TODO: Convert based on pixel format / mode / something?
 			host->SendDebugScreenshot(topaddr, linesize, 272);
 			return 0;

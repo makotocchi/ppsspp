@@ -120,7 +120,7 @@ bool FramebufferManagerGLES::NotifyStencilUpload(u32 addr, int size, StencilUplo
 			// Common when creating buffers, it's already 0.  We're done.
 			return false;
 		}
-		shaderManagerGL_->DirtyLastShader();
+		shaderManager_->DirtyLastShader();
 
 		// Let's not bother with the shader if it's just zero.
 		if (dstBuffer->fbo) {
@@ -147,7 +147,7 @@ bool FramebufferManagerGLES::NotifyStencilUpload(u32 addr, int size, StencilUplo
 		queries.push_back({ &u_stencilValue, "u_stencilValue" });
 		std::vector<GLRProgram::Initializer> inits;
 		inits.push_back({ &u_stencilUploadTex, 0, TEX_SLOT_PSP_TEXTURE });
-		stencilUploadProgram_ = render_->CreateProgram(shaders, semantics, queries, inits, false);
+		stencilUploadProgram_ = render_->CreateProgram(shaders, semantics, queries, inits, false, false);
 		for (auto iter : shaders) {
 			render_->DeleteShader(iter);
 		}
@@ -156,7 +156,7 @@ bool FramebufferManagerGLES::NotifyStencilUpload(u32 addr, int size, StencilUplo
 		}
 	}
 
-	shaderManagerGL_->DirtyLastShader();
+	shaderManager_->DirtyLastShader();
 
 	bool useBlit = gstate_c.Supports(GPU_SUPPORTS_FRAMEBUFFER_BLIT);
 
@@ -179,7 +179,7 @@ bool FramebufferManagerGLES::NotifyStencilUpload(u32 addr, int size, StencilUplo
 
 	float u1 = 1.0f;
 	float v1 = 1.0f;
-	textureCacheGL_->ForgetLastTexture();
+	textureCache_->ForgetLastTexture();
 	Draw::Texture *tex = MakePixelTexture(src, dstBuffer->format, dstBuffer->fb_stride, dstBuffer->width, dstBuffer->height, u1, v1);
 	if (!tex)
 		return false;

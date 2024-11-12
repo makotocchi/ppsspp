@@ -15,10 +15,10 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
-#include "Common/Math/lin/matrix4x4.h"
-#include "Common/GPU/thin3d.h"
-
+#include "Common/Common.h"
 #include "Common/Data/Convert/ColorConv.h"
+#include "Common/GPU/thin3d.h"
+#include "Common/Math/lin/matrix4x4.h"
 #include "Core/MemMap.h"
 #include "Core/Config.h"
 #include "Core/ConfigValues.h"
@@ -141,17 +141,14 @@ static const D3DVERTEXELEMENT9 g_FramebufferVertexElements[] = {
 	}
 
 	void FramebufferManagerDX9::SetTextureCache(TextureCacheDX9 *tc) {
-		textureCacheDX9_ = tc;
 		textureCache_ = tc;
 	}
 
 	void FramebufferManagerDX9::SetShaderManager(ShaderManagerDX9 *sm) {
-		shaderManagerDX9_ = sm;
 		shaderManager_ = sm;
 	}
 
 	void FramebufferManagerDX9::SetDrawEngine(DrawEngineDX9 *td) {
-		drawEngineD3D9_ = td;
 		drawEngine_ = td;
 	}
 
@@ -240,7 +237,7 @@ static const D3DVERTEXELEMENT9 g_FramebufferVertexElements[] = {
 			return it->second.surface;
 		}
 
-		textureCacheDX9_->ForgetLastTexture();
+		textureCache_->ForgetLastTexture();
 		LPDIRECT3DSURFACE9 offscreen = nullptr;
 		HRESULT hr = device_->CreateOffscreenPlainSurface(w, h, fmt, D3DPOOL_SYSTEMMEM, &offscreen, NULL);
 		if (FAILED(hr) || !offscreen) {

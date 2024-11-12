@@ -1,14 +1,20 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
+#include <condition_variable>
+
 
 #include "Common/Data/Collections/Hashmaps.h"
 #include "Common/GPU/Vulkan/VulkanContext.h"
+#include "Common/GPU/Vulkan/VulkanBarrier.h"
 #include "Common/Data/Convert/SmallDataConvert.h"
 #include "Common/Data/Collections/TinySet.h"
 #include "Common/GPU/DataFormat.h"
 
 class VKRFramebuffer;
+struct VKRGraphicsPipeline;
+struct VKRComputePipeline;
 struct VKRImage;
 
 enum {
@@ -20,7 +26,9 @@ enum {
 
 enum class VKRRenderCommand : uint8_t {
 	REMOVED,
-	BIND_PIPELINE,
+	BIND_PIPELINE,  // raw pipeline
+	BIND_GRAPHICS_PIPELINE,  // async
+	BIND_COMPUTE_PIPELINE,  // async
 	STENCIL,
 	BLEND,
 	VIEWPORT,
@@ -45,6 +53,12 @@ struct VkRenderData {
 		struct {
 			VkPipeline pipeline;
 		} pipeline;
+		struct {
+			VKRGraphicsPipeline *pipeline;
+		} graphics_pipeline;
+		struct {
+			VKRComputePipeline *pipeline;
+		} compute_pipeline;
 		struct {
 			VkPipelineLayout pipelineLayout;
 			VkDescriptorSet ds;
@@ -244,6 +258,15 @@ public:
 		hacksEnabled_ = hacks;
 	}
 
+	void NotifyCompileDone() {
+		compileDone_.notify_all();
+	}
+
+	void WaitForCompileNotification() {
+		std::unique_lock<std::mutex> lock(compileDoneMutex_);
+		compileDone_.wait(lock);
+	}
+
 private:
 	void InitBackbufferRenderPass();
 
@@ -266,8 +289,8 @@ private:
 	void ApplySonicHack(std::vector<VKRStep *> &steps);
 	void ApplyRenderPassMerge(std::vector<VKRStep *> &steps);
 
-	static void SetupTransitionToTransferSrc(VKRImage &img, VkImageMemoryBarrier &barrier, VkPipelineStageFlags &stage, VkImageAspectFlags aspect);
-	static void SetupTransitionToTransferDst(VKRImage &img, VkImageMemoryBarrier &barrier, VkPipelineStageFlags &stage, VkImageAspectFlags aspect);
+	static void SetupTransitionToTransferSrc(VKRImage &img, VkImageAspectFlags aspect, VulkanBarrier *recordBarrier);
+	static void SetupTransitionToTransferDst(VKRImage &img, VkImageAspectFlags aspect, VulkanBarrier *recordBarrier);
 
 	VulkanContext *vulkan_;
 
@@ -292,4 +315,13 @@ private:
 
 	// TODO: Enable based on compat.ini.
 	uint32_t hacksEnabled_ = 0;
+
+	// Compile done notifications.
+	std::mutex compileDoneMutex_;
+	std::condition_variable compileDone_;
+
+	// Image barrier helper used during command buffer record (PerformRenderPass etc).
+	// Stored here to help reuse the allocation.
+
+	VulkanBarrier recordBarrier_;
 };

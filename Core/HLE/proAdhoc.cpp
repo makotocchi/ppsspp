@@ -51,6 +51,7 @@
 #define TCP_MAXSEG 2
 #endif // defined(HAVE_LIBNX) || PPSSPP_PLATFORM(SWITCH)
 
+#include <algorithm>
 #include <mutex>
 #include <cstring>
 
@@ -60,6 +61,7 @@
 
 #include "Common/Serialize/SerializeFuncs.h"
 #include "Common/TimeUtil.h"
+#include "Core/Config.h"
 #include "Core/Core.h"
 #include "Core/Host.h"
 #include "Core/HLE/sceKernelInterrupt.h"
@@ -226,6 +228,8 @@ void addFriend(SceNetAdhocctlConnectPacketS2C * packet) {
 		peer->nickname = packet->name;
 		peer->mac_addr = packet->mac;
 		peer->ip_addr = packet->ip;
+		// Calculate final IP-specific Port Offset
+		peer->port_offset = ((isOriPort && !isPrivateIP(peer->ip_addr)) ? 0 : portOffset);
 		// Update TimeStamp
 		peer->last_recv = CoreTiming::GetGlobalTimeUsScaled();
 	}
@@ -245,6 +249,9 @@ void addFriend(SceNetAdhocctlConnectPacketS2C * packet) {
 
 			// Save IP Address
 			peer->ip_addr = packet->ip;
+
+			// Calculate final IP-specific Port Offset
+			peer->port_offset = ((isOriPort && !isPrivateIP(peer->ip_addr)) ? 0 : portOffset);
 
 			// TimeStamp
 			peer->last_recv = CoreTiming::GetGlobalTimeUsScaled();
@@ -1241,7 +1248,7 @@ void notifyMatchingHandler(SceNetAdhocMatchingContext * context, ThreadMessage *
 	// Don't share buffer address space with other mipscall in the queue since mipscalls aren't immediately executed
 	MatchingArgs argsNew = { 0 };
 	u32_le dataBufLen = msg->optlen + 8; //max(bufLen, msg->optlen + 8);
-	u32_le dataBufAddr = userMemory.Alloc(dataBufLen); // We will free this memory after returning from mipscall
+	u32_le dataBufAddr = userMemory.Alloc(dataBufLen); // We will free this memory after returning from mipscall. FIXME: Are these buffers supposed to be taken/pre-allocated from the memory pool during sceNetAdhocMatchingInit?
 	uint8_t * dataPtr = Memory::GetPointer(dataBufAddr);
 	if (dataPtr) {
 		memcpy(dataPtr, &msg->mac, sizeof(msg->mac));
@@ -1255,6 +1262,7 @@ void notifyMatchingHandler(SceNetAdhocMatchingContext * context, ThreadMessage *
 	}
 	else {
 		argsNew.data[1] = PSP_ADHOC_MATCHING_EVENT_ERROR; // not sure where to put the error code for EVENT_ERROR tho
+		//argsNew.data[2] = dataBufAddr; // FIXME: Is the MAC address mandatory (ie. can't be null pointer) even for EVENT_ERROR? Where should we put this MAC data in the case we failed to allocate the memory? may be on the memory pool?
 	}
 	argsNew.data[0] = context->id;	
 	argsNew.data[5] = context->handler.entryPoint; //not part of callback argument, just borrowing a space to store callback address so i don't need to search the context first later
@@ -1792,11 +1800,12 @@ int getLocalIp(sockaddr_in* SocketAddress) {
 
 #if !PPSSPP_PLATFORM(SWITCH)
 	if (metasocket != (int)INVALID_SOCKET) {
-		struct sockaddr_in localAddr;
+		struct sockaddr_in localAddr {};
 		localAddr.sin_addr.s_addr = INADDR_ANY;
 		socklen_t addrLen = sizeof(localAddr);
 		int ret = getsockname((int)metasocket, (struct sockaddr*)&localAddr, &addrLen);
-		if (SOCKET_ERROR != ret) {
+		// Note: Sometimes metasocket still contains a valid socket fd right after failed to connect to AdhocServer on a different thread, thus ended with 0.0.0.0 here
+		if (SOCKET_ERROR != ret && localAddr.sin_addr.s_addr != 0) {
 			SocketAddress->sin_addr = localAddr.sin_addr;
 			return 0;
 		}
@@ -1804,27 +1813,8 @@ int getLocalIp(sockaddr_in* SocketAddress) {
 #endif // !PPSSPP_PLATFORM(SWITCH)
 
 // Fallback if not connected to AdhocServer
-#if defined(_WIN32)
-	// Get local host name
-	char szHostName[256] = "";
-
-	if (::gethostname(szHostName, sizeof(szHostName))) {
-		// Error handling 
-	}
-	// Get local network IP addresses (LAN/VPN/loopback)
-	struct addrinfo hints, * res = 0;
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_INET; // AF_UNSPEC;
-	hints.ai_socktype = SOCK_DGRAM;
-	hints.ai_flags = AI_ADDRCONFIG; // getaddrinfo with AI_ADDRCONFIG will fail when there is no local network connected? https://github.com/stephane/libmodbus/issues/575
-	// Note: getaddrinfo could cause freezes on Android if there is no network https://github.com/hrydgard/ppsspp/issues/13300
-	if (getaddrinfo(szHostName, NULL, &hints, &res) == 0 && res != NULL) {
-		memcpy(&SocketAddress->sin_addr, &((struct sockaddr_in*)res->ai_addr)->sin_addr, sizeof(SocketAddress->sin_addr));
-		freeaddrinfo(res);
-		return 0;
-	}
-
-#elif defined(getifaddrs) // On Android: Requires __ANDROID_API__ >= 24
+// getifaddrs first appeared in glibc 2.3, On Android officially supported since __ANDROID_API__ >= 24
+#if defined(_IFADDRS_H_) || (__GLIBC__ > 2) || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 3) || (__ANDROID_API__ >= 24)
 	struct ifaddrs* ifAddrStruct = NULL;
 	struct ifaddrs* ifa = NULL;
 
@@ -1849,15 +1839,16 @@ int getLocalIp(sockaddr_in* SocketAddress) {
 	if (sock != SOCKET_ERROR) {
 		const char* kGoogleDnsIp = "8.8.8.8"; // Needs to be an IP string so it can be resolved as fast as possible to IP, doesn't need to be reachable
 		uint16_t kDnsPort = 53;
-		struct sockaddr_in serv;
-		memset(&serv, 0, sizeof(serv));
+		struct sockaddr_in serv {};
+		u32 ipv4 = INADDR_NONE; // inet_addr(kGoogleDnsIp); // deprecated?
+		inet_pton(AF_INET, kGoogleDnsIp, &ipv4);
 		serv.sin_family = AF_INET;
-		serv.sin_addr.s_addr = inet_addr(kGoogleDnsIp);
+		serv.sin_addr.s_addr = ipv4;
 		serv.sin_port = htons(kDnsPort);
 
-		int err = connect(sock, (struct sockaddr*)&serv, sizeof(serv));
+		int err = connect(sock, (struct sockaddr*)&serv, sizeof(serv)); // connect should succeed even with SOCK_DGRAM
 		if (err != SOCKET_ERROR) {
-			struct sockaddr_in name;
+			struct sockaddr_in name {};
 			socklen_t namelen = sizeof(name);
 			err = getsockname(sock, (struct sockaddr*)&name, &namelen);
 			if (err != SOCKET_ERROR) {
@@ -1873,7 +1864,7 @@ int getLocalIp(sockaddr_in* SocketAddress) {
 }
 
 uint32_t getLocalIp(int sock) {
-	struct sockaddr_in localAddr;
+	struct sockaddr_in localAddr {};
 	localAddr.sin_addr.s_addr = INADDR_ANY;
 	socklen_t addrLen = sizeof(localAddr);
 	getsockname(sock, (struct sockaddr*)&localAddr, &addrLen);
@@ -1884,7 +1875,7 @@ uint32_t getLocalIp(int sock) {
 }
 
 static std::vector<std::pair<uint32_t, uint32_t>> InitPrivateIPRanges() {
-	struct sockaddr_in saNet, saMask;
+	struct sockaddr_in saNet {}, saMask{};
 	std::vector<std::pair<uint32_t, uint32_t>> ip_ranges;
 
 	if (1 == inet_pton(AF_INET, "192.168.0.0", &(saNet.sin_addr)) && 1 == inet_pton(AF_INET, "255.255.0.0", &(saMask.sin_addr)))
@@ -1903,7 +1894,7 @@ static std::vector<std::pair<uint32_t, uint32_t>> InitPrivateIPRanges() {
 
 bool isPrivateIP(uint32_t ip) {
 	static const std::vector<std::pair<uint32_t, uint32_t>> ip_ranges = InitPrivateIPRanges();
-	for (auto ipRange : ip_ranges) {
+	for (auto& ipRange : ip_ranges) {
 		if ((ip & ipRange.second) == (ipRange.first & ipRange.second)) // We can just use ipRange.first directly if it's already correctly formatted
 			return true;
 	}
@@ -1931,7 +1922,7 @@ void getLocalMac(SceNetEtherAddr * addr){
 }
 
 uint16_t getLocalPort(int sock) {
-	struct sockaddr_in localAddr;
+	struct sockaddr_in localAddr {};
 	localAddr.sin_port = 0;
 	socklen_t addrLen = sizeof(localAddr);
 	getsockname(sock, (struct sockaddr*)&localAddr, &addrLen);
@@ -1941,7 +1932,8 @@ uint16_t getLocalPort(int sock) {
 u_long getAvailToRecv(int sock, int udpBufferSize) {
 	u_long n = 0; // Typical MTU size is 1500
 	int err = -1;
-#if defined(_WIN32) // May not be available on all platform
+	// Note: FIONREAD may have different behavior depends on the platform, according to https://stackoverflow.com/questions/9278189/how-do-i-get-amount-of-queued-data-for-udp-socket/9296481#9296481
+#if defined(_WIN32)
 	err = ioctlsocket(sock, FIONREAD, &n);
 #else
 	err = ioctl(sock, FIONREAD, &n);
@@ -1950,6 +1942,7 @@ u_long getAvailToRecv(int sock, int udpBufferSize) {
 		return 0;
 
 	if (udpBufferSize > 0 && n > 0) {
+		// TODO: May need to filter out packets from an IP that can't be translated to MAC address
 		// TODO: Cap number of bytes of full DGRAM message(s) up to buffer size, but may cause Warriors Orochi 2 to get FPS drops
 	}
 	return n;
@@ -1994,6 +1987,15 @@ int setSockTimeout(int sock, int opt, unsigned long timeout_usec) { // opt = SO_
 	struct timeval optval = { static_cast<long>(timeout_usec) / 1000000L, static_cast<long>(timeout_usec) % 1000000L };
 #endif
 	return setsockopt(sock, SOL_SOCKET, opt, (char*)&optval, sizeof(optval));
+}
+
+int getSockError(int sock) {
+	int result = 0;
+	socklen_t result_len = sizeof(result);
+	if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&result, &result_len) < 0) {
+		result = errno;
+	}
+	return result;
 }
 
 int getSockNoDelay(int tcpsock) { 
@@ -2190,15 +2192,16 @@ int initNetwork(SceNetAdhocctlAdhocId *adhoc_id){
 
 	// Don't need to connect if AdhocServer DNS was not resolved
 	if (g_adhocServerIP.in.sin_addr.s_addr == INADDR_NONE)
-		return -1;
+		return SOCKET_ERROR;
 
 	// Don't need to connect if AdhocServer IP is the same with this instance localhost IP and having AdhocServer disabled
 	if (g_adhocServerIP.in.sin_addr.s_addr == g_localhostIP.in.sin_addr.s_addr && !g_Config.bEnableAdhocServer)
-		return -1;
+		return SOCKET_ERROR;
 
 	// Connect to Adhoc Server
 	int errorcode = 0;
 	int cnt = 0;
+	DEBUG_LOG(SCENET, "InitNetwork: Connecting to AdhocServer");
 	iResult = connect((int)metasocket, &g_adhocServerIP.addr, sizeof(g_adhocServerIP));
 	errorcode = errno;
 
@@ -2206,8 +2209,10 @@ int initNetwork(SceNetAdhocctlAdhocId *adhoc_id){
 		u64 startTime = (u64)(time_now_d() * 1000000.0);
 		while (IsSocketReady((int)metasocket, false, true) <= 0) {
 			u64 now = (u64)(time_now_d() * 1000000.0);
-			if (coreState == CORE_POWERDOWN) return iResult;
-			if (now - startTime > adhocDefaultTimeout) break;
+			if (coreState == CORE_POWERDOWN) 
+				return iResult;
+			if (now - startTime > (u64)(getSockError((int)metasocket) == EINPROGRESS ? adhocDefaultTimeout*2LL: adhocDefaultTimeout))
+				break;
 			sleep_ms(10);
 		}
 		if (IsSocketReady((int)metasocket, false, true) <= 0) {
@@ -2228,6 +2233,7 @@ int initNetwork(SceNetAdhocctlAdhocId *adhoc_id){
 	memcpy(packet.game.data, adhoc_id->data, ADHOCCTL_ADHOCID_LEN);
 
 	IsSocketReady((int)metasocket, false, true, nullptr, adhocDefaultTimeout);
+	DEBUG_LOG(SCENET, "InitNetwork: Sending LOGIN OPCODE %d", packet.base.opcode);
 	int sent = send((int)metasocket, (char*)&packet, sizeof(packet), MSG_NOSIGNAL);
 	if (sent > 0) {
 		socklen_t addrLen = sizeof(LocalIP);
@@ -2281,7 +2287,7 @@ bool resolveIP(uint32_t ip, SceNetEtherAddr * mac) {
 	return false;
 }
 
-bool resolveMAC(SceNetEtherAddr * mac, uint32_t * ip) {
+bool resolveMAC(SceNetEtherAddr* mac, uint32_t* ip, u16* port_offset) {
 	// Get Local MAC Address
 	SceNetEtherAddr localMac;
 	getLocalMac(&localMac);
@@ -2291,6 +2297,8 @@ bool resolveMAC(SceNetEtherAddr * mac, uint32_t * ip) {
 		sockaddr_in sockAddr;
 		getLocalIp(&sockAddr);
 		*ip = sockAddr.sin_addr.s_addr;
+		if (port_offset)
+			*port_offset = portOffset;
 		return true; // return succes
 	}
 
@@ -2306,7 +2314,8 @@ bool resolveMAC(SceNetEtherAddr * mac, uint32_t * ip) {
 		if (isMacMatch(&peer->mac_addr, mac)) {
 			// Copy Data
 			*ip = peer->ip_addr;
-
+			if (port_offset)
+				*port_offset = peer->port_offset;
 			// Return Success
 			return true;
 		}

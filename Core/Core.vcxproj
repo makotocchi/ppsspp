@@ -519,6 +519,7 @@
     <ClCompile Include="Debugger\WebSocket\GameSubscriber.cpp" />
     <ClCompile Include="Debugger\WebSocket\GPUBufferSubscriber.cpp" />
     <ClCompile Include="Debugger\WebSocket\GPURecordSubscriber.cpp" />
+    <ClCompile Include="Debugger\WebSocket\GPUStatsSubscriber.cpp" />
     <ClCompile Include="Debugger\WebSocket\HLESubscriber.cpp" />
     <ClCompile Include="Debugger\WebSocket\InputBroadcaster.cpp" />
     <ClCompile Include="Debugger\WebSocket\InputSubscriber.cpp" />
@@ -539,6 +540,7 @@
     <ClCompile Include="HLE\sceUsbMic.cpp" />
     <ClCompile Include="HW\BufferQueue.cpp" />
     <ClCompile Include="HW\Camera.cpp" />
+    <ClCompile Include="HW\Display.cpp" />
     <ClCompile Include="Instance.cpp" />
     <ClCompile Include="KeyMap.cpp" />
     <ClCompile Include="KeyMapDefaults.cpp" />
@@ -989,16 +991,6 @@
     <ClCompile Include="System.cpp" />
     <ClCompile Include="ThreadPools.cpp" />
     <ClCompile Include="Util\AudioFormat.cpp" />
-    <ClCompile Include="Util\AudioFormatNEON.cpp">
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">false</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|ARM'">false</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">false</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|ARM'">false</ExcludedFromBuild>
-    </ClCompile>
     <ClCompile Include="Util\BlockAllocator.cpp" />
     <ClCompile Include="Util\DisArm64.cpp" />
     <ClCompile Include="Util\GameManager.cpp" />
@@ -1076,6 +1068,7 @@
     <ClInclude Include="Debugger\WebSocket\DisasmSubscriber.h" />
     <ClInclude Include="Debugger\WebSocket\GPUBufferSubscriber.h" />
     <ClInclude Include="Debugger\WebSocket\GPURecordSubscriber.h" />
+    <ClInclude Include="Debugger\WebSocket\GPUStatsSubscriber.h" />
     <ClInclude Include="Debugger\WebSocket\HLESubscriber.h" />
     <ClInclude Include="Debugger\WebSocket\InputBroadcaster.h" />
     <ClInclude Include="Debugger\WebSocket\InputSubscriber.h" />
@@ -1097,6 +1090,7 @@
     <ClInclude Include="HLE\sceUsbCam.h" />
     <ClInclude Include="HLE\sceUsbMic.h" />
     <ClInclude Include="HW\Camera.h" />
+    <ClInclude Include="HW\Display.h" />
     <ClInclude Include="Instance.h" />
     <ClInclude Include="KeyMap.h" />
     <ClInclude Include="KeyMapDefaults.h" />
@@ -1350,16 +1344,6 @@
     <ClInclude Include="ThreadEventQueue.h" />
     <ClInclude Include="ThreadPools.h" />
     <ClInclude Include="Util\AudioFormat.h" />
-    <ClInclude Include="Util\AudioFormatNEON.h">
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">false</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|ARM'">false</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">false</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|ARM'">false</ExcludedFromBuild>
-    </ClInclude>
     <ClInclude Include="Util\BlockAllocator.h" />
     <ClInclude Include="Util\DisArm64.h" />
     <ClInclude Include="Util\GameManager.h" />

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 
+#include "Core/Config.h"
 #include "Common/System/Display.h"
 #include "Common/System/System.h"
 #include "Common/UI/UI.h"
@@ -9,7 +10,6 @@
 #include "Common/UI/Context.h"
 #include "Common/Render/DrawBuffer.h"
 #include "Common/Render/Text/draw_text.h"
-
 #include "Common/Log.h"
 #include "UI/TextureUtil.h"
 
@@ -35,13 +35,34 @@ void UIContext::Init(Draw::DrawContext *thin3d, Draw::Pipeline *uipipe, Draw::Pi
 	textDrawer_ = TextDrawer::Create(thin3d);  // May return nullptr if no implementation is available for this platform.
 }
 
+void UIContext::setUIAtlas(const std::string &name) {
+	_dbg_assert_(!name.empty());
+	UIAtlas_ = name;
+}
+
 void UIContext::BeginFrame() {
-	if (!uitexture_) {
-		uitexture_ = CreateTextureFromFile(draw_, "ui_atlas.zim", ImageFileType::ZIM, false);
-		_dbg_assert_msg_(uitexture_, "Failed to load ui_atlas.zim.\n\nPlace it in the directory \"assets\" under your PPSSPP directory.");
+	if (!uitexture_ || UIAtlas_ != lastUIAtlas_) {
+		uitexture_ = CreateTextureFromFile(draw_, UIAtlas_.c_str(), ImageFileType::ZIM, false);
+		lastUIAtlas_ = UIAtlas_;
+		if (!fontTexture_) {
+#if PPSSPP_PLATFORM(WINDOWS) || PPSSPP_PLATFORM(ANDROID)
+			// Don't bother with loading font_atlas.zim
+#else
+			fontTexture_ = CreateTextureFromFile(draw_, "font_atlas.zim", ImageFileType::ZIM, false);
+#endif
+			if (!fontTexture_) {
+				// Load the smaller ascii font only, like on Android. For debug ui etc.
+				fontTexture_ = CreateTextureFromFile(draw_, "asciifont_atlas.zim", ImageFileType::ZIM, false);
+				if (!fontTexture_) {
+					WARN_LOG(SYSTEM, "Failed to load font_atlas.zim or asciifont_atlas.zim");
+				}
+			}
+		}
 	}
 	uidrawbufferTop_->SetCurZ(0.0f);
 	uidrawbuffer_->SetCurZ(0.0f);
+	uidrawbuffer_->SetTintSaturation(g_Config.fUITint, g_Config.fUISaturation);
+	uidrawbufferTop_->SetTintSaturation(g_Config.fUITint, g_Config.fUISaturation);
 	ActivateTopScissor();
 }
 
@@ -56,13 +77,25 @@ void UIContext::BeginNoTex() {
 
 void UIContext::BeginPipeline(Draw::Pipeline *pipeline, Draw::SamplerState *samplerState) {
 	_assert_(pipeline != nullptr);
-	draw_->BindSamplerStates(0, 1, &samplerState);
+	// Also clear out any other textures bound.
+	Draw::SamplerState *samplers[3]{ samplerState };
+	draw_->BindSamplerStates(0, 3, samplers);
+	Draw::Texture *textures[2]{};
+	draw_->BindTextures(1, 2, textures);
 	RebindTexture();
 	UIBegin(pipeline);
 }
 
 void UIContext::RebindTexture() const {
 	if (uitexture_)
+		draw_->BindTexture(0, uitexture_->GetTexture());
+}
+
+void UIContext::BindFontTexture() const {
+	// Fall back to the UI texture, in case they have an old atlas.
+	if (fontTexture_)
+		draw_->BindTexture(0, fontTexture_->GetTexture());
+	else if (uitexture_)
 		draw_->BindTexture(0, uitexture_->GetTexture());
 }
 
@@ -186,14 +219,22 @@ void UIContext::MeasureTextRect(const UI::FontStyle &style, float scaleX, float 
 
 void UIContext::DrawText(const char *str, float x, float y, uint32_t color, int align) {
 	if (!textDrawer_ || (align & FLAG_DYNAMIC_ASCII)) {
+		// Use the font texture if this font is in that texture instead.
+		bool useFontTexture = Draw()->GetFontAtlas()->getFont(fontStyle_->atlasFont) != nullptr;
+		if (useFontTexture) {
+			Flush();
+			BindFontTexture();
+		}
 		float sizeFactor = (float)fontStyle_->sizePts / 24.0f;
 		Draw()->SetFontScale(fontScaleX_ * sizeFactor, fontScaleY_ * sizeFactor);
 		Draw()->DrawText(fontStyle_->atlasFont, str, x, y, color, align);
+		if (useFontTexture)
+			Flush();
 	} else {
 		textDrawer_->SetFontScale(fontScaleX_, fontScaleY_);
 		textDrawer_->DrawString(*Draw(), str, x, y, color, align);
-		RebindTexture();
 	}
+	RebindTexture();
 }
 
 void UIContext::DrawTextShadow(const char *str, float x, float y, uint32_t color, int align) {
@@ -204,17 +245,25 @@ void UIContext::DrawTextShadow(const char *str, float x, float y, uint32_t color
 
 void UIContext::DrawTextRect(const char *str, const Bounds &bounds, uint32_t color, int align) {
 	if (!textDrawer_ || (align & FLAG_DYNAMIC_ASCII)) {
+		// Use the font texture if this font is in that texture instead.
+		bool useFontTexture = Draw()->GetFontAtlas()->getFont(fontStyle_->atlasFont) != nullptr;
+		if (useFontTexture) {
+			Flush();
+			BindFontTexture();
+		}
 		float sizeFactor = (float)fontStyle_->sizePts / 24.0f;
 		Draw()->SetFontScale(fontScaleX_ * sizeFactor, fontScaleY_ * sizeFactor);
 		Draw()->DrawTextRect(fontStyle_->atlasFont, str, bounds.x, bounds.y, bounds.w, bounds.h, color, align);
+		if (useFontTexture)
+			Flush();
 	} else {
 		textDrawer_->SetFontScale(fontScaleX_, fontScaleY_);
 		Bounds rounded = bounds;
 		rounded.x = floorf(rounded.x);
 		rounded.y = floorf(rounded.y);
 		textDrawer_->DrawStringRect(*Draw(), str, rounded, color, align);
-		RebindTexture();
 	}
+	RebindTexture();
 }
 
 void UIContext::DrawTextShadowRect(const char *str, const Bounds &bounds, uint32_t color, int align) {

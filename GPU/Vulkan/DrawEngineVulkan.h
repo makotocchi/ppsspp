@@ -32,6 +32,7 @@
 // won't get any bone data, etc.
 
 #include "Common/Data/Collections/Hashmaps.h"
+#include "Common/GPU/Vulkan/VulkanMemory.h"
 
 #include "GPU/Vulkan/VulkanUtil.h"
 
@@ -123,7 +124,7 @@ private:
 // Handles transform, lighting and drawing.
 class DrawEngineVulkan : public DrawEngineCommon {
 public:
-	DrawEngineVulkan(VulkanContext *vulkan, Draw::DrawContext *draw);
+	DrawEngineVulkan(Draw::DrawContext *draw);
 	virtual ~DrawEngineVulkan();
 
 	void SetShaderManager(ShaderManagerVulkan *shaderManager) {
@@ -140,7 +141,7 @@ public:
 	}
 
 	void DeviceLost();
-	void DeviceRestore(VulkanContext *vulkan, Draw::DrawContext *draw);
+	void DeviceRestore(Draw::DrawContext *draw);
 
 	// So that this can be inlined
 	void Flush() {
@@ -174,19 +175,13 @@ public:
 	}
 
 	VulkanPushBuffer *GetPushBufferForTextureData() {
-		return frame_[vulkan_->GetCurFrame()].pushUBO;
-	}
-
-	// Only use Allocate on this one.
-	VulkanPushBuffer *GetPushBufferLocal() {
-		return frame_[vulkan_->GetCurFrame()].pushLocal;
+		return GetCurFrame().pushUBO;
 	}
 
 	const DrawEngineVulkanStats &GetStats() const {
 		return stats_;
 	}
 
-	void SetLineWidth(float lineWidth);
 	void SetDepalTexture(VkImageView depal) {
 		if (boundDepal_ != depal) {
 			boundDepal_ = depal;
@@ -205,14 +200,13 @@ private:
 	void DestroyDeviceObjects();
 
 	void DecodeVertsToPushBuffer(VulkanPushBuffer *push, uint32_t *bindOffset, VkBuffer *vkbuf);
-	VkResult RecreateDescriptorPool(FrameData &frame, int newSize);
 
 	void DoFlush();
 	void UpdateUBOs(FrameData *frame);
+	FrameData &GetCurFrame();
 
 	VkDescriptorSet GetOrCreateDescriptorSet(VkImageView imageView, VkSampler sampler, VkBuffer base, VkBuffer light, VkBuffer bone, bool tess);
 
-	VulkanContext *vulkan_;
 	Draw::DrawContext *draw_;
 
 	// We use a single descriptor set layout for all PSP draws.
@@ -241,18 +235,15 @@ private:
 
 	// We alternate between these.
 	struct FrameData {
-		FrameData() : descSets(512) {}
+		FrameData() : descSets(512), descPool("DrawEngine", true) {
+			descPool.Setup([this] { descSets.Clear(); });
+		}
 
-		VkDescriptorPool descPool = VK_NULL_HANDLE;
-		int descCount = 0;
-		int descPoolSize = 256;  // We double this before we allocate so we initialize this to half the size we want.
+		VulkanDescSetPool descPool;
 
 		VulkanPushBuffer *pushUBO = nullptr;
 		VulkanPushBuffer *pushVertex = nullptr;
 		VulkanPushBuffer *pushIndex = nullptr;
-
-		// Special push buffer in GPU local memory, for texture data conversion and similar tasks.
-		VulkanPushBuffer *pushLocal;
 
 		// We do rolling allocation and reset instead of caching across frames. That we might do later.
 		DenseHashMap<DescriptorSetKey, VkDescriptorSet, (VkDescriptorSet)VK_NULL_HANDLE> descSets;

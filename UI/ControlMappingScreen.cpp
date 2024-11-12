@@ -175,7 +175,7 @@ void SingleControlMapper::MappedCallback(KeyDef kdf) {
 		bool success = KeyMap::ReplaceSingleKeyMapping(pspKey_, actionIndex_, kdf);
 		if (!success) {
 			replaceAllButton_->SetFocus(); // Last got removed as a duplicate
-		} else if (actionIndex_ < rows_.size()) {
+		} else if (actionIndex_ < (int)rows_.size()) {
 			rows_[actionIndex_]->SetFocus();
 		} else {
 			SetFocus();
@@ -223,7 +223,7 @@ UI::EventReturn SingleControlMapper::OnDelete(UI::EventParams &params) {
 	KeyMap::g_controllerMap[pspKey_].erase(KeyMap::g_controllerMap[pspKey_].begin() + index);
 	KeyMap::g_controllerMapGeneration++;
 
-	if (index + 1 < rows_.size())
+	if (index + 1 < (int)rows_.size())
 		rows_[index]->SetFocus();
 	else
 		SetFocus();
@@ -809,7 +809,7 @@ void TouchTestScreen::render() {
 
 	ui_context->Begin();
 
-	char buffer[2048];
+	char buffer[4096];
 	for (int i = 0; i < MAX_TOUCH_POINTS; i++) {
 		if (touches_[i].id != -1) {
 			ui_context->Draw()->Circle(touches_[i].x, touches_[i].y, 100.0, 3.0, 80, 0.0f, 0xFFFFFFFF, 1.0);
@@ -953,7 +953,7 @@ public:
 	void Draw(UIContext &dc) override {
 		uint32_t c = 0xFFFFFFFF;
 		if (HasFocus() || Selected())
-			c = dc.theme->buttonFocusedStyle.background.color;
+			c = dc.theme->itemFocusedStyle.background.color;
 
 		float scales[2]{};
 		if (bgImg_.isValid())

@@ -123,16 +123,17 @@ struct TexCacheEntry {
 		STATUS_CLUT_RECHECK = 0x20,    // Another texture with same addr had a hashfail.
 		STATUS_TO_SCALE = 0x80,        // Pending texture scaling in a later frame.
 		STATUS_IS_SCALED = 0x100,      // Has been scaled (can't be replaceImages'd.)
+		STATUS_TO_REPLACE = 0x0200,    // Pending texture replacement.
 		// When hashing large textures, we optimize 512x512 down to 512x272 by default, since this
 		// is commonly the only part accessed.  If access is made above 272, we hash the entire
 		// texture, and set this flag to allow scaling the texture just once for the new hash.
-		STATUS_FREE_CHANGE = 0x200,    // Allow one change before marking "frequent".
+		STATUS_FREE_CHANGE = 0x0400,   // Allow one change before marking "frequent".
 
-		STATUS_BAD_MIPS = 0x400,       // Has bad or unusable mipmap levels.
+		STATUS_BAD_MIPS = 0x0800,      // Has bad or unusable mipmap levels.
 
-		STATUS_FRAMEBUFFER_OVERLAP = 0x800,
+		STATUS_FRAMEBUFFER_OVERLAP = 0x1000,
 
-		STATUS_FORCE_REBUILD = 0x1000,
+		STATUS_FORCE_REBUILD = 0x2000,
 	};
 
 	// Status, but int so we can zero initialize.
@@ -175,6 +176,13 @@ struct TexCacheEntry {
 		status = (status & ~STATUS_ALPHA_MASK) | newStatus;
 	}
 	void SetAlphaStatus(TexStatus newStatus, int level) {
+		// For non-level zero, only set more restrictive.
+		if (newStatus == STATUS_ALPHA_UNKNOWN || level == 0) {
+			SetAlphaStatus(newStatus);
+		}
+	}
+	void SetAlphaStatus(CheckAlphaResult alphaResult, int level) {
+		TexStatus newStatus = (TexStatus)alphaResult;
 		// For non-level zero, only set more restrictive.
 		if (newStatus == STATUS_ALPHA_UNKNOWN || level == 0) {
 			SetAlphaStatus(newStatus);
@@ -274,9 +282,10 @@ protected:
 	virtual void UpdateCurrentClut(GEPaletteFormat clutFormat, u32 clutBase, bool clutIndexIsSimple) = 0;
 	bool CheckFullHash(TexCacheEntry *entry, bool &doDelete);
 
-	void DecodeTextureLevel(u8 *out, int outPitch, GETextureFormat format, GEPaletteFormat clutformat, uint32_t texaddr, int level, int bufw, bool reverseColors, bool useBGRA, bool expandTo32Bit);
+	CheckAlphaResult DecodeTextureLevel(u8 *out, int outPitch, GETextureFormat format, GEPaletteFormat clutformat, uint32_t texaddr, int level, int bufw, bool reverseColors, bool useBGRA, bool expandTo32Bit);
 	void UnswizzleFromMem(u32 *dest, u32 destPitch, const u8 *texptr, u32 bufw, u32 height, u32 bytesPerPixel);
-	void ReadIndexedTex(u8 *out, int outPitch, int level, const u8 *texptr, int bytesPerIndex, int bufw, bool expandTo32Bit);
+	CheckAlphaResult ReadIndexedTex(u8 *out, int outPitch, int level, const u8 *texptr, int bytesPerIndex, int bufw, bool reverseColors, bool expandTo32Bit);
+	ReplacedTexture &FindReplacement(TexCacheEntry *entry, int &w, int &h);
 
 	template <typename T>
 	inline const T *GetCurrentClut() {
@@ -314,7 +323,7 @@ protected:
 		gpuStats.numTextureDataBytesHashed += sizeInRAM;
 
 		if (Memory::IsValidAddress(addr + sizeInRAM)) {
-			return DoQuickTexHash(checkp, sizeInRAM);
+			return StableQuickTexHash(checkp, sizeInRAM);
 		} else {
 			return 0;
 		}
@@ -334,6 +343,9 @@ protected:
 	int decimationCounter_;
 	int texelsScaledThisFrame_ = 0;
 	int timesInvalidatedAllThisFrame_ = 0;
+	double replacementTimeThisFrame_ = 0;
+	// TODO: Maybe vary by FPS...
+	double replacementFrameBudget_ = 0.5 / 60.0;
 
 	TexCache cache_;
 	u32 cacheSizeEstimate_ = 0;

@@ -121,7 +121,8 @@ void CMemoryDlg::searchBoxRedraw(std::vector<u32> results) {
 	wchar_t temp[256]{};
 	SendMessage(srcListHdl, WM_SETREDRAW, FALSE, 0);
 	ListBox_ResetContent(srcListHdl);
-	for (int i = 0; i < results.size(); i++) {
+	SendMessage(srcListHdl, LB_INITSTORAGE, (WPARAM)results.size(), (LPARAM)results.size() * 22);
+	for (size_t i = 0; i < results.size(); i++) {
 		wsprintf(temp, L"0x%08X", results[i]);
 		int index = (int)ListBox_AddString(srcListHdl, temp);
 		ListBox_SetItemData(srcListHdl, index, results[i]);
@@ -134,7 +135,9 @@ void CMemoryDlg::searchBoxRedraw(std::vector<u32> results) {
 void CMemoryDlg::NotifyMapLoaded() {
 	if (m_hDlg && g_symbolMap)
 		g_symbolMap->FillSymbolListBox(symListHdl, ST_DATA);
-	Update(); 
+	else
+		mapLoadPending_ = true;
+	Update();
 }
 
 BOOL CMemoryDlg::DlgProc(UINT message, WPARAM wParam, LPARAM lParam) {
@@ -219,6 +222,10 @@ BOOL CMemoryDlg::DlgProc(UINT message, WPARAM wParam, LPARAM lParam) {
 	}
 
 	case WM_DEB_UPDATE:
+		if (mapLoadPending_ && m_hDlg && g_symbolMap) {
+			g_symbolMap->FillSymbolListBox(symListHdl, ST_DATA);
+			mapLoadPending_ = false;
+		}
 		Update();
 		return TRUE;
 

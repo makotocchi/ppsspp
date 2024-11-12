@@ -5,6 +5,7 @@
 #include <cstring>
 #include <iostream>
 
+#include "Common/System/System.h"
 #include "Common/System/Display.h"
 #include "Common/Log.h"
 #include "Common/GPU/Vulkan/VulkanContext.h"
@@ -13,13 +14,16 @@
 #include "Common/StringUtils.h"
 #include "Core/Config.h"
 
-// Change this to 1, 2, and 3 to fake failures in a few places, so that
-// we can test our fallback-to-GL code.
-#define SIMULATE_VULKAN_FAILURE 0
-
 #ifdef USE_CRT_DBG
 #undef new
 #endif
+
+#include "ext/vma/vk_mem_alloc.h"
+
+
+// Change this to 1, 2, and 3 to fake failures in a few places, so that
+// we can test our fallback-to-GL code.
+#define SIMULATE_VULKAN_FAILURE 0
 
 #include "ext/glslang/SPIRV/GlslangToSpv.h"
 
@@ -147,16 +151,28 @@ VkResult VulkanContext::CreateInstance(const CreateInfo &info) {
 	// Temporary hack for libretro. For some reason, when we try to load the functions from this extension,
 	// we get null pointers when running libretro. Quite strange.
 #if !defined(__LIBRETRO__)
-	if (IsInstanceExtensionAvailable(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME)) {
-		instance_extensions_enabled_.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+	if (EnableInstanceExtension(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME)) {
 		extensionsLookup_.KHR_get_physical_device_properties2 = true;
 	}
 #endif
+
+	if (EnableInstanceExtension(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
+		extensionsLookup_.EXT_swapchain_colorspace = true;
+	}
 
 	// Validate that all the instance extensions we ask for are actually available.
 	for (auto ext : instance_extensions_enabled_) {
 		if (!IsInstanceExtensionAvailable(ext))
 			WARN_LOG(G3D, "WARNING: Does not seem that instance extension '%s' is available. Trying to proceed anyway.", ext);
+	}
+
+	// Check which Vulkan version we should request.
+	// Our code is fine with any version from 1.0 to 1.2, we don't know about higher versions.
+	u32 vulkanApiVersion = VK_API_VERSION_1_0;
+	if (vkEnumerateInstanceVersion) {
+		vkEnumerateInstanceVersion(&vulkanApiVersion);
+		vulkanApiVersion &= 0xFFFFF000;  // Remove patch version.
+		vulkanApiVersion = std::min(VK_API_VERSION_1_2, vulkanApiVersion);
 	}
 
 	VkApplicationInfo app_info{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
@@ -165,7 +181,7 @@ VkResult VulkanContext::CreateInstance(const CreateInfo &info) {
 	app_info.pEngineName = info.app_name;
 	// Let's increment this when we make major engine/context changes.
 	app_info.engineVersion = 2;
-	app_info.apiVersion = VK_API_VERSION_1_0;
+	app_info.apiVersion = vulkanApiVersion;
 
 	VkInstanceCreateInfo inst_info{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
 	inst_info.flags = 0;
@@ -277,10 +293,14 @@ void VulkanContext::DestroyInstance() {
 	instance_ = VK_NULL_HANDLE;
 }
 
-void VulkanContext::BeginFrame() {
+void VulkanContext::BeginFrame(VkCommandBuffer firstCommandBuffer) {
 	FrameData *frame = &frame_[curFrame_];
 	// Process pending deletes.
-	frame->deleteList.PerformDeletes(device_);
+	frame->deleteList.PerformDeletes(device_, allocator_);
+	// VK_NULL_HANDLE when profiler is disabled.
+	if (firstCommandBuffer) {
+		frame->profiler.BeginFrame(this, firstCommandBuffer);
+	}
 }
 
 void VulkanContext::EndFrame() {
@@ -574,12 +594,12 @@ void VulkanContext::ChooseDevice(int physical_device) {
 	deviceFeatures_.enabled = {};
 	// Enable a few safe ones if they are available.
 	deviceFeatures_.enabled.dualSrcBlend = deviceFeatures_.available.dualSrcBlend;
-	deviceFeatures_.enabled.largePoints = deviceFeatures_.available.largePoints;
-	deviceFeatures_.enabled.wideLines = deviceFeatures_.available.wideLines;
 	deviceFeatures_.enabled.logicOp = deviceFeatures_.available.logicOp;
 	deviceFeatures_.enabled.depthClamp = deviceFeatures_.available.depthClamp;
 	deviceFeatures_.enabled.depthBounds = deviceFeatures_.available.depthBounds;
 	deviceFeatures_.enabled.samplerAnisotropy = deviceFeatures_.available.samplerAnisotropy;
+	deviceFeatures_.enabled.shaderClipDistance = deviceFeatures_.available.shaderClipDistance;
+	deviceFeatures_.enabled.shaderCullDistance = deviceFeatures_.available.shaderCullDistance;
 	// For easy wireframe mode, someday.
 	deviceFeatures_.enabled.fillModeNonSolid = deviceFeatures_.available.fillModeNonSolid;
 
@@ -592,6 +612,16 @@ bool VulkanContext::EnableDeviceExtension(const char *extension) {
 	for (auto &iter : device_extension_properties_) {
 		if (!strcmp(iter.extensionName, extension)) {
 			device_extensions_enabled_.push_back(extension);
+			return true;
+		}
+	}
+	return false;
+}
+
+bool VulkanContext::EnableInstanceExtension(const char *extension) {
+	for (auto &iter : instance_extension_properties_) {
+		if (!strcmp(iter.extensionName, extension)) {
+			instance_extensions_enabled_.push_back(extension);
 			return true;
 		}
 	}
@@ -656,6 +686,58 @@ VkResult VulkanContext::CreateDevice() {
 	}
 	INFO_LOG(G3D, "Device created.\n");
 	VulkanSetAvailable(true);
+
+	VmaAllocatorCreateInfo allocatorInfo = {};
+	allocatorInfo.vulkanApiVersion = VK_API_VERSION_1_0;
+	allocatorInfo.physicalDevice = physical_devices_[physical_device_];
+	allocatorInfo.device = device_;
+	allocatorInfo.instance = instance_;
+	vmaCreateAllocator(&allocatorInfo, &allocator_);
+
+	// Examine the physical device to figure out super rough performance grade.
+	// Basically all we want to do is to identify low performance mobile devices
+	// so we can make decisions on things like texture scaling strategy.
+	auto &props = physicalDeviceProperties_[physical_device_].properties;
+	switch (props.vendorID) {
+	case VULKAN_VENDOR_AMD:
+	case VULKAN_VENDOR_NVIDIA:
+	case VULKAN_VENDOR_INTEL:
+		devicePerfClass_ = PerfClass::FAST;
+		break;
+
+	case VULKAN_VENDOR_ARM:
+		devicePerfClass_ = PerfClass::SLOW;
+		{
+			// Parse the device name as an ultra rough heuristic.
+			int maliG = 0;
+			if (sscanf(props.deviceName, "Mali-G%d", &maliG) == 1) {
+				if (maliG >= 72) {
+					devicePerfClass_ = PerfClass::FAST;
+				}
+			}
+		}
+		break;
+
+	case VULKAN_VENDOR_QUALCOMM:
+		devicePerfClass_ = PerfClass::SLOW;
+#if PPSSPP_PLATFORM(ANDROID)
+		if (System_GetPropertyInt(SYSPROP_SYSTEMVERSION) >= 30) {
+			devicePerfClass_ = PerfClass::FAST;
+		}
+#endif
+		break;
+
+	case VULKAN_VENDOR_IMGTEC:
+	default:
+		devicePerfClass_ = PerfClass::SLOW;
+		break;
+	}
+
+
+	for (int i = 0; i < ARRAY_SIZE(frame_); i++) {
+		frame_[i].profiler.Init(this);
+	}
+
 	return res;
 }
 
@@ -854,8 +936,8 @@ bool VulkanContext::ChooseQueue() {
 		return false;
 	}
 
-	std::vector<VkSurfaceFormatKHR> surfFormats(formatCount);
-	res = vkGetPhysicalDeviceSurfaceFormatsKHR(physical_devices_[physical_device_], surface_, &formatCount, surfFormats.data());
+	surfFormats_.resize(formatCount);
+	res = vkGetPhysicalDeviceSurfaceFormatsKHR(physical_devices_[physical_device_], surface_, &formatCount, surfFormats_.data());
 	_dbg_assert_(res == VK_SUCCESS);
 	if (res != VK_SUCCESS) {
 		return false;
@@ -863,24 +945,23 @@ bool VulkanContext::ChooseQueue() {
 	// If the format list includes just one entry of VK_FORMAT_UNDEFINED,
 	// the surface has no preferred format.  Otherwise, at least one
 	// supported format will be returned.
-	if (formatCount == 0 || (formatCount == 1 && surfFormats[0].format == VK_FORMAT_UNDEFINED)) {
+	if (formatCount == 0 || (formatCount == 1 && surfFormats_[0].format == VK_FORMAT_UNDEFINED)) {
 		INFO_LOG(G3D, "swapchain_format: Falling back to B8G8R8A8_UNORM");
 		swapchainFormat_ = VK_FORMAT_B8G8R8A8_UNORM;
 	} else {
 		swapchainFormat_ = VK_FORMAT_UNDEFINED;
 		for (uint32_t i = 0; i < formatCount; ++i) {
-			if (surfFormats[i].colorSpace != VK_COLORSPACE_SRGB_NONLINEAR_KHR) {
+			if (surfFormats_[i].colorSpace != VK_COLORSPACE_SRGB_NONLINEAR_KHR) {
 				continue;
 			}
-
-			if (surfFormats[i].format == VK_FORMAT_B8G8R8A8_UNORM || surfFormats[i].format == VK_FORMAT_R8G8B8A8_UNORM) {
-				swapchainFormat_ = surfFormats[i].format;
+			if (surfFormats_[i].format == VK_FORMAT_B8G8R8A8_UNORM || surfFormats_[i].format == VK_FORMAT_R8G8B8A8_UNORM) {
+				swapchainFormat_ = surfFormats_[i].format;
 				break;
 			}
 		}
 		if (swapchainFormat_ == VK_FORMAT_UNDEFINED) {
 			// Okay, take the first one then.
-			swapchainFormat_ = surfFormats[0].format;
+			swapchainFormat_ = surfFormats_[0].format;
 		}
 		INFO_LOG(G3D, "swapchain_format: %d (/%d)", swapchainFormat_, formatCount);
 	}
@@ -1087,9 +1168,9 @@ VkFence VulkanContext::CreateFence(bool presignalled) {
 
 void VulkanContext::PerformPendingDeletes() {
 	for (int i = 0; i < ARRAY_SIZE(frame_); i++) {
-		frame_[i].deleteList.PerformDeletes(device_);
+		frame_[i].deleteList.PerformDeletes(device_, allocator_);
 	}
-	Delete().PerformDeletes(device_);
+	Delete().PerformDeletes(device_, allocator_);
 }
 
 void VulkanContext::DestroyDevice() {
@@ -1102,6 +1183,13 @@ void VulkanContext::DestroyDevice() {
 
 	INFO_LOG(G3D, "VulkanContext::DestroyDevice (performing deletes)");
 	PerformPendingDeletes();
+
+	for (int i = 0; i < ARRAY_SIZE(frame_); i++) {
+		frame_[i].profiler.Shutdown();
+	}
+
+	vmaDestroyAllocator(allocator_);
+	allocator_ = VK_NULL_HANDLE;
 
 	vkDestroyDevice(device_, nullptr);
 	device_ = nullptr;
@@ -1215,6 +1303,8 @@ bool GLSLtoSPV(const VkShaderStageFlagBits shader_type, const char *sourceCode, 
 		return false; // something didn't work
 	}
 
+	// TODO: Propagate warnings into errorMessages even if we succeeded here.
+
 	// Note that program does not take ownership of &shader, so this is fine.
 	program.addShader(&shader);
 
@@ -1282,8 +1372,9 @@ void VulkanDeleteList::Take(VulkanDeleteList &del) {
 	_dbg_assert_(modules_.empty());
 	_dbg_assert_(buffers_.empty());
 	_dbg_assert_(bufferViews_.empty());
-	_dbg_assert_(images_.empty());
+	_dbg_assert_(buffersWithAllocs_.empty());
 	_dbg_assert_(imageViews_.empty());
+	_dbg_assert_(imagesWithAllocs_.empty());
 	_dbg_assert_(deviceMemory_.empty());
 	_dbg_assert_(samplers_.empty());
 	_dbg_assert_(pipelines_.empty());
@@ -1297,9 +1388,10 @@ void VulkanDeleteList::Take(VulkanDeleteList &del) {
 	descPools_ = std::move(del.descPools_);
 	modules_ = std::move(del.modules_);
 	buffers_ = std::move(del.buffers_);
+	buffersWithAllocs_ = std::move(del.buffersWithAllocs_);
 	bufferViews_ = std::move(del.bufferViews_);
-	images_ = std::move(del.images_);
 	imageViews_ = std::move(del.imageViews_);
+	imagesWithAllocs_ = std::move(del.imagesWithAllocs_);
 	deviceMemory_ = std::move(del.deviceMemory_);
 	samplers_ = std::move(del.samplers_);
 	pipelines_ = std::move(del.pipelines_);
@@ -1313,8 +1405,9 @@ void VulkanDeleteList::Take(VulkanDeleteList &del) {
 	del.descPools_.clear();
 	del.modules_.clear();
 	del.buffers_.clear();
-	del.images_.clear();
+	del.buffersWithAllocs_.clear();
 	del.imageViews_.clear();
+	del.imagesWithAllocs_.clear();
 	del.deviceMemory_.clear();
 	del.samplers_.clear();
 	del.pipelines_.clear();
@@ -1326,7 +1419,7 @@ void VulkanDeleteList::Take(VulkanDeleteList &del) {
 	del.callbacks_.clear();
 }
 
-void VulkanDeleteList::PerformDeletes(VkDevice device) {
+void VulkanDeleteList::PerformDeletes(VkDevice device, VmaAllocator allocator) {
 	for (auto &callback : callbacks_) {
 		callback.func(callback.userdata);
 	}
@@ -1347,14 +1440,18 @@ void VulkanDeleteList::PerformDeletes(VkDevice device) {
 		vkDestroyBuffer(device, buf, nullptr);
 	}
 	buffers_.clear();
+	for (auto &buf : buffersWithAllocs_) {
+		vmaDestroyBuffer(allocator, buf.buffer, buf.alloc);
+	}
+	buffersWithAllocs_.clear();
 	for (auto &bufView : bufferViews_) {
 		vkDestroyBufferView(device, bufView, nullptr);
 	}
 	bufferViews_.clear();
-	for (auto &image : images_) {
-		vkDestroyImage(device, image, nullptr);
+	for (auto &imageWithAlloc : imagesWithAllocs_) {
+		vmaDestroyImage(allocator, imageWithAlloc.image, imageWithAlloc.alloc);
 	}
-	images_.clear();
+	imagesWithAllocs_.clear();
 	for (auto &imageView : imageViews_) {
 		vkDestroyImageView(device, imageView, nullptr);
 	}
@@ -1451,4 +1548,66 @@ std::string FormatDriverVersion(const VkPhysicalDeviceProperties &props) {
 	uint32_t minor = VK_VERSION_MINOR(props.driverVersion);
 	uint32_t branch = VK_VERSION_PATCH(props.driverVersion);
 	return StringFromFormat("%d.%d.%d (%08x)", major, minor, branch, props.driverVersion);
+}
+
+// Mainly just the formats seen on gpuinfo.org for swapchains, as this function is only used for listing
+// those in the UI. Also depth buffers that we used in one place.
+// Might add more in the future if we find more uses for this.
+const char *VulkanFormatToString(VkFormat format) {
+	switch (format) {
+	case VK_FORMAT_A1R5G5B5_UNORM_PACK16: return "A1R5G5B5_UNORM_PACK16";
+	case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return "A2B10G10R10_UNORM_PACK32";
+	case VK_FORMAT_A8B8G8R8_SNORM_PACK32: return "A8B8G8R8_SNORM_PACK32";
+	case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return "A8B8G8R8_SRGB_PACK32";
+	case VK_FORMAT_A8B8G8R8_UNORM_PACK32: return "A8B8G8R8_UNORM_PACK32";
+	case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return "B10G11R11_UFLOAT_PACK32";
+	case VK_FORMAT_B4G4R4A4_UNORM_PACK16: return "B4G4R4A4_UNORM_PACK16";
+	case VK_FORMAT_B5G5R5A1_UNORM_PACK16: return "B5G5R5A1_UNORM_PACK16";
+	case VK_FORMAT_B5G6R5_UNORM_PACK16: return "B5G6R5_UNORM_PACK16";
+	case VK_FORMAT_B8G8R8A8_SNORM: return "B8G8R8A8_SNORM";
+	case VK_FORMAT_B8G8R8A8_SRGB: return "B8G8R8A8_SRGB";
+	case VK_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
+	case VK_FORMAT_R16G16B16A16_SFLOAT: return "R16G16B16A16_SFLOAT";
+	case VK_FORMAT_R16G16B16A16_SNORM: return "R16G16B16A16_SNORM";
+	case VK_FORMAT_R16G16B16A16_UNORM: return "R16G16B16A16_UNORM";
+	case VK_FORMAT_R4G4B4A4_UNORM_PACK16: return "R4G4B4A4_UNORM_PACK16";
+	case VK_FORMAT_R5G5B5A1_UNORM_PACK16: return "R5G5B5A1_UNORM_PACK16";
+	case VK_FORMAT_R5G6B5_UNORM_PACK16: return "R5G6B5_UNORM_PACK16";
+	case VK_FORMAT_R8G8B8A8_SNORM: return "R8G8B8A8_SNORM";
+	case VK_FORMAT_R8G8B8A8_SRGB: return "R8G8B8A8_SRGB";
+	case VK_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
+
+	case VK_FORMAT_D24_UNORM_S8_UINT: return "D24S8";
+	case VK_FORMAT_D16_UNORM: return "D16";
+	case VK_FORMAT_D16_UNORM_S8_UINT: return "D16S8";
+	case VK_FORMAT_D32_SFLOAT: return "D32f";
+	case VK_FORMAT_D32_SFLOAT_S8_UINT: return "D32fS8";
+	case VK_FORMAT_S8_UINT: return "S8";
+	case VK_FORMAT_UNDEFINED: return "UNDEFINED (BAD!)";
+
+	default: return "(format not added to string list)";
+	}
+}
+
+// I miss Rust where this is automatic :(
+const char *VulkanColorSpaceToString(VkColorSpaceKHR colorSpace) {
+	switch (colorSpace) {
+	case VK_COLOR_SPACE_SRGB_NONLINEAR_KHR: return "SRGB_NONLINEAR";
+	case VK_COLOR_SPACE_DISPLAY_P3_NONLINEAR_EXT: return "DISPLAY_P3_NONLINEAR";
+	case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT: return "EXTENDED_SRGB_LINEAR";
+	case VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT: return "DISPLAY_P3_LINEAR";
+	case VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT: return "DCI_P3_NONLINEAR"; 
+	case VK_COLOR_SPACE_BT709_LINEAR_EXT: return "BT709_LINEAR";
+	case VK_COLOR_SPACE_BT709_NONLINEAR_EXT: return "BT709_NONLINEAR";
+	case VK_COLOR_SPACE_BT2020_LINEAR_EXT: return "BT2020_LINEAR";
+	case VK_COLOR_SPACE_HDR10_ST2084_EXT: return "HDR10_ST2084";
+	case VK_COLOR_SPACE_DOLBYVISION_EXT: return "DOLBYVISION";
+	case VK_COLOR_SPACE_HDR10_HLG_EXT: return "HDR10_HLG";
+	case VK_COLOR_SPACE_ADOBERGB_LINEAR_EXT: return "ADOBERGB_LINEAR";
+	case VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT: return "ADOBERGB_NONLINEAR";
+	case VK_COLOR_SPACE_PASS_THROUGH_EXT: return "PASS_THROUGH";
+	case VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT: return "EXTENDED_SRGB_NONLINEAR";
+	case VK_COLOR_SPACE_DISPLAY_NATIVE_AMD: return "DISPLAY_NATIVE_AMD";
+	default: return "(unknown)";
+	}
 }

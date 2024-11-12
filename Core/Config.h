@@ -118,7 +118,6 @@ public:
 	uint32_t uJitDisableFlags;
 
 	bool bSeparateSASThread;
-	bool bSeparateIOThread;
 	int iIOTimingMethod;
 	int iLockedCPUSpeed;
 	bool bAutoSaveSymbolMap;
@@ -156,6 +155,7 @@ public:
 	std::string sMicDevice;
 
 	bool bSoftwareRendering;
+	bool bSoftwareRenderingJit;
 	bool bHardwareTransform; // only used in the GLES backend
 	bool bSoftwareSkinning;  // may speed up some games
 	bool bVendorBugChecksEnabled;
@@ -186,6 +186,9 @@ public:
 	int iWindowWidth;  // Windows and other windowed environments
 	int iWindowHeight;
 
+	float fUITint;
+	float fUISaturation;
+
 	bool bVertexCache;
 	bool bTextureBackoffCache;
 	bool bTextureSecondaryCache;
@@ -198,6 +201,7 @@ public:
 	bool bReplaceTextures;
 	bool bSaveNewTextures;
 	bool bIgnoreTextureFilenames;
+	bool bReplaceTexturesAllowLate;
 	int iTexScalingLevel; // 0 = auto, 1 = off, 2 = 2x, ..., 5 = 5x
 	int iTexScalingType; // 0 = xBRZ, 1 = Hybrid
 	bool bTexDeposterize;
@@ -224,6 +228,7 @@ public:
 	bool bFragmentTestCache;
 	int iSplineBezierQuality; // 0 = low , 1 = Intermediate , 2 = High
 	bool bHardwareTessellation;
+	bool bShaderCache;  // Hidden ini-only setting, useful for debugging shader compile times.
 
 	std::vector<std::string> vPostShaderNames; // Off for chain end (only Off for no shader)
 	std::map<std::string, float> mPostShaderSetting;
@@ -253,35 +258,7 @@ public:
 	bool bShowOnScreenMessages;
 	int iBackgroundAnimation;  // enum BackgroundAnimation
 
-	// TODO: Maybe move to a separate theme system.
-	uint32_t uItemStyleFg;
-	uint32_t uItemStyleBg;
-	uint32_t uItemFocusedStyleFg;
-	uint32_t uItemFocusedStyleBg;
-	uint32_t uItemDownStyleFg;
-	uint32_t uItemDownStyleBg;
-	uint32_t uItemDisabledStyleFg;
-	uint32_t uItemDisabledStyleBg;
-	uint32_t uItemHighlightedStyleFg;
-	uint32_t uItemHighlightedStyleBg;
-
-	uint32_t uButtonStyleFg;
-	uint32_t uButtonStyleBg;
-	uint32_t uButtonFocusedStyleFg;
-	uint32_t uButtonFocusedStyleBg;
-	uint32_t uButtonDownStyleFg;
-	uint32_t uButtonDownStyleBg;
-	uint32_t uButtonDisabledStyleFg;
-	uint32_t uButtonDisabledStyleBg;
-	uint32_t uButtonHighlightedStyleFg;
-	uint32_t uButtonHighlightedStyleBg;
-
-	uint32_t uHeaderStyleFg;
-	uint32_t uInfoStyleFg;
-	uint32_t uInfoStyleBg;
-	uint32_t uPopupTitleStyleFg;
-	uint32_t uPopupStyleFg;
-	uint32_t uPopupStyleBg;
+	std::string sThemeName;
 
 	bool bLogFrameDrops;
 	bool bShowDebugStats;
@@ -493,6 +470,7 @@ public:
 
 	// Volatile development settings
 	bool bShowFrameProfiler;
+	bool bGpuLogProfiler; // Controls the Vulkan logging profiler (profiles textures uploads etc).
 
 	// Various directories. Autoconfigured, not read from ini.
 	Path currentDirectory;  // The directory selected in the game browsing window.

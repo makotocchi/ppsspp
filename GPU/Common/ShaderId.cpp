@@ -79,27 +79,27 @@ void ComputeVertexShaderID(VShaderID *id_out, u32 vertType, bool useHWTransform,
 	}
 
 	bool enableFog = gstate.isFogEnabled() && !isModeThrough && !gstate.isModeClear();
-	bool lmode = gstate.isUsingSecondaryColor() && gstate.isLightingEnabled() && !isModeThrough;
+	bool lmode = gstate.isUsingSecondaryColor() && gstate.isLightingEnabled() && !isModeThrough && !gstate.isModeClear();
 	bool vertexRangeCulling = gstate_c.Supports(GPU_SUPPORTS_VS_RANGE_CULLING) &&
 		!isModeThrough && gstate_c.submitType == SubmitType::DRAW;  // neither hw nor sw spline/bezier. See #11692
 
 	VShaderID id;
 	id.SetBit(VS_BIT_LMODE, lmode);
-	id.SetBit(VS_BIT_IS_THROUGH, isModeThrough);
 	id.SetBit(VS_BIT_ENABLE_FOG, enableFog);
+	id.SetBit(VS_BIT_IS_THROUGH, isModeThrough);
 	id.SetBit(VS_BIT_HAS_COLOR, hasColor);
 	id.SetBit(VS_BIT_VERTEX_RANGE_CULLING, vertexRangeCulling);
 
 	if (doTexture) {
 		id.SetBit(VS_BIT_DO_TEXTURE);
+
+		// UV generation mode. doShadeMapping is implicitly stored here.
+		id.SetBits(VS_BIT_UVGEN_MODE, 2, gstate.getUVGenMode());
 	}
 
 	if (useHWTransform) {
 		id.SetBit(VS_BIT_USE_HW_TRANSFORM);
 		id.SetBit(VS_BIT_HAS_NORMAL, hasNormal);
-
-		// UV generation mode. doShadeMapping is implicitly stored here.
-		id.SetBits(VS_BIT_UVGEN_MODE, 2, gstate.getUVGenMode());
 
 		// The next bits are used differently depending on UVgen mode
 		if (gstate.getUVGenMode() == GE_TEXMAP_TEXTURE_MATRIX) {
@@ -121,7 +121,7 @@ void ComputeVertexShaderID(VShaderID *id_out, u32 vertType, bool useHWTransform,
 
 		if (gstate.isLightingEnabled()) {
 			// doShadeMapping is stored as UVGenMode, and light type doesn't matter for shade mapping.
-			id.SetBits(VS_BIT_MATERIAL_UPDATE, 3, gstate.getMaterialUpdate() & 7);
+			id.SetBits(VS_BIT_MATERIAL_UPDATE, 3, gstate.getMaterialUpdate());
 			id.SetBit(VS_BIT_LIGHTING_ENABLE);
 			// Light bits
 			for (int i = 0; i < 4; i++) {
@@ -186,8 +186,19 @@ std::string FragmentShaderDesc(const FShaderID &id) {
 		if (id.Bit(FS_BIT_CLAMP_T)) desc << "T";
 		desc << " ";
 	}
-	if (id.Bits(FS_BIT_REPLACE_BLEND, 3)) {
-		desc << "ReplaceBlend_" << id.Bits(FS_BIT_REPLACE_BLEND, 3) << "A:" << id.Bits(FS_BIT_BLENDFUNC_A, 4) << "_B:" << id.Bits(FS_BIT_BLENDFUNC_B, 4) << "_Eq:" << id.Bits(FS_BIT_BLENDEQ, 3) << " ";
+	int blendBits = id.Bits(FS_BIT_REPLACE_BLEND, 3);
+	if (blendBits) {
+		switch (blendBits) {
+		case ReplaceBlendType::REPLACE_BLEND_BLUE_TO_ALPHA:
+			desc << "BlueToAlpha_" << "A:" << id.Bits(FS_BIT_BLENDFUNC_A, 4);
+			break;
+		default:
+			desc << "ReplaceBlend_" << id.Bits(FS_BIT_REPLACE_BLEND, 3)
+				 << "A:" << id.Bits(FS_BIT_BLENDFUNC_A, 4)
+				 << "_B:" << id.Bits(FS_BIT_BLENDFUNC_B, 4)
+				 << "_Eq:" << id.Bits(FS_BIT_BLENDEQ, 3) << " ";
+			break;
+		}
 	}
 
 	switch (id.Bits(FS_BIT_STENCIL_TO_ALPHA, 2)) {
@@ -243,7 +254,7 @@ void ComputeFragmentShaderID(FShaderID *id_out, const Draw::Bugs &bugs) {
 		bool enableFog = gstate.isFogEnabled() && !isModeThrough;
 		bool enableAlphaTest = gstate.isAlphaTestEnabled() && !IsAlphaTestTriviallyTrue();
 		bool enableColorTest = gstate.isColorTestEnabled() && !IsColorTestTriviallyTrue();
-		bool enableColorDoubling = gstate.isColorDoublingEnabled() && gstate.isTextureMapEnabled() && gstate.getTextureFunction() == GE_TEXFUNC_MODULATE;
+		bool enableColorDoubling = gstate.isColorDoublingEnabled() && gstate.isTextureMapEnabled();
 		bool doTextureProjection = (gstate.getUVGenMode() == GE_TEXMAP_TEXTURE_MATRIX && MatrixNeedsProjection(gstate.tgenMatrix));
 		bool doTextureAlpha = gstate.isTextureAlphaUsed();
 		bool doFlatShading = gstate.getShadeMode() == GE_SHADE_FLAT;
@@ -252,7 +263,10 @@ void ComputeFragmentShaderID(FShaderID *id_out, const Draw::Bugs &bugs) {
 
 		// Note how we here recompute some of the work already done in state mapping.
 		// Not ideal! At least we share the code.
-		ReplaceBlendType replaceBlend = ReplaceBlendWithShader(gstate_c.allowFramebufferRead, gstate.FrameBufFormat());
+		ReplaceBlendType replaceBlend = ReplaceBlendWithShader(gstate_c.allowFramebufferRead, gstate_c.framebufFormat);
+		if (colorWriteMask) {
+			replaceBlend = REPLACE_BLEND_COPY_FBO;
+		}
 		ReplaceAlphaType stencilToAlpha = ReplaceAlphaWithStencil(replaceBlend);
 
 		// All texfuncs except replace are the same for RGB as for RGBA with full alpha.
@@ -309,7 +323,10 @@ void ComputeFragmentShaderID(FShaderID *id_out, const Draw::Bugs &bugs) {
 		id.SetBits(FS_BIT_REPLACE_LOGIC_OP_TYPE, 2, ReplaceLogicOpType());
 
 		// If replaceBlend == REPLACE_BLEND_STANDARD (or REPLACE_BLEND_NO) nothing is done, so we kill these bits.
-		if (replaceBlend > REPLACE_BLEND_STANDARD) {
+		if (replaceBlend == REPLACE_BLEND_BLUE_TO_ALPHA) {
+			id.SetBits(FS_BIT_REPLACE_BLEND, 3, replaceBlend);
+			id.SetBits(FS_BIT_BLENDFUNC_A, 4, gstate.getBlendFuncA());
+		} else if (replaceBlend > REPLACE_BLEND_STANDARD) {
 			// 3 bits.
 			id.SetBits(FS_BIT_REPLACE_BLEND, 3, replaceBlend);
 			// 11 bits total.

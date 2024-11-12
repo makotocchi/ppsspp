@@ -7,11 +7,12 @@
 
 #include "Core/Debugger/Breakpoints.h"
 #include "Core/Debugger/SymbolMap.h"
+#include "Windows/Debugger/BreakpointWindow.h"
+#include "Windows/Debugger/CtrlDisAsmView.h"
 #include "Windows/Debugger/Debugger_MemoryDlg.h"
 #include "Windows/Debugger/Debugger_Disasm.h"
 #include "Windows/Debugger/Debugger_VFPUDlg.h"
 #include "Windows/Debugger/DebuggerShared.h"
-#include "Windows/Debugger/BreakpointWindow.h"
 
 #include "Windows/main.h"
 #include "Windows/Debugger/CtrlRegisterList.h"
@@ -31,9 +32,6 @@
 
 #include <windowsx.h>
 #include <commctrl.h>
-
-// How long (max) to wait for Core to pause before clearing temp breakpoints.
-static const int TEMP_BREAKPOINT_WAIT_MS = 100;
 
 static FAR WNDPROC DefGotoEditProc;
 
@@ -90,6 +88,9 @@ LRESULT CALLBACK FuncListProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 	return (LRESULT)CallWindowProc((WNDPROC)DefFuncListProc,hDlg,message,wParam,lParam);
 }
 
+static constexpr UINT_PTR IDT_UPDATE = 0xC0DE0042;
+static constexpr UINT UPDATE_DELAY = 1000 / 60;
+
 CDisasm::CDisasm(HINSTANCE _hInstance, HWND _hParent, DebugInterface *_cpu) : Dialog((LPCSTR)IDD_DISASM, _hInstance, _hParent) {
 	cpu = _cpu;
 	lastTicks = PSP_IsInited() ? CoreTiming::GetTicks() : 0;
@@ -125,7 +126,7 @@ CDisasm::CDisasm(HINSTANCE _hInstance, HWND _hParent, DebugInterface *_cpu) : Di
 	SendMessage(statusBarWnd, SB_SETPARTS, (WPARAM) 2, (LPARAM) parts);
 
 	// init other controls
-	CtrlDisAsmView *ptr = CtrlDisAsmView::getFrom(GetDlgItem(m_hDlg,IDC_DISASMVIEW));
+	CtrlDisAsmView *ptr = DisAsmView();
 	ptr->setDebugger(cpu);
 	ptr->gotoAddr(0x00000000);
 
@@ -201,7 +202,7 @@ void CDisasm::stepInto()
 		return;
 	}
 
-	CtrlDisAsmView *ptr = CtrlDisAsmView::getFrom(GetDlgItem(m_hDlg,IDC_DISASMVIEW));
+	CtrlDisAsmView *ptr = DisAsmView();
 	lastTicks = CoreTiming::GetTicks();
 	u32 currentPc = cpu->GetPC();
 
@@ -236,12 +237,11 @@ void CDisasm::stepInto()
 
 	ptr->gotoPC();
 	UpdateDialog();
-	vfpudlg->Update();
+	if (vfpudlg)
+		vfpudlg->Update();
 
-	CtrlMemView::getFrom(GetDlgItem(m_hDlg,IDC_DEBUGMEMVIEW))->redraw();
 	threadList->reloadThreads();
 	stackTraceView->loadStackTrace();
-	updateThreadLabel(false);
 }
 
 void CDisasm::stepOver()
@@ -250,7 +250,7 @@ void CDisasm::stepOver()
 		return;
 	}
 	
-	CtrlDisAsmView *ptr = CtrlDisAsmView::getFrom(GetDlgItem(m_hDlg,IDC_DISASMVIEW));
+	CtrlDisAsmView *ptr = DisAsmView();
 	lastTicks = CoreTiming::GetTicks();
 
 	// If the current PC is on a breakpoint, the user doesn't want to do nothing.
@@ -285,7 +285,6 @@ void CDisasm::stepOver()
 		ptr->scrollStepping(breakpointAddress);
 	}
 
-	SetDebugMode(false, true);
 	CBreakPoints::AddBreakPoint(breakpointAddress,true);
 	Core_EnableStepping(false);
 	Sleep(1);
@@ -320,10 +319,9 @@ void CDisasm::stepOut()
 	// If the current PC is on a breakpoint, the user doesn't want to do nothing.
 	CBreakPoints::SetSkipFirst(currentMIPS->pc);
 	
-	CtrlDisAsmView *ptr = CtrlDisAsmView::getFrom(GetDlgItem(m_hDlg,IDC_DISASMVIEW));
+	CtrlDisAsmView *ptr = DisAsmView();
 	ptr->setDontRedraw(true);
 
-	SetDebugMode(false, true);
 	CBreakPoints::AddBreakPoint(breakpointAddress,true);
 	Core_EnableStepping(false);
 	Sleep(1);
@@ -337,12 +335,11 @@ void CDisasm::runToLine()
 		return;
 	}
 
-	CtrlDisAsmView *ptr = CtrlDisAsmView::getFrom(GetDlgItem(m_hDlg,IDC_DISASMVIEW));
+	CtrlDisAsmView *ptr = DisAsmView();
 	u32 pos = ptr->getSelection();
 
 	lastTicks = CoreTiming::GetTicks();
 	ptr->setDontRedraw(true);
-	SetDebugMode(false, true);
 	CBreakPoints::AddBreakPoint(pos,true);
 	Core_EnableStepping(false);
 }
@@ -365,17 +362,17 @@ BOOL CDisasm::DlgProc(UINT message, WPARAM wParam, LPARAM lParam)
 			leftTabs->HandleNotify(lParam);
 			break;
 		case IDC_BREAKPOINTLIST:
-			breakpointList->HandleNotify(lParam);
-			break;
+			SetWindowLongPtr(m_hDlg, DWLP_MSGRESULT, breakpointList->HandleNotify(lParam));
+			return TRUE;
 		case IDC_THREADLIST:
-			threadList->HandleNotify(lParam);
-			break;
+			SetWindowLongPtr(m_hDlg, DWLP_MSGRESULT, threadList->HandleNotify(lParam));
+			return TRUE;
 		case IDC_STACKFRAMES:
-			stackTraceView->HandleNotify(lParam);
-			break;
+			SetWindowLongPtr(m_hDlg, DWLP_MSGRESULT, stackTraceView->HandleNotify(lParam));
+			return TRUE;
 		case IDC_MODULELIST:
-			moduleList->HandleNotify(lParam);
-			break;
+			SetWindowLongPtr(m_hDlg, DWLP_MSGRESULT, moduleList->HandleNotify(lParam));
+			return TRUE;
 		case IDC_DEBUG_BOTTOMTABS:
 			bottomTabs->HandleNotify(lParam);
 			break;
@@ -383,7 +380,7 @@ BOOL CDisasm::DlgProc(UINT message, WPARAM wParam, LPARAM lParam)
 		break;
 	case WM_COMMAND:
 		{
-			CtrlDisAsmView *ptr = CtrlDisAsmView::getFrom(GetDlgItem(m_hDlg,IDC_DISASMVIEW));
+			CtrlDisAsmView *ptr = DisAsmView();
 			switch (LOWORD(wParam)) {
 			case ID_TOGGLE_BREAK:
 				SendMessage(MainWindow::GetHWND(), WM_COMMAND, ID_TOGGLE_BREAK, 0);
@@ -415,12 +412,13 @@ BOOL CDisasm::DlgProc(UINT message, WPARAM wParam, LPARAM lParam)
 
 			case ID_DEBUG_ADDBREAKPOINT:
 				{
+					CtrlDisAsmView *view = DisAsmView();
 					keepStatusBarText = true;
+					view->LockPosition();
 					bool isRunning = Core_IsActive();
 					if (isRunning)
 					{
-						SetDebugMode(true, false);
-						Core_EnableStepping(true);
+						Core_EnableStepping(true, "cpu.breakpoint.add", 0);
 						Core_WaitInactive(200);
 					}
 
@@ -428,10 +426,8 @@ BOOL CDisasm::DlgProc(UINT message, WPARAM wParam, LPARAM lParam)
 					if (bpw.exec()) bpw.addBreakpoint();
 
 					if (isRunning)
-					{
-						SetDebugMode(false, false);
 						Core_EnableStepping(false);
-					}
+					view->UnlockPosition();
 					keepStatusBarText = false;
 				}
 				break;
@@ -466,6 +462,7 @@ BOOL CDisasm::DlgProc(UINT message, WPARAM wParam, LPARAM lParam)
 				break;
 
 			case IDC_SHOWVFPU:
+				MainWindow::CreateVFPUWindow();
 				vfpudlg->Show(true);
 				break;
 
@@ -522,19 +519,18 @@ BOOL CDisasm::DlgProc(UINT message, WPARAM wParam, LPARAM lParam)
 					if (!Core_IsStepping())		// stop
 					{
 						ptr->setDontRedraw(false);
-						SetDebugMode(true, true);
-						Core_EnableStepping(true);
+						Core_EnableStepping(true, "ui.break", 0);
 						Sleep(1); //let cpu catch up
 						ptr->gotoPC();
 						UpdateDialog();
-						vfpudlg->Update();
+						if (vfpudlg)
+							vfpudlg->Update();
 					} else {					// go
 						lastTicks = CoreTiming::GetTicks();
 
 						// If the current PC is on a breakpoint, the user doesn't want to do nothing.
 						CBreakPoints::SetSkipFirst(currentMIPS->pc);
 
-						SetDebugMode(false, true);
 						Core_EnableStepping(false);
 					}
 				}
@@ -562,7 +558,6 @@ BOOL CDisasm::DlgProc(UINT message, WPARAM wParam, LPARAM lParam)
 					CBreakPoints::SetSkipFirst(currentMIPS->pc);
 
 					hleDebugBreak();
-					SetDebugMode(false, true);
 					Core_EnableStepping(false);
 				}
 				break;
@@ -597,7 +592,7 @@ BOOL CDisasm::DlgProc(UINT message, WPARAM wParam, LPARAM lParam)
 
 	case WM_DEB_GOTOWPARAM:
 	{
-		CtrlDisAsmView *ptr = CtrlDisAsmView::getFrom(GetDlgItem(m_hDlg,IDC_DISASMVIEW));
+		CtrlDisAsmView *ptr = DisAsmView();
 		ptr->gotoAddr(wParam);
 		SetFocus(GetDlgItem(m_hDlg,IDC_DISASMVIEW));
 		break;
@@ -608,7 +603,7 @@ BOOL CDisasm::DlgProc(UINT message, WPARAM wParam, LPARAM lParam)
 				break;
 			}
 			wchar_t szBuffer[256];
-			CtrlDisAsmView *ptr = CtrlDisAsmView::getFrom(GetDlgItem(m_hDlg,IDC_DISASMVIEW));
+			CtrlDisAsmView *ptr = DisAsmView();
 			GetWindowText(GetDlgItem(m_hDlg,IDC_ADDRESS),szBuffer,256);
 
 			u32 addr;
@@ -688,6 +683,14 @@ BOOL CDisasm::DlgProc(UINT message, WPARAM wParam, LPARAM lParam)
 			g_activeWindow = WINDOW_CPUDEBUGGER;
 		}
 		break;
+
+	case WM_TIMER:
+		if (wParam == IDT_UPDATE) {
+			ProcessUpdateDialog();
+			updateDialogScheduled_ = false;
+			KillTimer(GetDlgHandle(), wParam);
+		}
+		break;
 	}
 	return FALSE;
 }
@@ -727,7 +730,7 @@ void CDisasm::UpdateSize(WORD width, WORD height)
 		topHeightOffset = (windowRect.bottom-windowRect.top);
 	}
 	
-	CtrlDisAsmView *ptr = CtrlDisAsmView::getFrom(GetDlgItem(m_hDlg,IDC_DISASMVIEW));
+	CtrlDisAsmView *ptr = DisAsmView();
 	int disassemblyRowHeight = ptr->getRowHeight();
 
 	// disassembly
@@ -789,17 +792,14 @@ void CDisasm::SetDebugMode(bool _bDebug, bool switchPC)
 	HWND hDlg = m_hDlg;
 	bool ingame = (GetUIState() == UISTATE_INGAME || GetUIState() == UISTATE_EXCEPTION) && PSP_IsInited();
 
-	// Update Dialog Windows
-	if (_bDebug && ingame)
-	{
-		Core_WaitInactive(TEMP_BREAKPOINT_WAIT_MS);
+	// If we're stepping, update debugging windows.
+	// This is called potentially asynchronously, so state might've changed.
+	if (Core_IsStepping() && ingame) {
 		breakpointList->reloadBreakpoints();
 		threadList->reloadThreads();
 		stackTraceView->loadStackTrace();
 		moduleList->loadModules();
-		updateThreadLabel(false);
 
-		SetDlgItemText(m_hDlg, IDC_STOPGO, L"Go");
 		EnableWindow(GetDlgItem(hDlg, IDC_STOPGO), TRUE);
 		EnableWindow(GetDlgItem(hDlg, IDC_STEP), TRUE);
 		EnableWindow(GetDlgItem(hDlg, IDC_STEPOVER), TRUE);
@@ -807,33 +807,19 @@ void CDisasm::SetDebugMode(bool _bDebug, bool switchPC)
 		EnableWindow(GetDlgItem(hDlg, IDC_STEPOUT), TRUE);
 		EnableWindow(GetDlgItem(hDlg, IDC_GOTOPC), TRUE);
 		EnableWindow(GetDlgItem(hDlg, IDC_GOTOLR), TRUE);
-		CtrlDisAsmView *ptr = CtrlDisAsmView::getFrom(GetDlgItem(m_hDlg,IDC_DISASMVIEW));
+		CtrlDisAsmView *ptr = DisAsmView();
 		ptr->setDontRedraw(false);
 		if (switchPC)
 			ptr->gotoPC();
 		
 		ptr->scanFunctions();
-		CtrlMemView *mem = CtrlMemView::getFrom(GetDlgItem(m_hDlg,IDC_DEBUGMEMVIEW));
-		mem->redraw();
-
-		// update the callstack
-		//CDisam::blah blah
-		UpdateDialog();
 	}
 	else
 	{
-		updateThreadLabel(true);
-		
 		if (ingame)
-		{
-			SetDlgItemText(m_hDlg, IDC_STOPGO, L"Break");
 			EnableWindow(GetDlgItem(hDlg, IDC_STOPGO), TRUE);
-		}
 		else
-		{
-			SetDlgItemText(m_hDlg, IDC_STOPGO, L"Go");
 			EnableWindow(GetDlgItem(hDlg, IDC_STOPGO), FALSE);
-		}
 		EnableWindow(GetDlgItem(hDlg, IDC_STEP), FALSE);
 		EnableWindow(GetDlgItem(hDlg, IDC_STEPOVER), FALSE);
 		EnableWindow(GetDlgItem(hDlg, IDC_STEPHLE), FALSE);
@@ -843,6 +829,8 @@ void CDisasm::SetDebugMode(bool _bDebug, bool switchPC)
 		CtrlRegisterList *reglist = CtrlRegisterList::getFrom(GetDlgItem(m_hDlg,IDC_REGLIST));
 		reglist->redraw();
 	}
+
+	UpdateDialog();
 }
 
 void CDisasm::Show(bool bShow, bool includeToTop) {
@@ -861,21 +849,42 @@ void CDisasm::NotifyMapLoaded() {
 	} else {
 		deferredSymbolFill_ = true;
 	}
-	CtrlDisAsmView *ptr = CtrlDisAsmView::getFrom(GetDlgItem(m_hDlg, IDC_DISASMVIEW));
+	CtrlDisAsmView *ptr = DisAsmView();
 	ptr->clearFunctions();
 	ptr->redraw();
 }
 
 void CDisasm::Goto(u32 addr)
 {
-	CtrlDisAsmView *ptr = CtrlDisAsmView::getFrom(GetDlgItem(m_hDlg, IDC_DISASMVIEW));
+	CtrlDisAsmView *ptr = DisAsmView();
 	ptr->gotoAddr(addr);
 	SetFocus(GetDlgItem(m_hDlg, IDC_DISASMVIEW));
 	ptr->redraw();
 }
 
-void CDisasm::UpdateDialog(bool _bComplete)
-{
+void CDisasm::UpdateDialog() {
+	if (!updateDialogScheduled_) {
+		SetTimer(GetDlgHandle(), IDT_UPDATE, UPDATE_DELAY, nullptr);
+		updateDialogScheduled_ = true;
+	}
+
+	// Since these update on a delay, it's okay to do them immediately.
+	CtrlDisAsmView *ptr = DisAsmView();
+	ptr->redraw();
+	CtrlRegisterList *rl = CtrlRegisterList::getFrom(GetDlgItem(m_hDlg, IDC_REGLIST));
+	rl->redraw();
+
+	// Repaint windows at the bottom. only the memory view needs to be forced to redraw.
+	// All others are updated manually
+	CtrlMemView *memview = CtrlMemView::getFrom(GetDlgItem(m_hDlg, IDC_DEBUGMEMVIEW));
+	memview->redraw();
+
+	// Update memory window too.
+	if (memoryWindow)
+		memoryWindow->Update();
+}
+
+void CDisasm::ProcessUpdateDialog() {
 	/*
 	HWND gotoInt = GetDlgItem(m_hDlg, IDC_GOTOINT);
 	ComboBox_ResetContent(gotoInt);
@@ -889,22 +898,24 @@ void CDisasm::UpdateDialog(bool _bComplete)
 	ComboBox_SetItemData(gotoInt,0,0xFFFFFFFF);
 	ComboBox_SetCurSel(gotoInt,0);
 */
-	CtrlDisAsmView *ptr = CtrlDisAsmView::getFrom(GetDlgItem(m_hDlg,IDC_DISASMVIEW));
-	ptr->redraw();
-	CtrlRegisterList *rl = CtrlRegisterList::getFrom(GetDlgItem(m_hDlg,IDC_REGLIST));
-	rl->redraw();						
+
 	// Update Debug Counter
-	wchar_t tempTicks[24];
 	if (PSP_IsInited()) {
+		wchar_t tempTicks[24];
 		_snwprintf(tempTicks, 24, L"%lld", CoreTiming::GetTicks() - lastTicks);
 		SetDlgItemText(m_hDlg, IDC_DEBUG_COUNT, tempTicks);
 	}
-	// Update Register Dialog
-	if (memoryWindow)
-		memoryWindow->Update();
 
-	// repaint windows at the bottom. only the memory view needs to be forced to
-	// redraw. all others are updated manually
-	InvalidateRect (GetDlgItem(m_hDlg, IDC_DEBUGMEMVIEW), NULL, TRUE);
-	UpdateWindow (GetDlgItem(m_hDlg, IDC_DEBUGMEMVIEW));
+	bool ingame = (GetUIState() == UISTATE_INGAME || GetUIState() == UISTATE_EXCEPTION) && PSP_IsInited();
+	if (Core_IsStepping() || !ingame) {
+		SetDlgItemText(m_hDlg, IDC_STOPGO, L"Go");
+	} else {
+		SetDlgItemText(m_hDlg, IDC_STOPGO, L"Break");
+	}
+
+	updateThreadLabel(!ingame || !Core_IsStepping());
+}
+
+CtrlDisAsmView *CDisasm::DisAsmView() {
+	return CtrlDisAsmView::getFrom(GetDlgItem(m_hDlg, IDC_DISASMVIEW));
 }

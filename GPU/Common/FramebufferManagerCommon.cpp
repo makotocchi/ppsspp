@@ -23,7 +23,7 @@
 #include "Common/GPU/OpenGL/GLFeatures.h"
 #include "Common/Data/Convert/ColorConv.h"
 #include "Common/Data/Text/I18n.h"
-#include "Common/Common.h"
+#include "Common/CommonTypes.h"
 #include "Core/Config.h"
 #include "Core/ConfigValues.h"
 #include "Core/Core.h"
@@ -218,7 +218,7 @@ void GetFramebufferHeuristicInputs(FramebufferHeuristicParams *params, const GPU
 		params->z_stride = 0;
 	}
 
-	params->fmt = gstate.FrameBufFormat();
+	params->fmt = gstate_c.framebufFormat;
 
 	params->isClearingDepth = gstate.isModeClear() && gstate.isClearModeDepthMask();
 	// Technically, it may write depth later, but we're trying to detect it only when it's really true.
@@ -249,6 +249,10 @@ void GetFramebufferHeuristicInputs(FramebufferHeuristicParams *params, const GPU
 	params->regionHeight = gstate.getRegionY2() + 1;
 	params->scissorWidth = gstate.getScissorX2() + 1;
 	params->scissorHeight = gstate.getScissorY2() + 1;
+
+	if (gstate.getRegionRateX() != 0x100 || gstate.getRegionRateY() != 0x100) {
+		WARN_LOG_REPORT_ONCE(regionRate, G3D, "Drawing region rate add non-zero: %04x, %04x of %04x, %04x", gstate.getRegionRateX(), gstate.getRegionRateY(), gstate.getRegionX2(), gstate.getRegionY2());
+	}
 }
 
 VirtualFramebuffer *FramebufferManagerCommon::DoSetRenderFrameBuffer(const FramebufferHeuristicParams &params, u32 skipDrawReason) {
@@ -375,6 +379,11 @@ VirtualFramebuffer *FramebufferManagerCommon::DoSetRenderFrameBuffer(const Frame
 		ResizeFramebufFBO(vfb, drawing_width, drawing_height, true);
 		NotifyRenderFramebufferCreated(vfb);
 
+		// We might already want to copy depth, in case this is a temp buffer.  See #7810.
+		if (currentRenderVfb_ && !params.isClearingDepth) {
+			BlitFramebufferDepth(currentRenderVfb_, vfb);
+		}
+
 		SetColorUpdated(vfb, skipDrawReason);
 
 		INFO_LOG(FRAMEBUF, "Creating FBO for %08x (z: %08x) : %i x %i x %i", vfb->fb_address, vfb->z_address, vfb->width, vfb->height, vfb->format);
@@ -387,7 +396,7 @@ VirtualFramebuffer *FramebufferManagerCommon::DoSetRenderFrameBuffer(const Frame
 		if (useBufferedRendering_ && !g_Config.bDisableSlowFramebufEffects) {
 			gpu->PerformMemoryUpload(params.fb_address, byteSize);
 			NotifyStencilUpload(params.fb_address, byteSize, StencilUpload::STENCIL_IS_ZERO);
-			// TODO: Is it worth trying to upload the depth buffer?
+			// TODO: Is it worth trying to upload the depth buffer (only if it wasn't copied above..?)
 		}
 
 		// Let's check for depth buffer overlap.  Might be interesting.
@@ -469,6 +478,22 @@ void FramebufferManagerCommon::DestroyFramebuf(VirtualFramebuffer *v) {
 }
 
 void FramebufferManagerCommon::BlitFramebufferDepth(VirtualFramebuffer *src, VirtualFramebuffer *dst) {
+	_dbg_assert_(src && dst);
+
+	// Check that the depth address is even the same before actually blitting.
+	bool matchingDepthBuffer = src->z_address == dst->z_address && src->z_stride != 0 && dst->z_stride != 0;
+	bool matchingSize = src->width == dst->width && src->height == dst->height;
+	if (!matchingDepthBuffer || !matchingSize)
+		return;
+
+	// Copy depth value from the previously bound framebuffer to the current one.
+	bool hasNewerDepth = src->last_frame_depth_render != 0 && src->last_frame_depth_render >= dst->last_frame_depth_updated;
+	if (!src->fbo || !dst->fbo || !useBufferedRendering_ || !hasNewerDepth) {
+		// If depth wasn't updated, then we're at least "two degrees" away from the data.
+		// This is an optimization: it probably doesn't need to be copied in this case.
+		return;
+	}
+
 	int w = std::min(src->renderWidth, dst->renderWidth);
 	int h = std::min(src->renderHeight, dst->renderHeight);
 
@@ -564,7 +589,7 @@ void FramebufferManagerCommon::ReinterpretFramebuffer(VirtualFramebuffer *vfb, G
 
 			// Games that are marked as doing reinterpret just ignore this - better to keep the data than to clear.
 			// Fixes #13717.
-			if (!PSP_CoreParameter().compat.flags().ReinterpretFramebuffers) {
+			if (!PSP_CoreParameter().compat.flags().ReinterpretFramebuffers && !PSP_CoreParameter().compat.flags().BlueToAlpha) {
 				draw_->BindFramebufferAsRenderTarget(vfb->fbo, { Draw::RPAction::CLEAR, Draw::RPAction::KEEP, Draw::RPAction::CLEAR }, "FakeReinterpret");
 				// Need to dirty anything that has command buffer dynamic state, in case we started a new pass above.
 				// Should find a way to feed that information back, maybe... Or simply correct the issue in the rendermanager.
@@ -645,9 +670,11 @@ void FramebufferManagerCommon::ReinterpretFramebuffer(VirtualFramebuffer *vfb, G
 	// Copy to a temp framebuffer.
 	Draw::Framebuffer *temp = GetTempFBO(TempFBO::REINTERPRET, vfb->renderWidth, vfb->renderHeight);
 
+	// Ideally on Vulkan this should be using the original framebuffer as an input attachment, allowing it to read from
+	// itself while writing.
 	draw_->InvalidateCachedState();
 	draw_->CopyFramebufferImage(vfb->fbo, 0, 0, 0, 0, temp, 0, 0, 0, 0, vfb->renderWidth, vfb->renderHeight, 1, Draw::FBChannel::FB_COLOR_BIT, "reinterpret_prep");
-	draw_->BindFramebufferAsRenderTarget(vfb->fbo, { Draw::RPAction::DONT_CARE, Draw::RPAction::DONT_CARE, Draw::RPAction::DONT_CARE }, reinterpretStrings[(int)oldFormat][(int)newFormat]);
+	draw_->BindFramebufferAsRenderTarget(vfb->fbo, { Draw::RPAction::DONT_CARE, Draw::RPAction::KEEP, Draw::RPAction::KEEP }, reinterpretStrings[(int)oldFormat][(int)newFormat]);
 	draw_->BindPipeline(pipeline);
 	draw_->BindFramebufferAsTexture(temp, 0, Draw::FBChannel::FB_COLOR_BIT, 0);
 	draw_->BindSamplerStates(0, 1, &reinterpretSampler_);
@@ -666,7 +693,7 @@ void FramebufferManagerCommon::ReinterpretFramebuffer(VirtualFramebuffer *vfb, G
 	shaderManager_->DirtyLastShader();
 	textureCache_->ForgetLastTexture();
 
-	gstate_c.Dirty(DIRTY_BLEND_STATE | DIRTY_DEPTHSTENCIL_STATE | DIRTY_RASTER_STATE | DIRTY_VIEWPORTSCISSOR_STATE | DIRTY_VERTEXSHADER_STATE);
+	gstate_c.Dirty(DIRTY_BLEND_STATE | DIRTY_DEPTHSTENCIL_STATE | DIRTY_RASTER_STATE | DIRTY_VIEWPORTSCISSOR_STATE | DIRTY_VERTEXSHADER_STATE | DIRTY_FRAGMENTSHADER_STATE | DIRTY_TEXTURE_IMAGE | DIRTY_TEXTURE_PARAMS);
 
 	if (currentRenderVfb_ != vfb) {
 		// In case ReinterpretFramebuffer was called from the texture manager.
@@ -687,21 +714,9 @@ void FramebufferManagerCommon::NotifyRenderFramebufferSwitched(VirtualFramebuffe
 	textureCache_->ForgetLastTexture();
 	shaderManager_->DirtyLastShader();
 
-	if (prevVfb) {
-		// Copy depth value from the previously bound framebuffer to the current one.
-		// We check that the address is the same within BlitFramebufferDepth before actually blitting.
-
-		bool hasNewerDepth = prevVfb->last_frame_depth_render != 0 && prevVfb->last_frame_depth_render >= vfb->last_frame_depth_updated;
-		if (!prevVfb->fbo || !vfb->fbo || !useBufferedRendering_ || !hasNewerDepth || isClearingDepth) {
-			// If depth wasn't updated, then we're at least "two degrees" away from the data.
-			// This is an optimization: it probably doesn't need to be copied in this case.
-		} else {
-			bool matchingDepthBuffer = prevVfb->z_address == vfb->z_address && prevVfb->z_stride != 0 && vfb->z_stride != 0;
-			bool matchingSize = prevVfb->width == vfb->width && prevVfb->height == vfb->height;
-			if (matchingDepthBuffer && matchingSize) {
-				BlitFramebufferDepth(prevVfb, vfb);
-			}
-		}
+	// Copy depth between the framebuffers, if the z_address is the same (checked inside.)
+	if (prevVfb && !isClearingDepth) {
+		BlitFramebufferDepth(prevVfb, vfb);
 	}
 
 	if (vfb->drawnFormat != vfb->format) {
@@ -980,9 +995,8 @@ Draw::Texture *FramebufferManagerCommon::MakePixelTexture(const u8 *srcPixels, G
 		{ (uint8_t *)srcPixels },
 		generateTexture,
 	};
-	// TODO: On Vulkan, use a custom allocator?  Important to use an allocator:
-	// Hot Shot Golf (#12355) does tons of these in a frame in some situations! So actually,
-	// we do use an allocator. In fact, I've now banned allocator-less textures.
+	// Hot Shots Golf (#12355) does tons of these in a frame in some situations! So creating textures
+	// better be fast.
 	Draw::Texture *tex = draw_->CreateTexture(desc);
 	if (!tex)
 		ERROR_LOG(G3D, "Failed to create drawpixels texture");
@@ -1043,8 +1057,6 @@ void FramebufferManagerCommon::SetViewport2D(int x, int y, int w, int h) {
 void FramebufferManagerCommon::CopyDisplayToOutput(bool reallyDirty) {
 	DownloadFramebufferOnSwitch(currentRenderVfb_);
 	shaderManager_->DirtyLastShader();
-
-	currentRenderVfb_ = nullptr;
 
 	if (displayFramebufPtr_ == 0) {
 		if (Core_IsStepping())
@@ -1178,6 +1190,7 @@ void FramebufferManagerCommon::CopyDisplayToOutput(bool reallyDirty) {
 	// This may get called mid-draw if the game uses an immediate flip.
 	// PresentationCommon sets all kinds of state, we can't rely on anything.
 	gstate_c.Dirty(DIRTY_ALL);
+	currentRenderVfb_ = nullptr;
 }
 
 void FramebufferManagerCommon::DecimateFBOs() {
@@ -1317,16 +1330,17 @@ void FramebufferManagerCommon::ResizeFramebufFBO(VirtualFramebuffer *vfb, int w,
 			// TODO: Swap the order of the below? That way we can avoid the needGLESRebinds_ check below I think.
 			draw_->BindFramebufferAsRenderTarget(vfb->fbo, { Draw::RPAction::CLEAR, Draw::RPAction::CLEAR, Draw::RPAction::CLEAR }, "ResizeFramebufFBO");
 			if (!skipCopy) {
+				// TODO: In this case, it'll nearly always be better to draw the old framebuffer to the new one than to do an actual blit.
+				// Usually hardly a performance issue though.
 				BlitFramebuffer(vfb, 0, 0, &old, 0, 0, std::min((u16)oldWidth, std::min(vfb->bufferWidth, vfb->width)), std::min((u16)oldHeight, std::min(vfb->height, vfb->bufferHeight)), 0, "Blit_ResizeFramebufFBO");
 			}
 		}
 		fbosToDelete_.push_back(old.fbo);
-		if (needGLESRebinds_) {
-			draw_->BindFramebufferAsRenderTarget(vfb->fbo, { Draw::RPAction::KEEP, Draw::RPAction::KEEP, Draw::RPAction::KEEP }, "ResizeFramebufFBO");
-		}
+		draw_->BindFramebufferAsRenderTarget(vfb->fbo, { Draw::RPAction::KEEP, Draw::RPAction::KEEP, Draw::RPAction::KEEP }, "ResizeFramebufFBO");
 	} else {
 		draw_->BindFramebufferAsRenderTarget(vfb->fbo, { Draw::RPAction::CLEAR, Draw::RPAction::CLEAR, Draw::RPAction::CLEAR }, "ResizeFramebufFBO");
 	}
+	currentRenderVfb_ = vfb;
 
 	if (!vfb->fbo) {
 		ERROR_LOG(FRAMEBUF, "Error creating FBO during resize! %dx%d", vfb->renderWidth, vfb->renderHeight);
@@ -1630,8 +1644,7 @@ VirtualFramebuffer *FramebufferManagerCommon::FindDownloadTempBuffer(VirtualFram
 
 	// Create a new fbo if none was found for the size
 	if (!nvfb) {
-		nvfb = new VirtualFramebuffer();
-		memset(nvfb, 0, sizeof(VirtualFramebuffer));
+		nvfb = new VirtualFramebuffer{};
 		nvfb->fbo = nullptr;
 		nvfb->fb_address = vfb->fb_address;
 		nvfb->fb_stride = vfb->fb_stride;
@@ -1676,20 +1689,21 @@ void FramebufferManagerCommon::ApplyClearToMemory(int x1, int y1, int x2, int y2
 			return;
 		}
 	}
+
 	if (!Memory::IsValidAddress(gstate.getFrameBufAddress())) {
 		return;
 	}
 
 	u8 *addr = Memory::GetPointerUnchecked(gstate.getFrameBufAddress());
-	const int bpp = gstate.FrameBufFormat() == GE_FORMAT_8888 ? 4 : 2;
+	const int bpp = gstate_c.framebufFormat == GE_FORMAT_8888 ? 4 : 2;
 
 	u32 clearBits = clearColor;
 	if (bpp == 2) {
 		u16 clear16 = 0;
-		switch (gstate.FrameBufFormat()) {
-		case GE_FORMAT_565: ConvertRGBA8888ToRGB565(&clear16, &clearColor, 1); break;
-		case GE_FORMAT_5551: ConvertRGBA8888ToRGBA5551(&clear16, &clearColor, 1); break;
-		case GE_FORMAT_4444: ConvertRGBA8888ToRGBA4444(&clear16, &clearColor, 1); break;
+		switch (gstate_c.framebufFormat) {
+		case GE_FORMAT_565: clear16 = RGBA8888toRGB565(clearColor); break;
+		case GE_FORMAT_5551: clear16 = RGBA8888toRGBA5551(clearColor); break;
+		case GE_FORMAT_4444: clear16 = RGBA8888toRGBA4444(clearColor); break;
 		default: _dbg_assert_(0); break;
 		}
 		clearBits = clear16 | (clear16 << 16);

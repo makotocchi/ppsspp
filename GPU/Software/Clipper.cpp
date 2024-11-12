@@ -19,6 +19,7 @@
 
 #include "GPU/GPUState.h"
 
+#include "GPU/Software/BinManager.h"
 #include "GPU/Software/Clipper.h"
 #include "GPU/Software/Rasterizer.h"
 #include "GPU/Software/RasterizerRectangle.h"
@@ -33,12 +34,11 @@ enum {
 	CLIP_NEG_Z_BIT = 0x20,
 };
 
-static inline int CalcClipMask(const ClipCoords& v)
-{
-	int mask = 0;
+static inline int CalcClipMask(const ClipCoords &v) {
 	// This checks `x / w` compared to 1 or -1, skipping the division.
-	if (v.z < -v.w) mask |= CLIP_NEG_Z_BIT;
-	return mask;
+	if (v.z < -v.w)
+		return -1;
+	return 0;
 }
 
 inline bool different_signs(float x, float y) {
@@ -72,6 +72,7 @@ inline float clip_dotprod(const VertexData &vert, float A, float B, float C, flo
 					float t = dpPrev / (dpPrev - dp);				\
 					Vertices[numVertices++]->Lerp(t, *Vertices[idxPrev], *Vertices[idx]);		\
 				}													\
+				clipped = true;										\
 				outlist[outcount++] = numVertices - 1;				\
 			}														\
 																	\
@@ -101,6 +102,7 @@ inline float clip_dotprod(const VertexData &vert, float A, float B, float C, flo
 			if (dp0 < 0) {										\
 				float t = dp1 / (dp1 - dp0);					\
 				Vertices[0]->Lerp(t, *Vertices[1], *Vertices[0]); \
+				clipped = true;									\
 			}													\
 		}														\
 		dp0 = clip_dotprod(*Vertices[0], A, B, C, D );			\
@@ -109,23 +111,11 @@ inline float clip_dotprod(const VertexData &vert, float A, float B, float C, flo
 			if (dp1 < 0) {										\
 				float t = dp1 / (dp1- dp0);						\
 				Vertices[1]->Lerp(t, *Vertices[1], *Vertices[0]);	\
+				clipped = true;									\
 			}													\
 		}														\
 	}															\
 }
-
-static void RotateUVThrough(const VertexData &tl, const VertexData &br, VertexData &tr, VertexData &bl) {
-	const int x1 = tl.screenpos.x;
-	const int x2 = br.screenpos.x;
-	const int y1 = tl.screenpos.y;
-	const int y2 = br.screenpos.y;
-
-	if ((x1 < x2 && y1 > y2) || (x1 > x2 && y1 < y2)) {
-		std::swap(bl.texturecoords, tr.texturecoords);
-	}
-}
-
-void ProcessTriangleInternal(VertexData &v0, VertexData &v1, VertexData &v2, const VertexData &provoking, bool fromRectangle);
 
 static inline bool CheckOutsideZ(ClipCoords p, int &pos, int &neg) {
 	constexpr float outsideValue = 1.000030517578125f;
@@ -141,8 +131,7 @@ static inline bool CheckOutsideZ(ClipCoords p, int &pos, int &neg) {
 	return false;
 }
 
-void ProcessRect(const VertexData& v0, const VertexData& v1)
-{
+void ProcessRect(const VertexData &v0, const VertexData &v1, BinManager &binner) {
 	if (!gstate.isModeThrough()) {
 		// We may discard the entire rect based on depth values.
 		int outsidePos = 0, outsideNeg = 0;
@@ -156,111 +145,45 @@ void ProcessRect(const VertexData& v0, const VertexData& v1)
 		else if (outsidePos >= 2 || outsideNeg >= 2)
 			return;
 
-		VertexData buf[4];
-		buf[0].clippos = ClipCoords(v0.clippos.x, v0.clippos.y, v1.clippos.z, v1.clippos.w);
-		buf[0].texturecoords = v0.texturecoords;
+		if (v0.fogdepth != v1.fogdepth) {
+			// Rectangles seem to always use nearest along X for fog depth, but reversed.
+			// TODO: Check exactness of middle.
+			VertexData vhalf0 = v1;
+			vhalf0.screenpos.x = v0.screenpos.x + (v1.screenpos.x - v0.screenpos.x) / 2;
 
-		buf[1].clippos = ClipCoords(v0.clippos.x, v1.clippos.y, v1.clippos.z, v1.clippos.w);
-		buf[1].texturecoords = Vec2<float>(v0.texturecoords.x, v1.texturecoords.y);
+			VertexData vhalf1 = v1;
+			vhalf1.screenpos.x = v0.screenpos.x + (v1.screenpos.x - v0.screenpos.x) / 2;
+			vhalf1.screenpos.y = v0.screenpos.y;
 
-		buf[2].clippos = ClipCoords(v1.clippos.x, v0.clippos.y, v1.clippos.z, v1.clippos.w);
-		buf[2].texturecoords = Vec2<float>(v1.texturecoords.x, v0.texturecoords.y);
+			VertexData vrev1 = v1;
+			vrev1.fogdepth = v0.fogdepth;
 
-		buf[3] = v1;
-
-		// Color and depth values of second vertex are used for the whole rectangle
-		buf[0].color0 = buf[1].color0 = buf[2].color0 = buf[3].color0;
-		buf[0].color1 = buf[1].color1 = buf[2].color1 = buf[3].color1;
-		buf[0].fogdepth = buf[1].fogdepth = buf[2].fogdepth = buf[3].fogdepth;
-
-		VertexData* topleft = &buf[0];
-		VertexData* topright = &buf[1];
-		VertexData* bottomleft = &buf[2];
-		VertexData* bottomright = &buf[3];
-
-		for (int i = 0; i < 4; ++i) {
-			if (buf[i].clippos.x < topleft->clippos.x && buf[i].clippos.y < topleft->clippos.y)
-				topleft = &buf[i];
-			if (buf[i].clippos.x > topright->clippos.x && buf[i].clippos.y < topright->clippos.y)
-				topright = &buf[i];
-			if (buf[i].clippos.x < bottomleft->clippos.x && buf[i].clippos.y > bottomleft->clippos.y)
-				bottomleft = &buf[i];
-			if (buf[i].clippos.x > bottomright->clippos.x && buf[i].clippos.y > bottomright->clippos.y)
-				bottomright = &buf[i];
+			binner.AddRect(v0, vhalf0);
+			binner.AddRect(vhalf1, vrev1);
+		} else {
+			binner.AddRect(v0, v1);
 		}
-
-		// Four triangles to do backfaces as well. Two of them will get backface culled.
-		ProcessTriangleInternal(*topleft, *topright, *bottomright, buf[3], true);
-		ProcessTriangleInternal(*bottomright, *topright, *topleft, buf[3], true);
-		ProcessTriangleInternal(*bottomright, *bottomleft, *topleft, buf[3], true);
-		ProcessTriangleInternal(*topleft, *bottomleft, *bottomright, buf[3], true);
 	} else {
 		// through mode handling
-
-		if (Rasterizer::RectangleFastPath(v0, v1)) {
+		if (Rasterizer::RectangleFastPath(v0, v1, binner)) {
 			return;
-		}
-
-		VertexData buf[4];
-		buf[0].screenpos = ScreenCoords(v0.screenpos.x, v0.screenpos.y, v1.screenpos.z);
-		buf[0].texturecoords = v0.texturecoords;
-
-		buf[1].screenpos = ScreenCoords(v0.screenpos.x, v1.screenpos.y, v1.screenpos.z);
-		buf[1].texturecoords = Vec2<float>(v0.texturecoords.x, v1.texturecoords.y);
-
-		buf[2].screenpos = ScreenCoords(v1.screenpos.x, v0.screenpos.y, v1.screenpos.z);
-		buf[2].texturecoords = Vec2<float>(v1.texturecoords.x, v0.texturecoords.y);
-
-		buf[3] = v1;
-
-		// Color and depth values of second vertex are used for the whole rectangle
-		buf[0].color0 = buf[1].color0 = buf[2].color0 = buf[3].color0;
-		buf[0].color1 = buf[1].color1 = buf[2].color1 = buf[3].color1;  // is color1 ever used in through mode?
-		buf[0].clippos.w = buf[1].clippos.w = buf[2].clippos.w = buf[3].clippos.w = 1.0f;
-		buf[0].fogdepth = buf[1].fogdepth = buf[2].fogdepth = buf[3].fogdepth = 1.0f;
-
-		VertexData* topleft = &buf[0];
-		VertexData* topright = &buf[1];
-		VertexData* bottomleft = &buf[2];
-		VertexData* bottomright = &buf[3];
-
-		// DrawTriangle always culls, so sort out the drawing order.
-		for (int i = 0; i < 4; ++i) {
-			if (buf[i].screenpos.x < topleft->screenpos.x && buf[i].screenpos.y < topleft->screenpos.y)
-				topleft = &buf[i];
-			if (buf[i].screenpos.x > topright->screenpos.x && buf[i].screenpos.y < topright->screenpos.y)
-				topright = &buf[i];
-			if (buf[i].screenpos.x < bottomleft->screenpos.x && buf[i].screenpos.y > bottomleft->screenpos.y)
-				bottomleft = &buf[i];
-			if (buf[i].screenpos.x > bottomright->screenpos.x && buf[i].screenpos.y > bottomright->screenpos.y)
-				bottomright = &buf[i];
-		}
-
-		RotateUVThrough(v0, v1, *topright, *bottomleft);
-
-		if (gstate.isModeClear()) {
-			Rasterizer::ClearRectangle(v0, v1);
+		} else if (gstate.isModeClear() && !gstate.isDitherEnabled()) {
+			binner.AddClearRect(v0, v1);
 		} else {
-			// Four triangles to do backfaces as well. Two of them will get backface culled.
-			Rasterizer::DrawTriangle(*topleft, *topright, *bottomright);
-			Rasterizer::DrawTriangle(*bottomright, *topright, *topleft);
-			Rasterizer::DrawTriangle(*bottomright, *bottomleft, *topleft);
-			Rasterizer::DrawTriangle(*topleft, *bottomleft, *bottomright);
+			binner.AddRect(v0, v1);
 		}
 	}
 }
 
-void ProcessPoint(VertexData& v0)
-{
+void ProcessPoint(const VertexData &v0, BinManager &binner) {
 	// Points need no clipping. Will be bounds checked in the rasterizer (which seems backwards?)
-	Rasterizer::DrawPoint(v0);
+	binner.AddPoint(v0);
 }
 
-void ProcessLine(VertexData& v0, VertexData& v1)
-{
+void ProcessLine(const VertexData &v0, const VertexData &v1, BinManager &binner) {
 	if (gstate.isModeThrough()) {
 		// Actually, should clip this one too so we don't need to do bounds checks in the rasterizer.
-		Rasterizer::DrawLine(v0, v1);
+		binner.AddLine(v0, v1);
 		return;
 	}
 
@@ -275,63 +198,39 @@ void ProcessLine(VertexData& v0, VertexData& v1)
 	else if (outsidePos >= 2 || outsideNeg >= 2)
 		return;
 
-	VertexData *Vertices[2] = {&v0, &v1};
-
 	int mask0 = CalcClipMask(v0.clippos);
 	int mask1 = CalcClipMask(v1.clippos);
 	int mask = mask0 | mask1;
-	if (mask) {
-		CLIP_LINE(CLIP_NEG_Z_BIT,  0,  0,  1, 1);
-	}
-
-	VertexData data[2] = { *Vertices[0], *Vertices[1] };
-	data[0].screenpos = TransformUnit::ClipToScreen(data[0].clippos);
-	data[1].screenpos = TransformUnit::ClipToScreen(data[1].clippos);
-	Rasterizer::DrawLine(data[0], data[1]);
-}
-
-void ProcessTriangleInternal(VertexData &v0, VertexData &v1, VertexData &v2, const VertexData &provoking, bool fromRectangle) {
-	if (gstate.isModeThrough()) {
-		// In case of cull reordering, make sure the right color is on the final vertex.
-		if (gstate.getShadeMode() == GE_SHADE_FLAT) {
-			VertexData corrected2 = v2;
-			corrected2.color0 = provoking.color0;
-			corrected2.color1 = provoking.color1;
-			Rasterizer::DrawTriangle(v0, v1, corrected2);
-		} else {
-			Rasterizer::DrawTriangle(v0, v1, v2);
-		}
+	if ((mask & CLIP_NEG_Z_BIT) == 0) {
+		binner.AddLine(v0, v1);
 		return;
 	}
 
-	enum { NUM_CLIPPED_VERTICES = 33, NUM_INDICES = NUM_CLIPPED_VERTICES + 3 };
+	VertexData ClippedVertices[2] = { v0, v1 };
+	VertexData *Vertices[2] = { &ClippedVertices[0], &ClippedVertices[1] };
+	bool clipped = false;
+	CLIP_LINE(CLIP_NEG_Z_BIT,  0,  0,  1, 1);
 
-	VertexData* Vertices[NUM_INDICES];
-	VertexData ClippedVertices[NUM_CLIPPED_VERTICES];
-	for (int i = 0; i < NUM_CLIPPED_VERTICES; ++i)
-		Vertices[i+3] = &ClippedVertices[i];
+	VertexData data[2] = { *Vertices[0], *Vertices[1] };
+	if (clipped) {
+		data[0].screenpos = TransformUnit::ClipToScreen(data[0].clippos);
+		data[1].screenpos = TransformUnit::ClipToScreen(data[1].clippos);
+	}
+	binner.AddLine(data[0], data[1]);
+}
 
-	// TODO: Change logic when it's a backface (why? In what way?)
-	Vertices[0] = &v0;
-	Vertices[1] = &v1;
-	Vertices[2] = &v2;
-
-	int indices[NUM_INDICES] = { 0, 1, 2, SKIP_FLAG, SKIP_FLAG, SKIP_FLAG, SKIP_FLAG, SKIP_FLAG, SKIP_FLAG,
-									SKIP_FLAG, SKIP_FLAG, SKIP_FLAG, SKIP_FLAG, SKIP_FLAG, SKIP_FLAG,
-									SKIP_FLAG, SKIP_FLAG, SKIP_FLAG, SKIP_FLAG, SKIP_FLAG, SKIP_FLAG };
-	int numIndices = 3;
-
+void ProcessTriangle(const VertexData &v0, const VertexData &v1, const VertexData &v2, const VertexData &provoking, BinManager &binner) {
 	int mask = 0;
-	mask |= CalcClipMask(v0.clippos);
-	mask |= CalcClipMask(v1.clippos);
-	mask |= CalcClipMask(v2.clippos);
+	if (!gstate.isModeThrough()) {
+		mask |= CalcClipMask(v0.clippos);
+		mask |= CalcClipMask(v1.clippos);
+		mask |= CalcClipMask(v2.clippos);
 
-	if (mask && !fromRectangle) {
 		// We may discard the entire triangle based on depth values.  First check what's outside.
 		int outsidePos = 0, outsideNeg = 0;
-		for (int i = 0; i < 3; ++i) {
-			CheckOutsideZ(Vertices[i]->clippos, outsidePos, outsideNeg);
-		}
+		CheckOutsideZ(v0.clippos, outsidePos, outsideNeg);
+		CheckOutsideZ(v1.clippos, outsidePos, outsideNeg);
+		CheckOutsideZ(v2.clippos, outsidePos, outsideNeg);
 
 		// With depth clamp off, we discard the triangle if even one vert is outside.
 		if (outsidePos + outsideNeg > 0 && !gstate.isDepthClampEnabled())
@@ -339,57 +238,87 @@ void ProcessTriangleInternal(VertexData &v0, VertexData &v1, VertexData &v2, con
 		// With it on, all three must be outside in the same direction.
 		else if (outsidePos >= 3 || outsideNeg >= 3)
 			return;
+	}
 
-		for (int i = 0; i < 3; i += 3) {
-			int vlist[2][2*6+1];
-			int *inlist = vlist[0], *outlist = vlist[1];
-			int n = 3;
-			int numVertices = 3;
+	// No clipping is common, let's skip processing if we can.
+	if ((mask & CLIP_NEG_Z_BIT) == 0) {
+		if (gstate.getShadeMode() == GE_SHADE_FLAT) {
+			// So that the order of clipping doesn't matter...
+			VertexData corrected2 = v2;
+			corrected2.color0 = provoking.color0;
+			corrected2.color1 = provoking.color1;
+			binner.AddTriangle(v0, v1, corrected2);
+		} else {
+			binner.AddTriangle(v0, v1, v2);
+		}
+		return;
+	}
 
-			inlist[0] = 0;
-			inlist[1] = 1;
-			inlist[2] = 2;
+	enum { NUM_CLIPPED_VERTICES = 3, NUM_INDICES = NUM_CLIPPED_VERTICES + 3 };
 
-			// mark this triangle as unused in case it should be completely clipped
-			indices[0] = SKIP_FLAG;
-			indices[1] = SKIP_FLAG;
-			indices[2] = SKIP_FLAG;
+	VertexData* Vertices[NUM_INDICES];
+	VertexData ClippedVertices[NUM_INDICES];
+	for (int i = 0; i < NUM_INDICES; ++i)
+		Vertices[i] = &ClippedVertices[i];
 
-			// The PSP only clips on negative Z (importantly, regardless of viewport.)
-			POLY_CLIP(CLIP_NEG_Z_BIT, 0, 0, 1, 1);
+	// TODO: Change logic when it's a backface (why? In what way?)
+	ClippedVertices[0] = v0;
+	ClippedVertices[1] = v1;
+	ClippedVertices[2] = v2;
 
-			// transform the poly in inlist into triangles
-			indices[0] = inlist[0];
-			indices[1] = inlist[1];
-			indices[2] = inlist[2];
-			for (int j = 3; j < n; ++j) {
-				indices[numIndices++] = inlist[0];
-				indices[numIndices++] = inlist[j - 1];
-				indices[numIndices++] = inlist[j];
-			}
+	int indices[NUM_INDICES] = { 0, 1, 2, SKIP_FLAG, SKIP_FLAG, SKIP_FLAG };
+	int numIndices = 3;
+	bool clipped = false;
+
+	for (int i = 0; i < 3; i += 3) {
+		int vlist[2][2*6+1];
+		int *inlist = vlist[0], *outlist = vlist[1];
+		int n = 3;
+		int numVertices = 3;
+
+		inlist[0] = 0;
+		inlist[1] = 1;
+		inlist[2] = 2;
+
+		// mark this triangle as unused in case it should be completely clipped
+		indices[0] = SKIP_FLAG;
+		indices[1] = SKIP_FLAG;
+		indices[2] = SKIP_FLAG;
+
+		// The PSP only clips on negative Z (importantly, regardless of viewport.)
+		POLY_CLIP(CLIP_NEG_Z_BIT, 0, 0, 1, 1);
+
+		// transform the poly in inlist into triangles
+		indices[0] = inlist[0];
+		indices[1] = inlist[1];
+		indices[2] = inlist[2];
+		for (int j = 3; j < n; ++j) {
+			indices[numIndices++] = inlist[0];
+			indices[numIndices++] = inlist[j - 1];
+			indices[numIndices++] = inlist[j];
 		}
 	}
 
 	for (int i = 0; i + 3 <= numIndices; i += 3) {
 		if (indices[i] != SKIP_FLAG) {
-			VertexData data[3] = { *Vertices[indices[i]], *Vertices[indices[i+1]], *Vertices[indices[i+2]] };
-			data[0].screenpos = TransformUnit::ClipToScreen(data[0].clippos);
-			data[1].screenpos = TransformUnit::ClipToScreen(data[1].clippos);
-			data[2].screenpos = TransformUnit::ClipToScreen(data[2].clippos);
+			VertexData &subv0 = *Vertices[indices[i + 0]];
+			VertexData &subv1 = *Vertices[indices[i + 1]];
+			VertexData &subv2 = *Vertices[indices[i + 2]];
+			if (clipped) {
+				subv0.screenpos = TransformUnit::ClipToScreen(subv0.clippos);
+				subv1.screenpos = TransformUnit::ClipToScreen(subv1.clippos);
+				subv2.screenpos = TransformUnit::ClipToScreen(subv2.clippos);
+			}
 
 			if (gstate.getShadeMode() == GE_SHADE_FLAT) {
 				// So that the order of clipping doesn't matter...
-				data[2].color0 = provoking.color0;
-				data[2].color1 = provoking.color1;
+				subv2.color0 = provoking.color0;
+				subv2.color1 = provoking.color1;
 			}
 
-			Rasterizer::DrawTriangle(data[0], data[1], data[2]);
+			binner.AddTriangle(subv0, subv1, subv2);
 		}
 	}
-}
-
-void ProcessTriangle(VertexData &v0, VertexData &v1, VertexData &v2, const VertexData &provoking) {
-	ProcessTriangleInternal(v0, v1, v2, provoking, false);
 }
 
 } // namespace

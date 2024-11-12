@@ -3,6 +3,7 @@
 #include <memory>
 #include <vector>
 #include <cstdint>
+#include <string>
 
 #include "Common/Math/geom2d.h"
 #include "Common/Math/lin/vec3.h"
@@ -59,6 +60,7 @@ public:
 	void Flush();
 
 	void RebindTexture() const;
+	void BindFontTexture() const;
 
 	// TODO: Support transformed bounds using stencil
 	void PushScissor(const Bounds &bounds);
@@ -99,6 +101,8 @@ public:
 	void PopTransform();
 	Bounds TransformBounds(const Bounds &bounds);
 
+	void setUIAtlas(const std::string &name);
+
 private:
 	Draw::DrawContext *draw_ = nullptr;
 	Bounds bounds_;
@@ -112,10 +116,14 @@ private:
 	Draw::Pipeline *ui_pipeline_ = nullptr;
 	Draw::Pipeline *ui_pipeline_notex_ = nullptr;
 	std::unique_ptr<ManagedTexture> uitexture_;
+	std::unique_ptr<ManagedTexture> fontTexture_;
 
 	DrawBuffer *uidrawbuffer_ = nullptr;
 	DrawBuffer *uidrawbufferTop_ = nullptr;
 
 	std::vector<Bounds> scissorStack_;
 	std::vector<UITransform> transformStack_;
+
+	std::string lastUIAtlas_;
+	std::string UIAtlas_ = "ui_atlas.zim";
 };

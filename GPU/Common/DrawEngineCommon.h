@@ -73,6 +73,11 @@ public:
 		SubmitPrim(verts, inds, prim, vertexCount, vertTypeID, cullMode, bytesRead);
 	}
 
+	virtual void DispatchSubmitImm(void *verts, void *inds, GEPrimitiveType prim, int vertexCount, u32 vertTypeID, int cullMode, int *bytesRead) {
+		SubmitPrim(verts, inds, prim, vertexCount, vertTypeID, cullMode, bytesRead);
+		DispatchFlush();
+	}
+
 	bool TestBoundingBox(void* control_points, int vertexCount, u32 vertType, int *bytesRead);
 
 	void SubmitPrim(void *verts, void *inds, GEPrimitiveType prim, int vertexCount, u32 vertTypeID, int cullMode, int *bytesRead);
@@ -114,7 +119,7 @@ protected:
 	// Vertex decoding
 	void DecodeVertsStep(u8 *dest, int &i, int &decodedVerts);
 
-	bool ApplyFramebufferRead(bool *fboTexNeedsBind);
+	void ApplyFramebufferRead(bool *fboTexNeedsBind);
 
 	inline int IndexSize(u32 vtype) const {
 		const u32 indexType = (vtype & GE_VTYPE_IDX_MASK);

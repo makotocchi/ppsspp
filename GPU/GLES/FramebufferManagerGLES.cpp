@@ -87,7 +87,7 @@ void FramebufferManagerGLES::CompileDraw2DProgram() {
 		std::vector<GLRProgram::Semantic> semantics;
 		semantics.push_back({ 0, "a_position" });
 		semantics.push_back({ 1, "a_texcoord0" });
-		draw2dprogram_ = render_->CreateProgram(shaders, semantics, queries, initializers, false);
+		draw2dprogram_ = render_->CreateProgram(shaders, semantics, queries, initializers, false, false);
 		for (auto shader : shaders)
 			render_->DeleteShader(shader);
 	}
@@ -113,12 +113,10 @@ void FramebufferManagerGLES::Init() {
 }
 
 void FramebufferManagerGLES::SetTextureCache(TextureCacheGLES *tc) {
-	textureCacheGL_ = tc;
 	textureCache_ = tc;
 }
 
 void FramebufferManagerGLES::SetShaderManager(ShaderManagerGLES *sm) {
-	shaderManagerGL_ = sm;
 	shaderManager_ = sm;
 }
 
@@ -325,7 +323,7 @@ void FramebufferManagerGLES::BlitFramebuffer(VirtualFramebuffer *dst, int dstX, 
 		float srcH = src->bufferHeight;
 		render_->BindProgram(draw2dprogram_);
 		DrawActiveTexture(dstX1, dstY1, w * dstXFactor, h * dstYFactor, dst->bufferWidth, dst->bufferHeight, srcX1 / srcW, srcY1 / srcH, srcX2 / srcW, srcY2 / srcH, ROTATION_LOCKED_HORIZONTAL, DRAWTEX_NEAREST);
-		textureCacheGL_->ForgetLastTexture();
+		textureCache_->ForgetLastTexture();
 	}
 
 	gstate_c.Dirty(DIRTY_VIEWPORTSCISSOR_STATE | DIRTY_BLEND_STATE | DIRTY_RASTER_STATE);
@@ -349,8 +347,6 @@ void FramebufferManagerGLES::Resized() {
 	FramebufferManagerCommon::Resized();
 
 	render_->Resize(PSP_CoreParameter().pixelWidth, PSP_CoreParameter().pixelHeight);
-
-	// render_->SetLineWidth(renderWidth_ / 480.0f);
 }
 
 bool FramebufferManagerGLES::GetOutputFramebuffer(GPUDebugBuffer &buffer) {

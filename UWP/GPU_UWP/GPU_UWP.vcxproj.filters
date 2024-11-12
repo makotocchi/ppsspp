@@ -17,7 +17,6 @@
     <ClCompile Include="..\..\GPU\Common\StencilCommon.cpp" />
     <ClCompile Include="..\..\GPU\Common\TextureCacheCommon.cpp" />
     <ClCompile Include="..\..\GPU\Common\TextureDecoder.cpp" />
-    <ClCompile Include="..\..\GPU\Common\TextureDecoderNEON.cpp" />
     <ClCompile Include="..\..\GPU\Common\TextureScalerCommon.cpp" />
     <ClCompile Include="..\..\GPU\Common\TransformCommon.cpp" />
     <ClCompile Include="..\..\GPU\Common\VertexDecoderArm.cpp" />
@@ -45,7 +44,10 @@
     <ClCompile Include="..\..\GPU\GPUCommon.cpp" />
     <ClCompile Include="..\..\GPU\GPUState.cpp" />
     <ClCompile Include="..\..\GPU\Math3D.cpp" />
+    <ClCompile Include="..\..\GPU\Software\BinManager.cpp" />
     <ClCompile Include="..\..\GPU\Software\Clipper.cpp" />
+    <ClCompile Include="..\..\GPU\Software\DrawPixel.cpp" />
+    <ClCompile Include="..\..\GPU\Software\FuncId.cpp" />
     <ClCompile Include="..\..\GPU\Software\Lighting.cpp" />
     <ClCompile Include="..\..\GPU\Software\Rasterizer.cpp" />
     <ClCompile Include="..\..\GPU\Software\Sampler.cpp" />
@@ -53,6 +55,7 @@
     <ClCompile Include="..\..\GPU\Software\TransformUnit.cpp" />
     <ClCompile Include="pch.cpp" />
     <ClCompile Include="..\..\GPU\Software\RasterizerRectangle.cpp" />
+    <ClCompile Include="..\..\GPU\Software\RasterizerRegCache.cpp" />
     <ClCompile Include="..\..\GPU\Common\FragmentShaderGenerator.cpp" />
     <ClCompile Include="..\..\GPU\Common\VertexShaderGenerator.cpp" />
     <ClCompile Include="..\..\GPU\Common\ReinterpretFramebuffer.cpp" />
@@ -75,7 +78,6 @@
     <ClInclude Include="..\..\GPU\Common\StencilCommon.h" />
     <ClInclude Include="..\..\GPU\Common\TextureCacheCommon.h" />
     <ClInclude Include="..\..\GPU\Common\TextureDecoder.h" />
-    <ClInclude Include="..\..\GPU\Common\TextureDecoderNEON.h" />
     <ClInclude Include="..\..\GPU\Common\TextureScalerCommon.h" />
     <ClInclude Include="..\..\GPU\Common\TransformCommon.h" />
     <ClInclude Include="..\..\GPU\Common\VertexDecoderCommon.h" />
@@ -101,7 +103,10 @@
     <ClInclude Include="..\..\GPU\GPUInterface.h" />
     <ClInclude Include="..\..\GPU\GPUState.h" />
     <ClInclude Include="..\..\GPU\Math3D.h" />
+    <ClInclude Include="..\..\GPU\Software\BinManager.h" />
     <ClInclude Include="..\..\GPU\Software\Clipper.h" />
+    <ClInclude Include="..\..\GPU\Software\DrawPixel.h" />
+    <ClInclude Include="..\..\GPU\Software\FuncId.h" />
     <ClInclude Include="..\..\GPU\Software\Lighting.h" />
     <ClInclude Include="..\..\GPU\Software\Rasterizer.h" />
     <ClInclude Include="..\..\GPU\Software\Sampler.h" />
@@ -110,6 +115,7 @@
     <ClInclude Include="pch.h" />
     <ClInclude Include="targetver.h" />
     <ClInclude Include="..\..\GPU\Software\RasterizerRectangle.h" />
+    <ClInclude Include="..\..\GPU\Software\RasterizerRegCache.h" />
     <ClInclude Include="..\..\GPU\Common\FragmentShaderGenerator.h" />
     <ClInclude Include="..\..\GPU\Common\VertexShaderGenerator.h" />
     <ClInclude Include="..\..\GPU\Common\ReinterpretFramebuffer.h" />

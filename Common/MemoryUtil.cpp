@@ -20,7 +20,7 @@
 #include <cstring>
 #include <cstdlib>
 
-#include "Common/Common.h"
+#include "Common/CommonTypes.h"
 #include "Common/Log.h"
 #include "Common/MemoryUtil.h"
 #include "Common/StringUtils.h"
@@ -236,7 +236,7 @@ void *AllocateMemoryPages(size_t size, uint32_t memProtFlags) {
 
 void *AllocateAlignedMemory(size_t size, size_t alignment) {
 #ifdef _WIN32
-	void* ptr = _aligned_malloc(size,alignment);
+	void* ptr = _aligned_malloc(size, alignment);
 #else
 	void* ptr = NULL;
 #ifdef __ANDROID__

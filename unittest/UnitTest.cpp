@@ -311,7 +311,6 @@ bool TestParsers() {
 bool TestVFPUSinCos() {
 	float sine, cosine;
 	InitVFPUSinCos();
-	EXPECT_FALSE(vfpu_sincos == nullptr);
 	vfpu_sincos(0.0f, sine, cosine);
 	EXPECT_EQ_FLOAT(sine, 0.0f);
 	EXPECT_EQ_FLOAT(cosine, 1.0f);
@@ -475,29 +474,27 @@ private:
 };
 
 bool TestQuickTexHash() {
-	SetupTextureDecoder();
-
 	static const int BUF_SIZE = 1024;
 	AlignedMem buf(BUF_SIZE, 16);
 
 	memset(buf, 0, BUF_SIZE);
-	EXPECT_EQ_HEX(DoQuickTexHash(buf, BUF_SIZE), 0xaa756edc);
+	EXPECT_EQ_HEX(StableQuickTexHash(buf, BUF_SIZE), 0xaa756edc);
 
 	memset(buf, 1, BUF_SIZE);
-	EXPECT_EQ_HEX(DoQuickTexHash(buf, BUF_SIZE), 0x66f81b1c);
+	EXPECT_EQ_HEX(StableQuickTexHash(buf, BUF_SIZE), 0x66f81b1c);
 
 	strncpy(buf, "hello", BUF_SIZE);
-	EXPECT_EQ_HEX(DoQuickTexHash(buf, BUF_SIZE), 0xf6028131);
+	EXPECT_EQ_HEX(StableQuickTexHash(buf, BUF_SIZE), 0xf6028131);
 
 	strncpy(buf, "goodbye", BUF_SIZE);
-	EXPECT_EQ_HEX(DoQuickTexHash(buf, BUF_SIZE), 0xef81b54f);
+	EXPECT_EQ_HEX(StableQuickTexHash(buf, BUF_SIZE), 0xef81b54f);
 
 	// Simple patterns.
 	for (int i = 0; i < BUF_SIZE; ++i) {
 		char *p = buf;
 		p[i] = i & 0xFF;
 	}
-	EXPECT_EQ_HEX(DoQuickTexHash(buf, BUF_SIZE), 0x0d64531c);
+	EXPECT_EQ_HEX(StableQuickTexHash(buf, BUF_SIZE), 0x0d64531c);
 
 	int j = 573;
 	for (int i = 0; i < BUF_SIZE; ++i) {
@@ -505,7 +502,7 @@ bool TestQuickTexHash() {
 		j += ((i * 7) + (i & 3)) * 11;
 		p[i] = j & 0xFF;
 	}
-	EXPECT_EQ_HEX(DoQuickTexHash(buf, BUF_SIZE), 0x58de8dbc);
+	EXPECT_EQ_HEX(StableQuickTexHash(buf, BUF_SIZE), 0x58de8dbc);
 
 	return true;
 }
@@ -602,12 +599,18 @@ static bool TestPath() {
 	EXPECT_EQ_STR(Path("foo.bar/hello.txt").WithReplacedExtension(".txt", ".html").ToString(), std::string("foo.bar/hello.html"));
 
 	EXPECT_EQ_STR(Path("C:\\Yo").NavigateUp().ToString(), std::string("C:"));
+#if PPSSPP_PLATFORM(WINDOWS)
 	EXPECT_EQ_STR(Path("C:").NavigateUp().ToString(), std::string("/"));
 
 	EXPECT_EQ_STR(Path("C:\\Yo").GetDirectory(), std::string("C:"));
 	EXPECT_EQ_STR(Path("C:\\Yo").GetFilename(), std::string("Yo"));
 	EXPECT_EQ_STR(Path("C:\\Yo\\Lo").GetDirectory(), std::string("C:/Yo"));
 	EXPECT_EQ_STR(Path("C:\\Yo\\Lo").GetFilename(), std::string("Lo"));
+
+	EXPECT_EQ_STR(Path(R"(\\host\share\filename)").GetRootVolume().ToString(), std::string("//host"));
+	EXPECT_EQ_STR(Path(R"(\\?\UNC\share\filename)").GetRootVolume().ToString(), std::string("//?/UNC"));
+	EXPECT_EQ_STR(Path(R"(\\?\C:\share\filename)").GetRootVolume().ToString(), std::string("//?/C:"));
+#endif
 
 	std::string computedPath;
 
@@ -671,7 +674,7 @@ protected:
 	float MeasureWidth(const char *str, size_t bytes) override {
 		// Simple case for unit testing.
 		int w = 0;
-		for (UTF8 utf(str); !utf.end() && utf.byteIndex() < bytes; ) {
+		for (UTF8 utf(str); !utf.end() && (size_t)utf.byteIndex() < bytes; ) {
 			uint32_t c = utf.next();
 			switch (c) {
 			case ' ':
@@ -752,6 +755,7 @@ bool TestArmEmitter();
 bool TestArm64Emitter();
 bool TestX64Emitter();
 bool TestShaderGenerators();
+bool TestSoftwareGPUJit();
 bool TestThreadManager();
 
 TestItem availableTests[] = {
@@ -777,6 +781,7 @@ TestItem availableTests[] = {
 	TEST_ITEM(CLZ),
 	TEST_ITEM(MemMap),
 	TEST_ITEM(ShaderGenerators),
+	TEST_ITEM(SoftwareGPUJit),
 	TEST_ITEM(Path),
 	TEST_ITEM(AndroidContentURI),
 	TEST_ITEM(ThreadManager),

@@ -63,7 +63,6 @@ using namespace std::placeholders;
 #include "GPU/Vulkan/DebugVisVulkan.h"
 #endif
 #include "Core/HLE/sceCtrl.h"
-#include "Core/HLE/sceDisplay.h"
 #include "Core/HLE/sceSas.h"
 #include "Core/Debugger/SymbolMap.h"
 #include "Core/SaveState.h"
@@ -71,6 +70,7 @@ using namespace std::placeholders;
 #include "Core/HLE/__sceAudio.h"
 #include "Core/HLE/proAdhoc.h"
 #include "Core/HLE/Plugins.h"
+#include "Core/HW/Display.h"
 
 #include "UI/BackgroundAudio.h"
 #include "UI/OnScreenDisplay.h"
@@ -110,7 +110,7 @@ static void __EmuScreenVblank()
 	if (frameStep_ && lastNumFlips != gpuStats.numFlips)
 	{
 		frameStep_ = false;
-		Core_EnableStepping(true);
+		Core_EnableStepping(true, "ui.frameAdvance", 0);
 		lastNumFlips = gpuStats.numFlips;
 	}
 #ifndef MOBILE_DEVICE
@@ -545,11 +545,17 @@ inline float clamp1(float x) {
 bool EmuScreen::touch(const TouchInput &touch) {
 	Core_NotifyActivity();
 
-	if (chatMenu_ && (touch.flags & TOUCH_DOWN) != 0 && !chatMenu_->Contains(touch.x, touch.y)) {
-		chatMenu_->Close();
-		if (chatButton_)
-			chatButton_->SetVisibility(UI::V_VISIBLE);
-		UI::EnableFocusMovement(false);
+	if (chatMenu_ && chatMenu_->GetVisibility() == UI::V_VISIBLE) {
+		// Avoid pressing touch button behind the chat
+		if (chatMenu_->Contains(touch.x, touch.y)) {
+			chatMenu_->Touch(touch);
+			return true;
+		} else if ((touch.flags & TOUCH_DOWN) != 0) {
+			chatMenu_->Close();
+			if (chatButton_)
+				chatButton_->SetVisibility(UI::V_VISIBLE);
+			UI::EnableFocusMovement(false);
+		}
 	}
 
 	if (root_) {
@@ -611,7 +617,7 @@ void EmuScreen::onVKeyDown(int virtualKeyCode) {
 		}
 		else if (!frameStep_)
 		{
-			Core_EnableStepping(true);
+			Core_EnableStepping(true, "ui.frameAdvance", 0);
 		}
 		break;
 
@@ -706,6 +712,18 @@ void EmuScreen::onVKeyDown(int virtualKeyCode) {
 		break;
 	case VIRTKEY_MUTE_TOGGLE:
 		g_Config.bEnableSound = !g_Config.bEnableSound;
+		break;
+	case VIRTKEY_SCREEN_ROTATION_VERTICAL:
+		g_Config.iInternalScreenRotation = ROTATION_LOCKED_VERTICAL;
+		break;
+	case VIRTKEY_SCREEN_ROTATION_VERTICAL180:
+		g_Config.iInternalScreenRotation = ROTATION_LOCKED_VERTICAL180;
+		break;
+	case VIRTKEY_SCREEN_ROTATION_HORIZONTAL:
+		g_Config.iInternalScreenRotation = ROTATION_LOCKED_HORIZONTAL;
+		break;
+	case VIRTKEY_SCREEN_ROTATION_HORIZONTAL180:
+		g_Config.iInternalScreenRotation = ROTATION_LOCKED_HORIZONTAL180;
 		break;
 	}
 }
@@ -1091,22 +1109,29 @@ void EmuScreen::checkPowerDown() {
 	}
 }
 
-static void DrawDebugStats(DrawBuffer *draw2d, const Bounds &bounds) {
+static void DrawDebugStats(UIContext *ctx, const Bounds &bounds) {
 	FontID ubuntu24("UBUNTU24");
 
 	float left = std::max(bounds.w / 2 - 20.0f, 550.0f);
 	float right = bounds.w - left - 20.0f;
 
 	char statbuf[4096];
+
+	ctx->Flush();
+	ctx->BindFontTexture();
+	ctx->Draw()->SetFontScale(.7f, .7f);
+
 	__DisplayGetDebugStats(statbuf, sizeof(statbuf));
-	draw2d->SetFontScale(.7f, .7f);
-	draw2d->DrawTextRect(ubuntu24, statbuf, bounds.x + 11, bounds.y + 31, left, bounds.h - 30, 0xc0000000, FLAG_DYNAMIC_ASCII | FLAG_WRAP_TEXT);
-	draw2d->DrawTextRect(ubuntu24, statbuf, bounds.x + 10, bounds.y + 30, left, bounds.h - 30, 0xFFFFFFFF, FLAG_DYNAMIC_ASCII | FLAG_WRAP_TEXT);
+	ctx->Draw()->DrawTextRect(ubuntu24, statbuf, bounds.x + 11, bounds.y + 31, left, bounds.h - 30, 0xc0000000, FLAG_DYNAMIC_ASCII | FLAG_WRAP_TEXT);
+	ctx->Draw()->DrawTextRect(ubuntu24, statbuf, bounds.x + 10, bounds.y + 30, left, bounds.h - 30, 0xFFFFFFFF, FLAG_DYNAMIC_ASCII | FLAG_WRAP_TEXT);
 
 	__SasGetDebugStats(statbuf, sizeof(statbuf));
-	draw2d->DrawTextRect(ubuntu24, statbuf, bounds.x + left + 21, bounds.y + 31, right, bounds.h - 30, 0xc0000000, FLAG_DYNAMIC_ASCII | FLAG_WRAP_TEXT);
-	draw2d->DrawTextRect(ubuntu24, statbuf, bounds.x + left + 20, bounds.y + 30, right, bounds.h - 30, 0xFFFFFFFF, FLAG_DYNAMIC_ASCII | FLAG_WRAP_TEXT);
-	draw2d->SetFontScale(1.0f, 1.0f);
+	ctx->Draw()->DrawTextRect(ubuntu24, statbuf, bounds.x + left + 21, bounds.y + 31, right, bounds.h - 30, 0xc0000000, FLAG_DYNAMIC_ASCII | FLAG_WRAP_TEXT);
+	ctx->Draw()->DrawTextRect(ubuntu24, statbuf, bounds.x + left + 20, bounds.y + 30, right, bounds.h - 30, 0xFFFFFFFF, FLAG_DYNAMIC_ASCII | FLAG_WRAP_TEXT);
+
+	ctx->Draw()->SetFontScale(1.0f, 1.0f);
+	ctx->Flush();
+	ctx->RebindTexture();
 }
 
 static const char *CPUCoreAsString(int core) {
@@ -1121,7 +1146,18 @@ static const char *CPUCoreAsString(int core) {
 static void DrawCrashDump(UIContext *ctx) {
 	const ExceptionInfo &info = Core_GetExceptionInfo();
 
+	auto sy = GetI18NCategory("System");
 	FontID ubuntu24("UBUNTU24");
+
+	int x = 20 + System_GetPropertyFloat(SYSPROP_DISPLAY_SAFE_INSET_LEFT);
+	int y = 20 + System_GetPropertyFloat(SYSPROP_DISPLAY_SAFE_INSET_TOP);
+
+	ctx->Flush();
+	if (ctx->Draw()->GetFontAtlas()->getFont(ubuntu24))
+		ctx->BindFontTexture();
+	ctx->Draw()->SetFontScale(1.2f, 1.2f);
+	ctx->Draw()->DrawTextShadow(ubuntu24, sy->T("Game crashed"), x, y, 0xFFFFFFFF);
+
 	char statbuf[4096];
 	char versionString[256];
 	snprintf(versionString, sizeof(versionString), "%s", PPSSPP_GIT_VERSION);
@@ -1138,9 +1174,7 @@ static void DrawCrashDump(UIContext *ctx) {
 	int sysVersion = System_GetPropertyInt(SYSPROP_SYSTEMVERSION);
 
 	// First column
-	ctx->Flush();
-	int x = 20 + System_GetPropertyFloat(SYSPROP_DISPLAY_SAFE_INSET_LEFT);
-	int y = 50 + System_GetPropertyFloat(SYSPROP_DISPLAY_SAFE_INSET_TOP);
+	y += 65;
 
 	int columnWidth = (ctx->GetBounds().w - x - 10) / 2;
 	int height = ctx->GetBounds().h;
@@ -1199,7 +1233,7 @@ BREAK
 	// Draw some additional stuff to the right.
 
 	x += columnWidth + 10;
-	y = 50;
+	y = 85;
 	snprintf(statbuf, sizeof(statbuf),
 		"CPU Core: %s (flags: %08x)\n"
 		"Locked CPU freq: %d MHz\n"
@@ -1209,19 +1243,26 @@ BREAK
 		CheatsInEffect() ? "Y" : "N", HLEPlugins::HasEnabled() ? "Y" : "N");
 
 	ctx->Draw()->DrawTextShadow(ubuntu24, statbuf, x, y, 0xFFFFFFFF);
+	ctx->Flush();
+	ctx->RebindTexture();
 }
 
-static void DrawAudioDebugStats(DrawBuffer *draw2d, const Bounds &bounds) {
+static void DrawAudioDebugStats(UIContext *ctx, const Bounds &bounds) {
 	FontID ubuntu24("UBUNTU24");
 	char statbuf[4096] = { 0 };
 	__AudioGetDebugStats(statbuf, sizeof(statbuf));
-	draw2d->SetFontScale(0.7f, 0.7f);
-	draw2d->DrawTextRect(ubuntu24, statbuf, bounds.x + 11, bounds.y + 31, bounds.w - 20, bounds.h - 30, 0xc0000000, FLAG_DYNAMIC_ASCII | FLAG_WRAP_TEXT);
-	draw2d->DrawTextRect(ubuntu24, statbuf, bounds.x + 10, bounds.y + 30, bounds.w - 20, bounds.h - 30, 0xFFFFFFFF, FLAG_DYNAMIC_ASCII | FLAG_WRAP_TEXT);
-	draw2d->SetFontScale(1.0f, 1.0f);
+
+	ctx->Flush();
+	ctx->BindFontTexture();
+	ctx->Draw()->SetFontScale(0.7f, 0.7f);
+	ctx->Draw()->DrawTextRect(ubuntu24, statbuf, bounds.x + 11, bounds.y + 31, bounds.w - 20, bounds.h - 30, 0xc0000000, FLAG_DYNAMIC_ASCII | FLAG_WRAP_TEXT);
+	ctx->Draw()->DrawTextRect(ubuntu24, statbuf, bounds.x + 10, bounds.y + 30, bounds.w - 20, bounds.h - 30, 0xFFFFFFFF, FLAG_DYNAMIC_ASCII | FLAG_WRAP_TEXT);
+	ctx->Draw()->SetFontScale(1.0f, 1.0f);
+	ctx->Flush();
+	ctx->RebindTexture();
 }
 
-static void DrawFPS(DrawBuffer *draw2d, const Bounds &bounds) {
+static void DrawFPS(UIContext *ctx, const Bounds &bounds) {
 	FontID ubuntu24("UBUNTU24");
 	float vps, fps, actual_fps;
 	__DisplayGetFPS(&vps, &fps, &actual_fps);
@@ -1237,10 +1278,14 @@ static void DrawFPS(DrawBuffer *draw2d, const Bounds &bounds) {
 		return;
 	}
 
-	draw2d->SetFontScale(0.7f, 0.7f);
-	draw2d->DrawText(ubuntu24, fpsbuf, bounds.x2() - 8, 12, 0xc0000000, ALIGN_TOPRIGHT | FLAG_DYNAMIC_ASCII);
-	draw2d->DrawText(ubuntu24, fpsbuf, bounds.x2() - 10, 10, 0xFF3fFF3f, ALIGN_TOPRIGHT | FLAG_DYNAMIC_ASCII);
-	draw2d->SetFontScale(1.0f, 1.0f);
+	ctx->Flush();
+	ctx->BindFontTexture();
+	ctx->Draw()->SetFontScale(0.7f, 0.7f);
+	ctx->Draw()->DrawText(ubuntu24, fpsbuf, bounds.x2() - 8, 12, 0xc0000000, ALIGN_TOPRIGHT | FLAG_DYNAMIC_ASCII);
+	ctx->Draw()->DrawText(ubuntu24, fpsbuf, bounds.x2() - 10, 10, 0xFF3fFF3f, ALIGN_TOPRIGHT | FLAG_DYNAMIC_ASCII);
+	ctx->Draw()->SetFontScale(1.0f, 1.0f);
+	ctx->Flush();
+	ctx->RebindTexture();
 }
 
 static void DrawFrameTimes(UIContext *ctx, const Bounds &bounds) {
@@ -1266,10 +1311,13 @@ static void DrawFrameTimes(UIContext *ctx, const Bounds &bounds) {
 
 	ctx->Flush();
 	ctx->Begin();
+	ctx->BindFontTexture();
 	ctx->Draw()->SetFontScale(0.5f, 0.5f);
 	ctx->Draw()->DrawText(ubuntu24, "33.3ms", bounds.x + width, bottom - 0.0333 * scale, 0xFF3f3Fff, ALIGN_BOTTOMLEFT | FLAG_DYNAMIC_ASCII);
 	ctx->Draw()->DrawText(ubuntu24, "16.7ms", bounds.x + width, bottom - 0.0167 * scale, 0xFF3f3Fff, ALIGN_BOTTOMLEFT | FLAG_DYNAMIC_ASCII);
 	ctx->Draw()->SetFontScale(1.0f, 1.0f);
+	ctx->Flush();
+	ctx->RebindTexture();
 }
 
 void EmuScreen::preRender() {
@@ -1388,9 +1436,11 @@ void EmuScreen::render() {
 		break;
 	}
 
+	PSP_EndHostFrame();
+
+	// This must happen after PSP_EndHostFrame so that things like push buffers are end-frame'd before we start destroying stuff.
 	checkPowerDown();
 
-	PSP_EndHostFrame();
 	if (invalid_)
 		return;
 
@@ -1446,25 +1496,23 @@ void EmuScreen::renderUI() {
 		root_->Draw(*ctx);
 	}
 
-	DrawBuffer *draw2d = ctx->Draw();
-
 	if (g_Config.bShowDebugStats && !invalid_) {
-		DrawDebugStats(draw2d, ctx->GetLayoutBounds());
+		DrawDebugStats(ctx, ctx->GetLayoutBounds());
 	}
 
 	if (g_Config.bShowAudioDebug && !invalid_) {
-		DrawAudioDebugStats(draw2d, ctx->GetLayoutBounds());
+		DrawAudioDebugStats(ctx, ctx->GetLayoutBounds());
 	}
 
 	if (g_Config.iShowFPSCounter && !invalid_) {
-		DrawFPS(draw2d, ctx->GetLayoutBounds());
+		DrawFPS(ctx, ctx->GetLayoutBounds());
 	}
 
 	if (g_Config.bDrawFrameGraph && !invalid_) {
 		DrawFrameTimes(ctx, ctx->GetLayoutBounds());
 	}
 
-#if !PPSSPP_PLATFORM(UWP)
+#if !PPSSPP_PLATFORM(UWP) && !PPSSPP_PLATFORM(SWITCH)
 	if (g_Config.iGPUBackend == (int)GPUBackend::VULKAN && g_Config.bShowAllocatorDebug) {
 		DrawAllocatorVis(ctx, gpu);
 	}

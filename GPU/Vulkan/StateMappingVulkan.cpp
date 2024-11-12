@@ -93,9 +93,9 @@ static const VkStencilOp stencilOps[] = {
 };
 
 static const VkPrimitiveTopology primToVulkan[8] = {
-	VK_PRIMITIVE_TOPOLOGY_POINT_LIST,
-	VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
-	VK_PRIMITIVE_TOPOLOGY_LINE_STRIP,
+	VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, // We convert points to triangles.
+	VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, // We convert lines to triangles.
+	VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, // We convert line strips to triangles.
 	VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
 	VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
 	VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN,
@@ -124,6 +124,7 @@ static const VkLogicOp logicOps[] = {
 
 void DrawEngineVulkan::ResetFramebufferRead() {
 	boundSecondary_ = VK_NULL_HANDLE;
+	fboTexBound_ = false;
 }
 
 // TODO: Do this more progressively. No need to compute the entire state if the entire state hasn't changed.
@@ -161,23 +162,17 @@ void DrawEngineVulkan::ConvertStateToVulkanKey(FramebufferManagerVulkan &fbManag
 				key.logicOp = VK_LOGIC_OP_CLEAR;
 			}
 
-			// Set blend - unless we need to do it in the shader.
-			GenericBlendState blendState;
-			ConvertBlendState(blendState, gstate_c.allowFramebufferRead);
-
 			GenericMaskState maskState;
 			ConvertMaskState(maskState, gstate_c.allowFramebufferRead);
 
+			// Set blend - unless we need to do it in the shader.
+			GenericBlendState blendState;
+			ConvertBlendState(blendState, gstate_c.allowFramebufferRead, maskState.applyFramebufferRead);
+
 			if (blendState.applyFramebufferRead || maskState.applyFramebufferRead) {
-				if (ApplyFramebufferRead(&fboTexNeedsBind_)) {
-					// The shader takes over the responsibility for blending, so recompute.
-					ApplyStencilReplaceAndLogicOpIgnoreBlend(blendState.replaceAlphaWithStencil, blendState);
-				} else {
-					// Until next time, force it off.
-					ResetFramebufferRead();
-					gstate_c.SetAllowFramebufferRead(false);
-					// Make sure we recompute the fragment shader ID to one that doesn't try to use shader blending.
-				}
+				ApplyFramebufferRead(&fboTexNeedsBind_);
+				// The shader takes over the responsibility for blending, so recompute.
+				ApplyStencilReplaceAndLogicOpIgnoreBlend(blendState.replaceAlphaWithStencil, blendState);
 				gstate_c.Dirty(DIRTY_FRAGMENTSHADER_STATE);
 			} else if (blendState.resetFramebufferRead) {
 				ResetFramebufferRead();
@@ -233,14 +228,13 @@ void DrawEngineVulkan::ConvertStateToVulkanKey(FramebufferManagerVulkan &fbManag
 	}
 
 	if (gstate_c.IsDirty(DIRTY_RASTER_STATE)) {
-		bool wantCull = !gstate.isModeClear() && prim != GE_PRIM_RECTANGLES && gstate.isCullEnabled();
+		bool wantCull = !gstate.isModeClear() && prim != GE_PRIM_RECTANGLES && prim > GE_PRIM_LINE_STRIP && gstate.isCullEnabled();
 		key.cullMode = wantCull ? (gstate.getCullMode() ? VK_CULL_MODE_FRONT_BIT : VK_CULL_MODE_BACK_BIT) : VK_CULL_MODE_NONE;
 
 		if (gstate.isModeClear() || gstate.isModeThrough()) {
 			// TODO: Might happen in clear mode if not through...
 			key.depthClampEnable = false;
 		} else {
-			// Set cull
 			if (gstate.getDepthRangeMin() == 0 || gstate.getDepthRangeMax() == 65535) {
 				// TODO: Still has a bug where we clamp to depth range if one is not the full range.
 				// But the alternate is not clamping in either direction...
@@ -352,23 +346,23 @@ void DrawEngineVulkan::ConvertStateToVulkanKey(FramebufferManagerVulkan &fbManag
 			gstate_c.Dirty(DIRTY_PROJMATRIX);
 		}
 
-		VkRect2D &scissor = dynState.scissor;
+		ScissorRect &scissor = dynState.scissor;
 		if (vpAndScissor.scissorEnable) {
-			scissor.offset.x = vpAndScissor.scissorX;
-			scissor.offset.y = vpAndScissor.scissorY;
-			scissor.extent.width = std::max(0, vpAndScissor.scissorW);
-			scissor.extent.height = std::max(0, vpAndScissor.scissorH);
+			scissor.x = vpAndScissor.scissorX;
+			scissor.y = vpAndScissor.scissorY;
+			scissor.width = std::max(0, vpAndScissor.scissorW);
+			scissor.height = std::max(0, vpAndScissor.scissorH);
 		} else {
-			scissor.offset.x = 0;
-			scissor.offset.y = 0;
-			scissor.extent.width = framebufferManager_->GetRenderWidth();
-			scissor.extent.height = framebufferManager_->GetRenderHeight();
+			scissor.x = 0;
+			scissor.y = 0;
+			scissor.width = framebufferManager_->GetRenderWidth();
+			scissor.height = framebufferManager_->GetRenderHeight();
 		}
 	}
 }
 
 void DrawEngineVulkan::BindShaderBlendTex() {
-	// TODO:  At this point, we know if the vertices are full alpha or not.
+	// TODO: At this point, we know if the vertices are full alpha or not.
 	// Set the nearest/linear here (since we correctly know if alpha/color tests are needed)?
 	if (!gstate.isModeClear()) {
 		if (fboTexNeedsBind_) {
@@ -382,7 +376,7 @@ void DrawEngineVulkan::BindShaderBlendTex() {
 
 void DrawEngineVulkan::ApplyDrawStateLate(VulkanRenderManager *renderManager, bool applyStencilRef, uint8_t stencilRef, bool useBlendConstant) {
 	if (gstate_c.IsDirty(DIRTY_VIEWPORTSCISSOR_STATE)) {
-		renderManager->SetScissor(dynState_.scissor);
+		renderManager->SetScissor(dynState_.scissor.x, dynState_.scissor.y, dynState_.scissor.width, dynState_.scissor.height);
 		renderManager->SetViewport(dynState_.viewport);
 	}
 	if ((gstate_c.IsDirty(DIRTY_DEPTHSTENCIL_STATE) && dynState_.useStencil) || applyStencilRef) {

@@ -19,6 +19,7 @@
 #include "Common/GPU/Vulkan/VulkanRenderManager.h"
 
 #include "Common/Log.h"
+#include "Core/Config.h"
 #include "Core/Reporting.h"
 #include "GPU/Common/StencilCommon.h"
 #include "GPU/Vulkan/FramebufferManagerVulkan.h"
@@ -147,21 +148,23 @@ bool FramebufferManagerVulkan::NotifyStencilUpload(u32 addr, int size, StencilUp
 
 	std::string error;
 	if (!stencilVs_) {
+		VulkanContext *vulkan = (VulkanContext *)draw_->GetNativeObject(Draw::NativeObject::CONTEXT);
+
 		const char *stencil_fs_source = stencil_fs;
 		// See comment above the stencil_fs_adreno definition.
-		u32 vendorID = vulkan_->GetPhysicalDeviceProperties().properties.vendorID;
+		u32 vendorID = vulkan->GetPhysicalDeviceProperties().properties.vendorID;
 		if (g_Config.bVendorBugChecksEnabled && (draw_->GetBugs().Has(Draw::Bugs::NO_DEPTH_CANNOT_DISCARD_STENCIL) || vendorID == VULKAN_VENDOR_ARM))
 			stencil_fs_source = stencil_fs_adreno;
 
-		stencilVs_ = CompileShaderModule(vulkan_, VK_SHADER_STAGE_VERTEX_BIT, stencil_vs, &error);
-		stencilFs_ = CompileShaderModule(vulkan_, VK_SHADER_STAGE_FRAGMENT_BIT, stencil_fs_source, &error);
+		stencilVs_ = CompileShaderModule(vulkan, VK_SHADER_STAGE_VERTEX_BIT, stencil_vs, &error);
+		stencilFs_ = CompileShaderModule(vulkan, VK_SHADER_STAGE_FRAGMENT_BIT, stencil_fs_source, &error);
 	}
 	VkRenderPass rp = (VkRenderPass)draw_->GetNativeObject(Draw::NativeObject::FRAMEBUFFER_RENDERPASS);
 
 	VulkanRenderManager *renderManager = (VulkanRenderManager *)draw_->GetNativeObject(Draw::NativeObject::RENDER_MANAGER);
 
-	shaderManagerVulkan_->DirtyLastShader();
-	textureCacheVulkan_->ForgetLastTexture();
+	shaderManager_->DirtyLastShader();
+	textureCache_->ForgetLastTexture();
 
 	u16 w = dstBuffer->renderWidth;
 	u16 h = dstBuffer->renderHeight;
@@ -181,7 +184,7 @@ bool FramebufferManagerVulkan::NotifyStencilUpload(u32 addr, int size, StencilUp
 	VkPipeline pipeline = vulkan2D_->GetPipeline(rp, stencilVs_, stencilFs_, false, Vulkan2D::VK2DDepthStencilMode::STENCIL_REPLACE_ALWAYS);
 	renderManager->BindPipeline(pipeline, PIPELINE_FLAG_USES_DEPTH_STENCIL);
 	renderManager->SetViewport({ 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f });
-	renderManager->SetScissor({ { 0, 0, },{ (uint32_t)w, (uint32_t)h } });
+	renderManager->SetScissor(0, 0, (int)w, (int)h);
 
 	draw_->BindTextures(0, 1, &tex);
 	VkImageView drawPixelsImageView = (VkImageView)draw_->GetNativeObject(Draw::NativeObject::BOUND_TEXTURE0_IMAGEVIEW);

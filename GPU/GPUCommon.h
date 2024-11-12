@@ -11,10 +11,6 @@
 #include <atomic>
 #endif
 
-#if defined(_M_SSE)
-#include <emmintrin.h>
-#endif
-
 class FramebufferManagerCommon;
 class TextureCacheCommon;
 class DrawEngineCommon;
@@ -31,7 +27,6 @@ enum DrawType {
 };
 
 enum {
-	FLAG_FLUSHBEFORE = 1,
 	FLAG_FLUSHBEFOREONCHANGE = 2,
 	FLAG_EXECUTE = 4,
 	FLAG_EXECUTEONCHANGE = 8,
@@ -43,16 +38,17 @@ enum {
 struct TransformedVertex {
 	union {
 		struct {
-			float x, y, z, fog;     // in case of morph, preblend during decode
+			float x, y, z, pos_w;     // in case of morph, preblend during decode
 		};
 		float pos[4];
 	};
 	union {
 		struct {
-			float u; float v; float w;   // scaled by uscale, vscale, if there
+			float u; float v; float uv_w;   // scaled by uscale, vscale, if there
 		};
 		float uv[3];
 	};
+	float fog;
 	union {
 		u8 color0[4];   // prelit
 		u32 color0_32;
@@ -170,6 +166,7 @@ public:
 
 	// Note: Not virtual!
 	void Flush();
+	void DispatchFlush() override;
 
 #ifdef USE_CRT_DBG
 #undef new
@@ -217,20 +214,7 @@ public:
 	GPUgstate GetGState() override;
 	void SetCmdValue(u32 op) override;
 
-	void UpdateUVScaleOffset() {
-#ifdef _M_SSE
-		__m128i values = _mm_slli_epi32(_mm_load_si128((const __m128i *)&gstate.texscaleu), 8);
-		_mm_storeu_si128((__m128i *)&gstate_c.uv, values);
-#elif PPSSPP_PLATFORM(ARM_NEON)
-		const uint32x4_t values = vshlq_n_u32(vld1q_u32(&gstate.texscaleu), 8);
-		vst1q_u32(&gstate_c.uv, values);
-#else
-		gstate_c.uv.uScale = getFloat24(gstate.texscaleu);
-		gstate_c.uv.vScale = getFloat24(gstate.texscalev);
-		gstate_c.uv.uOff = getFloat24(gstate.texoffsetu);
-		gstate_c.uv.vOff = getFloat24(gstate.texoffsetv);
-#endif
-	}
+	void UpdateUVScaleOffset();
 
 	DisplayList* getList(int listid) override {
 		return &dls[listid];
@@ -264,6 +248,10 @@ protected:
 	void DeviceLost() override;
 	void DeviceRestore() override;
 
+	inline bool IsTrianglePrim(GEPrimitiveType prim) const {
+		return prim != GE_PRIM_RECTANGLES && prim > GE_PRIM_LINE_STRIP;
+	}
+
 	void SetDrawType(DrawType type, GEPrimitiveType prim) {
 		if (type != lastDraw_) {
 			// We always flush when drawing splines/beziers so no need to do so here
@@ -272,7 +260,7 @@ protected:
 		}
 		// Prim == RECTANGLES can cause CanUseHardwareTransform to flip, so we need to dirty.
 		// Also, culling may be affected so dirty the raster state.
-		if ((prim == GE_PRIM_RECTANGLES) != (lastPrim_ == GE_PRIM_RECTANGLES)) {
+		if (IsTrianglePrim(prim) != IsTrianglePrim(lastPrim_)) {
 			Flush();
 			gstate_c.Dirty(DIRTY_RASTER_STATE | DIRTY_VERTEXSHADER_STATE);
 			lastPrim_ = prim;
@@ -313,6 +301,7 @@ protected:
 	TextureCacheCommon *textureCache_ = nullptr;
 	DrawEngineCommon *drawEngineCommon_ = nullptr;
 	ShaderManagerCommon *shaderManager_ = nullptr;
+	bool flushOnParams_ = true;
 
 	GraphicsContext *gfxCtx_;
 	Draw::DrawContext *draw_;
@@ -378,6 +367,3 @@ struct CommonCommandTableEntry {
 	uint64_t dirty;
 	GPUCommon::CmdFunc func;
 };
-
-extern const CommonCommandTableEntry commonCommandTable[];
-extern size_t commonCommandTableSize;

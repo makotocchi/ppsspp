@@ -409,6 +409,8 @@ UI::EventReturn MemStickScreen::UseInternalStorage(UI::EventParams &params) {
 			// This can't really happen?? Not worth making an error message.
 			ERROR_LOG_REPORT(SYSTEM, "Could not switch memstick path in setup (internal)");
 		}
+		// Don't have a confirmation dialog that would otherwise do it for us, need to just switch directly to the main screen.
+		screenManager()->switchScreen(new MainScreen());
 	} else if (pendingMemStickFolder != g_Config.memStickDirectory) {
 		// Always ask for confirmation when called from the UI. Likely there's already some data.
 		screenManager()->push(new ConfirmMemstickMoveScreen(pendingMemStickFolder, false));
@@ -645,7 +647,7 @@ UI::EventReturn ConfirmMemstickMoveScreen::OnConfirm(UI::EventParams &params) {
 	if (moveData_) {
 		progressReporter_.Set(iz->T("Starting move..."));
 
-		moveDataTask_ = Promise<MoveResult>::Spawn(&g_threadManager, [&]() -> MoveResult * {
+		moveDataTask_ = Promise<MoveResult *>::Spawn(&g_threadManager, [&]() -> MoveResult * {
 			Path moveSrc = g_Config.memStickDirectory;
 			Path moveDest = newMemstickFolder_;
 			if (moveSrc.GetFilename() != "PSP") {

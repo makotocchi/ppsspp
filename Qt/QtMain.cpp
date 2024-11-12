@@ -5,6 +5,7 @@
 // Qt 4.7+ / 5.0+ implementation of the framework.
 // Currently supports: Android, Linux, Windows, Mac OSX
 
+#include "ppsspp_config.h"
 #include <QApplication>
 #include <QClipboard>
 #include <QDesktopWidget>
@@ -29,6 +30,7 @@
 #ifdef SDL
 #include "SDL/SDLJoystick.h"
 #include "SDL_audio.h"
+#include "SDL_keyboard.h"
 #endif
 
 #include "Common/System/NativeApp.h"
@@ -41,10 +43,12 @@
 #include "Common/Data/Text/I18n.h"
 #include "Common/Thread/ThreadUtil.h"
 #include "Common/Data/Encoding/Utf8.h"
+#include "Common/StringUtils.h"
 #include "Core/Config.h"
 #include "Core/ConfigValues.h"
 #include "Core/HW/Camera.h"
 
+#include <signal.h>
 #include <string.h>
 
 MainUI *emugl = nullptr;
@@ -174,6 +178,19 @@ int System_GetPropertyInt(SystemProperty prop) {
 		return g_retFmt.freq;
 	case SYSPROP_AUDIO_FRAMES_PER_BUFFER:
 		return g_retFmt.samples;
+	case SYSPROP_KEYBOARD_LAYOUT:
+	{
+		// TODO: Use Qt APIs for detecting this
+		char q, w, y;
+		q = SDL_GetKeyFromScancode(SDL_SCANCODE_Q);
+		w = SDL_GetKeyFromScancode(SDL_SCANCODE_W);
+		y = SDL_GetKeyFromScancode(SDL_SCANCODE_Y);
+		if (q == 'a' && w == 'z' && y == 'y')
+			return KEYBOARD_LAYOUT_AZERTY;
+		else if (q == 'q' && w == 'w' && y == 'z')
+			return KEYBOARD_LAYOUT_QWERTZ;
+		return KEYBOARD_LAYOUT_QWERTY;
+	}
 #endif
 	case SYSPROP_DEVICE_TYPE:
 #if defined(__ANDROID__)
@@ -226,6 +243,8 @@ bool System_GetPropertyBool(SystemProperty prop) {
 		return false;
 #endif
 	case SYSPROP_CAN_JIT:
+		return true;
+	case SYSPROP_HAS_KEYBOARD:
 		return true;
 	default:
 		return false;
@@ -280,7 +299,7 @@ void Vibrate(int length_ms) {
 }
 
 void OpenDirectory(const char *path) {
-	// Unsupported
+	QDesktopServices::openUrl(QUrl::fromLocalFile(QString::fromUtf8(path)));
 }
 
 void LaunchBrowser(const char *url)
@@ -690,6 +709,11 @@ int main(int argc, char *argv[])
 			printf("%s\n", PPSSPP_GIT_VERSION);
 			return 0;
 		}
+	}
+
+	// Ignore sigpipe.
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+		perror("Unable to ignore SIGPIPE");
 	}
 
 	PROFILE_INIT();

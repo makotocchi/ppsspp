@@ -577,9 +577,6 @@
     <ClCompile Include="HLE\sceSha256.cpp">
       <Filter>HLE\Libraries</Filter>
     </ClCompile>
-    <ClCompile Include="Util\AudioFormatNEON.cpp">
-      <Filter>Util</Filter>
-    </ClCompile>
     <ClCompile Include="Util\AudioFormat.cpp">
       <Filter>Util</Filter>
     </ClCompile>
@@ -1181,6 +1178,12 @@
     <ClCompile Include="KeyMapDefaults.cpp">
       <Filter>Core</Filter>
     </ClCompile>
+    <ClCompile Include="Debugger\WebSocket\GPUStatsSubscriber.cpp">
+      <Filter>Debugger\WebSocket</Filter>
+    </ClCompile>
+    <ClCompile Include="HW\Display.cpp">
+      <Filter>HW</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ELF\ElfReader.h">
@@ -1657,9 +1660,6 @@
     <ClInclude Include="Util\AudioFormat.h">
       <Filter>Util</Filter>
     </ClInclude>
-    <ClInclude Include="Util\AudioFormatNEON.h">
-      <Filter>Util</Filter>
-    </ClInclude>
     <ClInclude Include="..\ext\sfmt19937\SFMT.h">
       <Filter>Ext\sfmt19937</Filter>
     </ClInclude>
@@ -1903,6 +1903,12 @@
     </ClInclude>
     <ClInclude Include="KeyMapDefaults.h">
       <Filter>Core</Filter>
+    </ClInclude>
+    <ClInclude Include="Debugger\WebSocket\GPUStatsSubscriber.h">
+      <Filter>Debugger\WebSocket</Filter>
+    </ClInclude>
+    <ClInclude Include="HW\Display.h">
+      <Filter>HW</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

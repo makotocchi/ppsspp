@@ -19,23 +19,28 @@
 #include <algorithm>
 #include <cmath>
 
+#include "Common/Common.h"
+#include "Common/CPUDetect.h"
 #include "Common/Data/Convert/ColorConv.h"
 #include "Common/Profiler/Profiler.h"
-#include "Common/Thread/ParallelLoop.h"
-#include "Core/ThreadPools.h"
+#include "Common/StringUtils.h"
 #include "Core/Config.h"
+#include "Core/Debugger/MemBlockInfo.h"
 #include "Core/MemMap.h"
 #include "Core/Reporting.h"
-#include "Core/ThreadPools.h"
 #include "GPU/GPUState.h"
 
 #include "GPU/Common/TextureDecoder.h"
-#include "GPU/Software/SoftGpu.h"
+#include "GPU/Software/BinManager.h"
+#include "GPU/Software/DrawPixel.h"
 #include "GPU/Software/Rasterizer.h"
 #include "GPU/Software/Sampler.h"
+#include "GPU/Software/SoftGpu.h"
+#include "GPU/Software/TransformUnit.h"
 
 #if defined(_M_SSE)
 #include <emmintrin.h>
+#include <smmintrin.h>
 #endif
 
 namespace Rasterizer {
@@ -96,286 +101,111 @@ static inline Vec4<float> Interpolate(const float &c0, const float &c1, const fl
 	return Interpolate(c0, c1, c2, w0.Cast<float>(), w1.Cast<float>(), w2.Cast<float>(), wsum_recip);
 }
 
+void ComputeRasterizerState(RasterizerState *state) {
+	ComputePixelFuncID(&state->pixelID);
+	state->drawPixel = Rasterizer::GetSingleFunc(state->pixelID);
+
+	state->enableTextures = gstate.isTextureMapEnabled() && !state->pixelID.clearMode;
+	if (state->enableTextures) {
+		ComputeSamplerID(&state->samplerID);
+		state->linear = Sampler::GetLinearFunc(state->samplerID);
+		state->nearest = Sampler::GetNearestFunc(state->samplerID);
+
+		// Since the definitions are the same, just force this setting using the func pointer.
+		if (g_Config.iTexFiltering == TEX_FILTER_FORCE_LINEAR) {
+			state->nearest = state->linear;
+		} else if (g_Config.iTexFiltering == TEX_FILTER_FORCE_NEAREST) {
+			state->linear = state->nearest;
+		}
+
+		state->maxTexLevel = state->samplerID.hasAnyMips ? gstate.getTextureMaxLevel() : 0;
+
+		GETextureFormat texfmt = state->samplerID.TexFmt();
+		for (uint8_t i = 0; i <= state->maxTexLevel; i++) {
+			u32 texaddr = gstate.getTextureAddress(i);
+			state->texaddr[i] = texaddr;
+			state->texbufw[i] = GetTextureBufw(i, texaddr, texfmt);
+			if (Memory::IsValidAddress(texaddr))
+				state->texptr[i] = Memory::GetPointerUnchecked(texaddr);
+			else
+				state->texptr[i] = nullptr;
+		}
+
+		state->textureLodSlope = gstate.getTextureLodSlope();
+		state->texLevelMode = gstate.getTexLevelMode();
+		state->texLevelOffset = (int8_t)gstate.getTexLevelOffset16();
+		state->mipFilt = gstate.isMipmapFilteringEnabled();
+		state->minFilt = gstate.isMinifyFilteringEnabled();
+		state->magFilt = gstate.isMagnifyFilteringEnabled();
+	}
+
+	state->shadeGouraud = gstate.getShadeMode() == GE_SHADE_GOURAUD;
+	state->throughMode = gstate.isModeThrough();
+	state->antialiasLines = gstate.isAntiAliasEnabled();
+
+	state->screenOffsetX = gstate.getOffsetX16();
+	state->screenOffsetY = gstate.getOffsetY16();
+
+#if defined(SOFTGPU_MEMORY_TAGGING_DETAILED) || defined(SOFTGPU_MEMORY_TAGGING_BASIC)
+	DisplayList currentList{};
+	if (gpuDebug)
+		gpuDebug->GetCurrentDisplayList(currentList);
+	state->listPC = currentList.pc;
+#endif
+}
+
 static inline u8 ClampFogDepth(float fogdepth) {
-	if (fogdepth <= 0.0f)
+	union FloatBits {
+		float f;
+		u32 u;
+	};
+	FloatBits f;
+	f.f = fogdepth;
+
+	u32 exp = f.u >> 23;
+	if ((f.u & 0x80000000) != 0 || exp <= 126 - 8)
 		return 0;
-	else if (fogdepth >= 1.0f)
+	if (exp > 126)
 		return 255;
-	else
-		return (u8)(u32)(fogdepth * 255.0f);
-}
 
-static inline int ClampUV(int v, int height) {
-	if (v >= height - 1)
-		return height - 1;
-	else if (v < 0)
-		return 0;
-	return v;
-}
-
-static inline int WrapUV(int v, int height) {
-	return v & (height - 1);
-}
-
-template <int N>
-static inline void ApplyTexelClamp(int out_u[N], int out_v[N], const int u[N], const int v[N], int width, int height) {
-	if (gstate.isTexCoordClampedS()) {
-		for (int i = 0; i < N; ++i) {
-			out_u[i] = ClampUV(u[i], width);
-		}
-	} else {
-		for (int i = 0; i < N; ++i) {
-			out_u[i] = WrapUV(u[i], width);
-		}
-	}
-	if (gstate.isTexCoordClampedT()) {
-		for (int i = 0; i < N; ++i) {
-			out_v[i] = ClampUV(v[i], height);
-		}
-	} else {
-		for (int i = 0; i < N; ++i) {
-			out_v[i] = WrapUV(v[i], height);
-		}
-	}
-}
-
-template <int N>
-static inline void ApplyTexelClampQuad(int out_u[N * 4], int out_v[N * 4], const int u[N], const int v[N], int width, int height) {
-	if (gstate.isTexCoordClampedS()) {
-		for (int i = 0; i < N * 4; ++i) {
-			out_u[i] = ClampUV(u[i >> 2] + (i & 1), width);
-		}
-	} else {
-		for (int i = 0; i < N * 4; ++i) {
-			out_u[i] = WrapUV(u[i >> 2] + (i & 1), width);
-		}
-	}
-	if (gstate.isTexCoordClampedT()) {
-		for (int i = 0; i < N * 4; ++i) {
-			out_v[i] = ClampUV(v[i >> 2] + ((i >> 1) & 1), height);
-		}
-	} else {
-		for (int i = 0; i < N * 4; ++i) {
-			out_v[i] = WrapUV(v[i >> 2] + ((i >> 1) & 1), height);
-		}
-	}
-}
-
-static inline void GetTexelCoordinates(int level, float s, float t, int& out_u, int& out_v)
-{
-	int width = gstate.getTextureWidth(level);
-	int height = gstate.getTextureHeight(level);
-
-	int base_u = (int)(s * width * 256.0f + 0.375f);
-	int base_v = (int)(t * height * 256.0f + 0.375f);
-
-	base_u >>= 8;
-	base_v >>= 8;
-
-	ApplyTexelClamp<1>(&out_u, &out_v, &base_u, &base_v, width, height);
-}
-
-static inline void GetTexelCoordinatesQuad(int level, float in_s, float in_t, int u[4], int v[4], int &frac_u, int &frac_v)
-{
-	// 8 bits of fractional UV
-	int width = gstate.getTextureWidth(level);
-	int height = gstate.getTextureHeight(level);
-
-	int base_u = (int)(in_s * width * 256.0f + 0.375f) - 128;
-	int base_v = (int)(in_t * height * 256.0f + 0.375f) - 128;
-
-	frac_u = (int)(base_u) & 0xff;
-	frac_v = (int)(base_v) & 0xff;
-
-	base_u >>= 8;
-	base_v >>= 8;
-
-	// Need to generate and individually wrap/clamp the four sample coordinates. Ugh.
-	ApplyTexelClampQuad<1>(u, v, &base_u, &base_v, width, height);
+	u32 mantissa = (f.u & 0x007FFFFF) | 0x00800000;
+	return mantissa >> (16 + 126 - exp);
 }
 
 static inline void GetTextureCoordinates(const VertexData& v0, const VertexData& v1, const float p, float &s, float &t) {
-	switch (gstate.getUVGenMode()) {
-	case GE_TEXMAP_TEXTURE_COORDS:
-	case GE_TEXMAP_UNKNOWN:
-	case GE_TEXMAP_ENVIRONMENT_MAP:
-	case GE_TEXMAP_TEXTURE_MATRIX:
-		{
-			// TODO: What happens if vertex has no texture coordinates?
-			// Note that for environment mapping, texture coordinates have been calculated during lighting
-			float q0 = 1.f / v0.clippos.w;
-			float q1 = 1.f / v1.clippos.w;
-			float wq0 = p * q0;
-			float wq1 = (1.0f - p) * q1;
+	// All UV gen modes, by the time they get here, behave the same.
 
-			float q_recip = 1.0f / (wq0 + wq1);
-			s = (v0.texturecoords.s() * wq0 + v1.texturecoords.s() * wq1) * q_recip;
-			t = (v0.texturecoords.t() * wq0 + v1.texturecoords.t() * wq1) * q_recip;
-		}
-		break;
-	default:
-		ERROR_LOG_REPORT(G3D, "Software: Unsupported texture mapping mode %x!", gstate.getUVGenMode());
-		s = 0.0f;
-		t = 0.0f;
-		break;
-	}
+	// TODO: What happens if vertex has no texture coordinates?
+	// Note that for environment mapping, texture coordinates have been calculated during lighting
+	float q0 = 1.f / v0.clippos.w;
+	float q1 = 1.f / v1.clippos.w;
+	float wq0 = p * q0;
+	float wq1 = (1.0f - p) * q1;
+
+	float q_recip = 1.0f / (wq0 + wq1);
+	s = (v0.texturecoords.s() * wq0 + v1.texturecoords.s() * wq1) * q_recip;
+	t = (v0.texturecoords.t() * wq0 + v1.texturecoords.t() * wq1) * q_recip;
 }
 
-static inline void GetTextureCoordinates(const VertexData& v0, const VertexData& v1, const VertexData& v2, const Vec4<int> &w0, const Vec4<int> &w1, const Vec4<int> &w2, const Vec4<float> &wsum_recip, Vec4<float> &s, Vec4<float> &t)
-{
-	switch (gstate.getUVGenMode()) {
-	case GE_TEXMAP_TEXTURE_COORDS:
-	case GE_TEXMAP_UNKNOWN:
-	case GE_TEXMAP_ENVIRONMENT_MAP:
-	case GE_TEXMAP_TEXTURE_MATRIX:
-		{
-			// TODO: What happens if vertex has no texture coordinates?
-			// Note that for environment mapping, texture coordinates have been calculated during lighting
-			float q0 = 1.f / v0.clippos.w;
-			float q1 = 1.f / v1.clippos.w;
-			float q2 = 1.f / v2.clippos.w;
-			Vec4<float> wq0 = w0.Cast<float>() * q0;
-			Vec4<float> wq1 = w1.Cast<float>() * q1;
-			Vec4<float> wq2 = w2.Cast<float>() * q2;
+static inline void GetTextureCoordinates(const VertexData &v0, const VertexData &v1, const VertexData &v2, const Vec4<int> &w0, const Vec4<int> &w1, const Vec4<int> &w2, const Vec4<float> &wsum_recip, Vec4<float> &s, Vec4<float> &t) {
+	// All UV gen modes, by the time they get here, behave the same.
 
-			Vec4<float> q_recip = (wq0 + wq1 + wq2).Reciprocal();
-			s = Interpolate(v0.texturecoords.s(), v1.texturecoords.s(), v2.texturecoords.s(), wq0, wq1, wq2, q_recip);
-			t = Interpolate(v0.texturecoords.t(), v1.texturecoords.t(), v2.texturecoords.t(), wq0, wq1, wq2, q_recip);
-		}
-		break;
-	default:
-		ERROR_LOG_REPORT(G3D, "Software: Unsupported texture mapping mode %x!", gstate.getUVGenMode());
-		s = Vec4<float>::AssignToAll(0.0f);
-		t = Vec4<float>::AssignToAll(0.0f);
-		break;
-	}
+	// TODO: What happens if vertex has no texture coordinates?
+	// Note that for environment mapping, texture coordinates have been calculated during lighting.
+	float q0 = 1.f / v0.clippos.w;
+	float q1 = 1.f / v1.clippos.w;
+	float q2 = 1.f / v2.clippos.w;
+	Vec4<float> wq0 = w0.Cast<float>() * q0;
+	Vec4<float> wq1 = w1.Cast<float>() * q1;
+	Vec4<float> wq2 = w2.Cast<float>() * q2;
+
+	Vec4<float> q_recip = (wq0 + wq1 + wq2).Reciprocal();
+	s = Interpolate(v0.texturecoords.s(), v1.texturecoords.s(), v2.texturecoords.s(), wq0, wq1, wq2, q_recip);
+	t = Interpolate(v0.texturecoords.t(), v1.texturecoords.t(), v2.texturecoords.t(), wq0, wq1, wq2, q_recip);
 }
 
-// NOTE: These likely aren't endian safe
-static inline u32 GetPixelColor(int x, int y)
-{
-	switch (gstate.FrameBufFormat()) {
-	case GE_FORMAT_565:
-		return RGB565ToRGBA8888(fb.Get16(x, y, gstate.FrameBufStride()));
-
-	case GE_FORMAT_5551:
-		return RGBA5551ToRGBA8888(fb.Get16(x, y, gstate.FrameBufStride()));
-
-	case GE_FORMAT_4444:
-		return RGBA4444ToRGBA8888(fb.Get16(x, y, gstate.FrameBufStride()));
-
-	case GE_FORMAT_8888:
-		return fb.Get32(x, y, gstate.FrameBufStride());
-
-	case GE_FORMAT_INVALID:
-	case GE_FORMAT_DEPTH16:
-		_dbg_assert_msg_(false, "Software: invalid framebuf format.");
-	}
-	return 0;
-}
-
-static inline void SetPixelColor(int x, int y, u32 value)
-{
-	switch (gstate.FrameBufFormat()) {
-	case GE_FORMAT_565:
-		fb.Set16(x, y, gstate.FrameBufStride(), RGBA8888ToRGB565(value));
-		break;
-
-	case GE_FORMAT_5551:
-		fb.Set16(x, y, gstate.FrameBufStride(), RGBA8888ToRGBA5551(value));
-		break;
-
-	case GE_FORMAT_4444:
-		fb.Set16(x, y, gstate.FrameBufStride(), RGBA8888ToRGBA4444(value));
-		break;
-
-	case GE_FORMAT_8888:
-		fb.Set32(x, y, gstate.FrameBufStride(), value);
-		break;
-
-	case GE_FORMAT_INVALID:
-	case GE_FORMAT_DEPTH16:
-		_dbg_assert_msg_(false, "Software: invalid framebuf format.");
-	}
-}
-
-static inline u16 GetPixelDepth(int x, int y)
-{
-	return depthbuf.Get16(x, y, gstate.DepthBufStride());
-}
-
-static inline void SetPixelDepth(int x, int y, u16 value)
-{
-	depthbuf.Set16(x, y, gstate.DepthBufStride(), value);
-}
-
-static inline u8 GetPixelStencil(int x, int y)
-{
-	if (gstate.FrameBufFormat() == GE_FORMAT_565) {
-		// Always treated as 0 for comparison purposes.
-		return 0;
-	} else if (gstate.FrameBufFormat() == GE_FORMAT_5551) {
-		return ((fb.Get16(x, y, gstate.FrameBufStride()) & 0x8000) != 0) ? 0xFF : 0;
-	} else if (gstate.FrameBufFormat() == GE_FORMAT_4444) {
-		return Convert4To8(fb.Get16(x, y, gstate.FrameBufStride()) >> 12);
-	} else {
-		return fb.Get32(x, y, gstate.FrameBufStride()) >> 24;
-	}
-}
-
-static inline void SetPixelStencil(int x, int y, u8 value)
-{
-	// TODO: This seems like it maybe respects the alpha mask (at least in some scenarios?)
-
-	if (gstate.FrameBufFormat() == GE_FORMAT_565) {
-		// Do nothing
-	} else if (gstate.FrameBufFormat() == GE_FORMAT_5551) {
-		u16 pixel = fb.Get16(x, y, gstate.FrameBufStride()) & ~0x8000;
-		pixel |= value != 0 ? 0x8000 : 0;
-		fb.Set16(x, y, gstate.FrameBufStride(), pixel);
-	} else if (gstate.FrameBufFormat() == GE_FORMAT_4444) {
-		u16 pixel = fb.Get16(x, y, gstate.FrameBufStride()) & ~0xF000;
-		pixel |= (u16)value << 12;
-		fb.Set16(x, y, gstate.FrameBufStride(), pixel);
-	} else {
-		u32 pixel = fb.Get32(x, y, gstate.FrameBufStride()) & ~0xFF000000;
-		pixel |= (u32)value << 24;
-		fb.Set32(x, y, gstate.FrameBufStride(), pixel);
-	}
-}
-
-static inline bool DepthTestPassed(int x, int y, u16 z)
-{
-	u16 reference_z = GetPixelDepth(x, y);
-
-	switch (gstate.getDepthTestFunction()) {
-	case GE_COMP_NEVER:
-		return false;
-
-	case GE_COMP_ALWAYS:
-		return true;
-
-	case GE_COMP_EQUAL:
-		return (z == reference_z);
-
-	case GE_COMP_NOTEQUAL:
-		return (z != reference_z);
-
-	case GE_COMP_LESS:
-		return (z < reference_z);
-
-	case GE_COMP_LEQUAL:
-		return (z <= reference_z);
-
-	case GE_COMP_GREATER:
-		return (z > reference_z);
-
-	case GE_COMP_GEQUAL:
-		return (z >= reference_z);
-
-	default:
-		return 0;
-	}
+static inline void SetPixelDepth(int x, int y, int stride, u16 value) {
+	depthbuf.Set16(x, y, stride, value);
 }
 
 static inline bool IsRightSideOrFlatBottomLine(const Vec2<int>& vertex, const Vec2<int>& line1, const Vec2<int>& line2)
@@ -389,436 +219,183 @@ static inline bool IsRightSideOrFlatBottomLine(const Vec2<int>& vertex, const Ve
 	}
 }
 
-static inline bool StencilTestPassed(u8 stencil)
-{
-	// TODO: Does the masking logic make any sense?
-	stencil &= gstate.getStencilTestMask();
-	u8 ref = gstate.getStencilTestRef() & gstate.getStencilTestMask();
-	switch (gstate.getStencilTestFunction()) {
-		case GE_COMP_NEVER:
-			return false;
-
-		case GE_COMP_ALWAYS:
-			return true;
-
-		case GE_COMP_EQUAL:
-			return ref == stencil;
-
-		case GE_COMP_NOTEQUAL:
-			return ref != stencil;
-
-		case GE_COMP_LESS:
-			return ref < stencil;
-
-		case GE_COMP_LEQUAL:
-			return ref <= stencil;
-
-		case GE_COMP_GREATER:
-			return ref > stencil;
-
-		case GE_COMP_GEQUAL:
-			return ref >= stencil;
-	}
-	return true;
-}
-
-static inline u8 ApplyStencilOp(int op, u8 old_stencil) {
-	// TODO: Apply mask to reference or old stencil?
-	u8 reference_stencil = gstate.getStencilTestRef(); // TODO: Apply mask?
-	const u8 write_mask = gstate.getStencilWriteMask();
-
-	switch (op) {
-		case GE_STENCILOP_KEEP:
-			return old_stencil;
-
-		case GE_STENCILOP_ZERO:
-			return old_stencil & write_mask;
-
-		case GE_STENCILOP_REPLACE:
-			return (reference_stencil & ~write_mask) | (old_stencil & write_mask);
-
-		case GE_STENCILOP_INVERT:
-			return (~old_stencil & ~write_mask) | (old_stencil & write_mask);
-
-		case GE_STENCILOP_INCR:
-			switch (gstate.FrameBufFormat()) {
-			case GE_FORMAT_8888:
-				if (old_stencil != 0xFF) {
-					return ((old_stencil + 1) & ~write_mask) | (old_stencil & write_mask);
-				}
-				return old_stencil;
-			case GE_FORMAT_5551:
-				return ~write_mask | (old_stencil & write_mask);
-			case GE_FORMAT_4444:
-				if (old_stencil < 0xF0) {
-					return ((old_stencil + 0x10) & ~write_mask) | (old_stencil & write_mask);
-				}
-				return old_stencil;
-			default:
-				return old_stencil;
-			}
-			break;
-
-		case GE_STENCILOP_DECR:
-			switch (gstate.FrameBufFormat()) {
-			case GE_FORMAT_4444:
-				if (old_stencil >= 0x10)
-					return ((old_stencil - 0x10) & ~write_mask) | (old_stencil & write_mask);
-				break;
-			default:
-				if (old_stencil != 0)
-					return ((old_stencil - 1) & ~write_mask) | (old_stencil & write_mask);
-				return old_stencil;
-			}
-			break;
-	}
-
-	return old_stencil;
-}
-
-static inline u32 ApplyLogicOp(GELogicOp op, u32 old_color, u32 new_color) {
-	// All of the operations here intentionally preserve alpha/stencil.
-	switch (op) {
-	case GE_LOGIC_CLEAR:
-		new_color &= 0xFF000000;
-		break;
-
-	case GE_LOGIC_AND:
-		new_color = new_color & (old_color | 0xFF000000);
-		break;
-
-	case GE_LOGIC_AND_REVERSE:
-		new_color = new_color & (~old_color | 0xFF000000);
-		break;
-
-	case GE_LOGIC_COPY:
-		// No change to new_color.
-		break;
-
-	case GE_LOGIC_AND_INVERTED:
-		new_color = (~new_color & (old_color & 0x00FFFFFF)) | (new_color & 0xFF000000);
-		break;
-
-	case GE_LOGIC_NOOP:
-		new_color = (old_color & 0x00FFFFFF) | (new_color & 0xFF000000);
-		break;
-
-	case GE_LOGIC_XOR:
-		new_color = new_color ^ (old_color & 0x00FFFFFF);
-		break;
-
-	case GE_LOGIC_OR:
-		new_color = new_color | (old_color & 0x00FFFFFF);
-		break;
-
-	case GE_LOGIC_NOR:
-		new_color = (~(new_color | old_color) & 0x00FFFFFF) | (new_color & 0xFF000000);
-		break;
-
-	case GE_LOGIC_EQUIV:
-		new_color = (~(new_color ^ old_color) & 0x00FFFFFF) | (new_color & 0xFF000000);
-		break;
-
-	case GE_LOGIC_INVERTED:
-		new_color = (~old_color & 0x00FFFFFF) | (new_color & 0xFF000000);
-		break;
-
-	case GE_LOGIC_OR_REVERSE:
-		new_color = new_color | (~old_color & 0x00FFFFFF);
-		break;
-
-	case GE_LOGIC_COPY_INVERTED:
-		new_color = (~new_color & 0x00FFFFFF) | (new_color & 0xFF000000);
-		break;
-
-	case GE_LOGIC_OR_INVERTED:
-		new_color = ((~new_color | old_color) & 0x00FFFFFF) | (new_color & 0xFF000000);
-		break;
-
-	case GE_LOGIC_NAND:
-		new_color = (~(new_color & old_color) & 0x00FFFFFF) | (new_color & 0xFF000000);
-		break;
-
-	case GE_LOGIC_SET:
-		new_color |= 0x00FFFFFF;
-		break;
-	}
-
-	return new_color;
-}
-
-Vec4<int> GetTextureFunctionOutput(const Vec4<int>& prim_color, const Vec4<int>& texcolor)
-{
-	Vec3<int> out_rgb;
-	int out_a;
-
-	bool rgba = gstate.isTextureAlphaUsed();
-
-	switch (gstate.getTextureFunction()) {
-	case GE_TEXFUNC_MODULATE:
-	{
-#if defined(_M_SSE)
-		// We can be accurate up to 24 bit integers, should be enough.
-		const __m128 p = _mm_cvtepi32_ps(prim_color.ivec);
-		const __m128 t = _mm_cvtepi32_ps(texcolor.ivec);
-		const __m128 b = _mm_mul_ps(p, t);
-		if (gstate.isColorDoublingEnabled()) {
-			// We double right here, only for modulate.  Other tex funcs do not color double.
-			const __m128 doubleColor = _mm_setr_ps(2.0f / 255.0f, 2.0f / 255.0f, 2.0f / 255.0f, 1.0f / 255.0f);
-			out_rgb.ivec = _mm_cvtps_epi32(_mm_mul_ps(b, doubleColor));
-		} else {
-			out_rgb.ivec = _mm_cvtps_epi32(_mm_mul_ps(b, _mm_set_ps1(1.0f / 255.0f)));
-		}
-
-		if (rgba) {
-			return Vec4<int>(out_rgb.ivec);
-		} else {
-			out_a = prim_color.a();
-		}
-#else
-		if (gstate.isColorDoublingEnabled()) {
-			out_rgb = (prim_color.rgb() * texcolor.rgb() * 2) / 255;
-		} else {
-			out_rgb = prim_color.rgb() * texcolor.rgb() / 255;
-		}
-		out_a = (rgba) ? (prim_color.a() * texcolor.a() / 255) : prim_color.a();
-#endif
-		break;
-	}
-
-	case GE_TEXFUNC_DECAL:
-	{
-		int t = (rgba) ? texcolor.a() : 255;
-		int invt = (rgba) ? 255 - t : 0;
-		out_rgb = (prim_color.rgb() * invt + texcolor.rgb() * t) / 255;
-		out_a = prim_color.a();
-		break;
-	}
-
-	case GE_TEXFUNC_BLEND:
-	{
-		const Vec3<int> const255(255, 255, 255);
-		const Vec3<int> texenv(gstate.getTextureEnvColR(), gstate.getTextureEnvColG(), gstate.getTextureEnvColB());
-		out_rgb = ((const255 - texcolor.rgb()) * prim_color.rgb() + texcolor.rgb() * texenv) / 255;
-		out_a = prim_color.a() * ((rgba) ? texcolor.a() : 255) / 255;
-		break;
-	}
-
-	case GE_TEXFUNC_REPLACE:
-		out_rgb = texcolor.rgb();
-		out_a = (rgba) ? texcolor.a() : prim_color.a();
-		break;
-
-	case GE_TEXFUNC_ADD:
-		out_rgb = prim_color.rgb() + texcolor.rgb();
-		if (out_rgb.r() > 255) out_rgb.r() = 255;
-		if (out_rgb.g() > 255) out_rgb.g() = 255;
-		if (out_rgb.b() > 255) out_rgb.b() = 255;
-		out_a = prim_color.a() * ((rgba) ? texcolor.a() : 255) / 255;
-		break;
-
-	default:
-		ERROR_LOG_REPORT(G3D, "Software: Unknown texture function %x", gstate.getTextureFunction());
-		out_rgb = Vec3<int>::AssignToAll(0);
-		out_a = 0;
-	}
-
-	return Vec4<int>(out_rgb.r(), out_rgb.g(), out_rgb.b(), out_a);
-}
-
-static inline bool ColorTestPassed(const Vec3<int> &color)
-{
-	const u32 mask = gstate.getColorTestMask();
-	const u32 c = color.ToRGB() & mask;
-	const u32 ref = gstate.getColorTestRef() & mask;
-	switch (gstate.getColorTestFunction()) {
-		case GE_COMP_NEVER:
-			return false;
-
-		case GE_COMP_ALWAYS:
-			return true;
-
-		case GE_COMP_EQUAL:
-			return c == ref;
-
-		case GE_COMP_NOTEQUAL:
-			return c != ref;
-
-		default:
-			ERROR_LOG_REPORT(G3D, "Software: Invalid colortest function: %d", gstate.getColorTestFunction());
-			break;
-	}
-	return true;
-}
-
-static inline bool AlphaTestPassed(int alpha)
-{
-	const u8 mask = gstate.getAlphaTestMask() & 0xFF;
-	const u8 ref = gstate.getAlphaTestRef() & mask;
-	alpha &= mask;
-
-	switch (gstate.getAlphaTestFunction()) {
-		case GE_COMP_NEVER:
-			return false;
-
-		case GE_COMP_ALWAYS:
-			return true;
-
-		case GE_COMP_EQUAL:
-			return (alpha == ref);
-
-		case GE_COMP_NOTEQUAL:
-			return (alpha != ref);
-
-		case GE_COMP_LESS:
-			return (alpha < ref);
-
-		case GE_COMP_LEQUAL:
-			return (alpha <= ref);
-
-		case GE_COMP_GREATER:
-			return (alpha > ref);
-
-		case GE_COMP_GEQUAL:
-			return (alpha >= ref);
-	}
-	return true;
-}
-
-static inline Vec3<int> GetSourceFactor(const Vec4<int>& source, const Vec4<int>& dst)
-{
-	switch (gstate.getBlendFuncA()) {
-	case GE_SRCBLEND_DSTCOLOR:
+static inline Vec3<int> GetSourceFactor(PixelBlendFactor factor, const Vec4<int> &source, const Vec4<int> &dst, uint32_t fix) {
+	switch (factor) {
+	case PixelBlendFactor::OTHERCOLOR:
 		return dst.rgb();
 
-	case GE_SRCBLEND_INVDSTCOLOR:
+	case PixelBlendFactor::INVOTHERCOLOR:
 		return Vec3<int>::AssignToAll(255) - dst.rgb();
 
-	case GE_SRCBLEND_SRCALPHA:
+	case PixelBlendFactor::SRCALPHA:
 #if defined(_M_SSE)
 		return Vec3<int>(_mm_shuffle_epi32(source.ivec, _MM_SHUFFLE(3, 3, 3, 3)));
 #else
 		return Vec3<int>::AssignToAll(source.a());
 #endif
 
-	case GE_SRCBLEND_INVSRCALPHA:
+	case PixelBlendFactor::INVSRCALPHA:
 #if defined(_M_SSE)
 		return Vec3<int>(_mm_sub_epi32(_mm_set1_epi32(255), _mm_shuffle_epi32(source.ivec, _MM_SHUFFLE(3, 3, 3, 3))));
 #else
 		return Vec3<int>::AssignToAll(255 - source.a());
 #endif
 
-	case GE_SRCBLEND_DSTALPHA:
+	case PixelBlendFactor::DSTALPHA:
 		return Vec3<int>::AssignToAll(dst.a());
 
-	case GE_SRCBLEND_INVDSTALPHA:
+	case PixelBlendFactor::INVDSTALPHA:
 		return Vec3<int>::AssignToAll(255 - dst.a());
 
-	case GE_SRCBLEND_DOUBLESRCALPHA:
+	case PixelBlendFactor::DOUBLESRCALPHA:
 		return Vec3<int>::AssignToAll(2 * source.a());
 
-	case GE_SRCBLEND_DOUBLEINVSRCALPHA:
+	case PixelBlendFactor::DOUBLEINVSRCALPHA:
 		return Vec3<int>::AssignToAll(255 - std::min(2 * source.a(), 255));
 
-	case GE_SRCBLEND_DOUBLEDSTALPHA:
+	case PixelBlendFactor::DOUBLEDSTALPHA:
 		return Vec3<int>::AssignToAll(2 * dst.a());
 
-	case GE_SRCBLEND_DOUBLEINVDSTALPHA:
+	case PixelBlendFactor::DOUBLEINVDSTALPHA:
 		return Vec3<int>::AssignToAll(255 - std::min(2 * dst.a(), 255));
 
-	case GE_SRCBLEND_FIXA:
+	case PixelBlendFactor::FIX:
 	default:
 		// All other dest factors (> 10) are treated as FIXA.
-		return Vec3<int>::FromRGB(gstate.getFixA());
+		return Vec3<int>::FromRGB(fix);
+
+	case PixelBlendFactor::ZERO:
+		return Vec3<int>::AssignToAll(0);
+
+	case PixelBlendFactor::ONE:
+		return Vec3<int>::AssignToAll(255);
 	}
 }
 
-static inline Vec3<int> GetDestFactor(const Vec4<int>& source, const Vec4<int>& dst)
-{
-	switch (gstate.getBlendFuncB()) {
-	case GE_DSTBLEND_SRCCOLOR:
+static inline Vec3<int> GetDestFactor(PixelBlendFactor factor, const Vec4<int> &source, const Vec4<int> &dst, uint32_t fix) {
+	switch (factor) {
+	case PixelBlendFactor::OTHERCOLOR:
 		return source.rgb();
 
-	case GE_DSTBLEND_INVSRCCOLOR:
+	case PixelBlendFactor::INVOTHERCOLOR:
 		return Vec3<int>::AssignToAll(255) - source.rgb();
 
-	case GE_DSTBLEND_SRCALPHA:
+	case PixelBlendFactor::SRCALPHA:
 #if defined(_M_SSE)
 		return Vec3<int>(_mm_shuffle_epi32(source.ivec, _MM_SHUFFLE(3, 3, 3, 3)));
 #else
 		return Vec3<int>::AssignToAll(source.a());
 #endif
 
-	case GE_DSTBLEND_INVSRCALPHA:
+	case PixelBlendFactor::INVSRCALPHA:
 #if defined(_M_SSE)
 		return Vec3<int>(_mm_sub_epi32(_mm_set1_epi32(255), _mm_shuffle_epi32(source.ivec, _MM_SHUFFLE(3, 3, 3, 3))));
 #else
 		return Vec3<int>::AssignToAll(255 - source.a());
 #endif
 
-	case GE_DSTBLEND_DSTALPHA:
+	case PixelBlendFactor::DSTALPHA:
 		return Vec3<int>::AssignToAll(dst.a());
 
-	case GE_DSTBLEND_INVDSTALPHA:
+	case PixelBlendFactor::INVDSTALPHA:
 		return Vec3<int>::AssignToAll(255 - dst.a());
 
-	case GE_DSTBLEND_DOUBLESRCALPHA:
+	case PixelBlendFactor::DOUBLESRCALPHA:
 		return Vec3<int>::AssignToAll(2 * source.a());
 
-	case GE_DSTBLEND_DOUBLEINVSRCALPHA:
+	case PixelBlendFactor::DOUBLEINVSRCALPHA:
 		return Vec3<int>::AssignToAll(255 - std::min(2 * source.a(), 255));
 
-	case GE_DSTBLEND_DOUBLEDSTALPHA:
+	case PixelBlendFactor::DOUBLEDSTALPHA:
 		return Vec3<int>::AssignToAll(2 * dst.a());
 
-	case GE_DSTBLEND_DOUBLEINVDSTALPHA:
+	case PixelBlendFactor::DOUBLEINVDSTALPHA:
 		return Vec3<int>::AssignToAll(255 - std::min(2 * dst.a(), 255));
 
-	case GE_DSTBLEND_FIXB:
+	case PixelBlendFactor::FIX:
 	default:
 		// All other dest factors (> 10) are treated as FIXB.
-		return Vec3<int>::FromRGB(gstate.getFixB());
+		return Vec3<int>::FromRGB(fix);
+
+	case PixelBlendFactor::ZERO:
+		return Vec3<int>::AssignToAll(0);
+
+	case PixelBlendFactor::ONE:
+		return Vec3<int>::AssignToAll(255);
 	}
 }
 
 // Removed inline here - it was never chosen to be inlined by the compiler anyway, too complex.
-Vec3<int> AlphaBlendingResult(const Vec4<int> &source, const Vec4<int> &dst)
-{
+Vec3<int> AlphaBlendingResult(const PixelFuncID &pixelID, const Vec4<int> &source, const Vec4<int> &dst) {
 	// Note: These factors cannot go below 0, but they can go above 255 when doubling.
-	Vec3<int> srcfactor = GetSourceFactor(source, dst);
-	Vec3<int> dstfactor = GetDestFactor(source, dst);
+	Vec3<int> srcfactor = GetSourceFactor(pixelID.AlphaBlendSrc(), source, dst, pixelID.cached.alphaBlendSrc);
+	Vec3<int> dstfactor = GetDestFactor(pixelID.AlphaBlendDst(), source, dst, pixelID.cached.alphaBlendDst);
 
-	switch (gstate.getBlendEq()) {
+	switch (pixelID.AlphaBlendEq()) {
 	case GE_BLENDMODE_MUL_AND_ADD:
 	{
 #if defined(_M_SSE)
-		const __m128 s = _mm_mul_ps(_mm_cvtepi32_ps(source.ivec), _mm_cvtepi32_ps(srcfactor.ivec));
-		const __m128 d = _mm_mul_ps(_mm_cvtepi32_ps(dst.ivec), _mm_cvtepi32_ps(dstfactor.ivec));
-		return Vec3<int>(_mm_cvtps_epi32(_mm_mul_ps(_mm_add_ps(s, d), _mm_set_ps1(1.0f / 255.0f))));
+		// We switch to 16 bit to use mulhi, and we use 4 bits of decimal to make the 16 bit shift free.
+		const __m128i half = _mm_set1_epi16(1 << 3);
+
+		const __m128i srgb = _mm_add_epi16(_mm_slli_epi16(_mm_packs_epi32(source.ivec, source.ivec), 4), half);
+		const __m128i sf = _mm_add_epi16(_mm_slli_epi16(_mm_packs_epi32(srcfactor.ivec, srcfactor.ivec), 4), half);
+		const __m128i s = _mm_mulhi_epi16(srgb, sf);
+
+		const __m128i drgb = _mm_add_epi16(_mm_slli_epi16(_mm_packs_epi32(dst.ivec, dst.ivec), 4), half);
+		const __m128i df = _mm_add_epi16(_mm_slli_epi16(_mm_packs_epi32(dstfactor.ivec, dstfactor.ivec), 4), half);
+		const __m128i d = _mm_mulhi_epi16(drgb, df);
+
+		return Vec3<int>(_mm_unpacklo_epi16(_mm_adds_epi16(s, d), _mm_setzero_si128()));
 #else
-		return (source.rgb() * srcfactor + dst.rgb() * dstfactor) / 255;
+		Vec3<int> half = Vec3<int>::AssignToAll(1);
+		Vec3<int> lhs = ((source.rgb() * 2 + half) * (srcfactor * 2 + half)) / 1024;
+		Vec3<int> rhs = ((dst.rgb() * 2 + half) * (dstfactor * 2 + half)) / 1024;
+		return lhs + rhs;
 #endif
 	}
 
 	case GE_BLENDMODE_MUL_AND_SUBTRACT:
 	{
 #if defined(_M_SSE)
-		const __m128 s = _mm_mul_ps(_mm_cvtepi32_ps(source.ivec), _mm_cvtepi32_ps(srcfactor.ivec));
-		const __m128 d = _mm_mul_ps(_mm_cvtepi32_ps(dst.ivec), _mm_cvtepi32_ps(dstfactor.ivec));
-		return Vec3<int>(_mm_cvtps_epi32(_mm_mul_ps(_mm_sub_ps(s, d), _mm_set_ps1(1.0f / 255.0f))));
+		const __m128i half = _mm_set1_epi16(1 << 3);
+
+		const __m128i srgb = _mm_add_epi16(_mm_slli_epi16(_mm_packs_epi32(source.ivec, source.ivec), 4), half);
+		const __m128i sf = _mm_add_epi16(_mm_slli_epi16(_mm_packs_epi32(srcfactor.ivec, srcfactor.ivec), 4), half);
+		const __m128i s = _mm_mulhi_epi16(srgb, sf);
+
+		const __m128i drgb = _mm_add_epi16(_mm_slli_epi16(_mm_packs_epi32(dst.ivec, dst.ivec), 4), half);
+		const __m128i df = _mm_add_epi16(_mm_slli_epi16(_mm_packs_epi32(dstfactor.ivec, dstfactor.ivec), 4), half);
+		const __m128i d = _mm_mulhi_epi16(drgb, df);
+
+		return Vec3<int>(_mm_unpacklo_epi16(_mm_max_epi16(_mm_subs_epi16(s, d), _mm_setzero_si128()), _mm_setzero_si128()));
 #else
-		return (source.rgb() * srcfactor - dst.rgb() * dstfactor) / 255;
+		Vec3<int> half = Vec3<int>::AssignToAll(1);
+		Vec3<int> lhs = ((source.rgb() * 2 + half) * (srcfactor * 2 + half)) / 1024;
+		Vec3<int> rhs = ((dst.rgb() * 2 + half) * (dstfactor * 2 + half)) / 1024;
+		return lhs - rhs;
 #endif
 	}
 
 	case GE_BLENDMODE_MUL_AND_SUBTRACT_REVERSE:
 	{
 #if defined(_M_SSE)
-		const __m128 s = _mm_mul_ps(_mm_cvtepi32_ps(source.ivec), _mm_cvtepi32_ps(srcfactor.ivec));
-		const __m128 d = _mm_mul_ps(_mm_cvtepi32_ps(dst.ivec), _mm_cvtepi32_ps(dstfactor.ivec));
-		return Vec3<int>(_mm_cvtps_epi32(_mm_mul_ps(_mm_sub_ps(d, s), _mm_set_ps1(1.0f / 255.0f))));
+		const __m128i half = _mm_set1_epi16(1 << 3);
+
+		const __m128i srgb = _mm_add_epi16(_mm_slli_epi16(_mm_packs_epi32(source.ivec, source.ivec), 4), half);
+		const __m128i sf = _mm_add_epi16(_mm_slli_epi16(_mm_packs_epi32(srcfactor.ivec, srcfactor.ivec), 4), half);
+		const __m128i s = _mm_mulhi_epi16(srgb, sf);
+
+		const __m128i drgb = _mm_add_epi16(_mm_slli_epi16(_mm_packs_epi32(dst.ivec, dst.ivec), 4), half);
+		const __m128i df = _mm_add_epi16(_mm_slli_epi16(_mm_packs_epi32(dstfactor.ivec, dstfactor.ivec), 4), half);
+		const __m128i d = _mm_mulhi_epi16(drgb, df);
+
+		return Vec3<int>(_mm_unpacklo_epi16(_mm_max_epi16(_mm_subs_epi16(d, s), _mm_setzero_si128()), _mm_setzero_si128()));
 #else
-		return (dst.rgb() * dstfactor - source.rgb() * srcfactor) / 255;
+		Vec3<int> half = Vec3<int>::AssignToAll(1);
+		Vec3<int> lhs = ((source.rgb() * 2 + half) * (srcfactor * 2 + half)) / 1024;
+		Vec3<int> rhs = ((dst.rgb() * 2 + half) * (dstfactor * 2 + half)) / 1024;
+		return rhs - lhs;
 #endif
 	}
 
@@ -838,151 +415,25 @@ Vec3<int> AlphaBlendingResult(const Vec4<int> &source, const Vec4<int> &dst)
 						::abs(source.b() - dst.b()));
 
 	default:
-		ERROR_LOG_REPORT(G3D, "Software: Unknown blend function %x", gstate.getBlendEq());
-		return Vec3<int>();
+		return source.rgb();
 	}
 }
 
-template <bool clearMode>
-inline void DrawSinglePixel(const DrawingCoords &p, u16 z, u8 fog, const Vec4<int> &color_in) {
-	Vec4<int> prim_color = color_in.Clamp(0, 255);
-	// Depth range test - applied in clear mode, if not through mode.
-	if (!gstate.isModeThrough())
-		if (z < gstate.getDepthRangeMin() || z > gstate.getDepthRangeMax())
-			return;
-
-	if (gstate.isAlphaTestEnabled() && !clearMode)
-		if (!AlphaTestPassed(prim_color.a()))
-			return;
-
-	// Fog is applied prior to color test.
-	if (gstate.isFogEnabled() && !gstate.isModeThrough() && !clearMode) {
-		Vec3<int> fogColor = Vec3<int>::FromRGB(gstate.fogcolor);
-		fogColor = (prim_color.rgb() * (int)fog + fogColor * (255 - (int)fog)) / 255;
-		prim_color.r() = fogColor.r();
-		prim_color.g() = fogColor.g();
-		prim_color.b() = fogColor.b();
-	}
-
-	if (gstate.isColorTestEnabled() && !clearMode)
-		if (!ColorTestPassed(prim_color.rgb()))
-			return;
-
-	// In clear mode, it uses the alpha color as stencil.
-	u8 stencil = clearMode ? prim_color.a() : GetPixelStencil(p.x, p.y);
-	if (!clearMode && (gstate.isStencilTestEnabled() || gstate.isDepthTestEnabled())) {
-		if (gstate.isStencilTestEnabled() && !StencilTestPassed(stencil)) {
-			stencil = ApplyStencilOp(gstate.getStencilOpSFail(), stencil);
-			SetPixelStencil(p.x, p.y, stencil);
-			return;
-		}
-
-		// Also apply depth at the same time.  If disabled, same as passing.
-		if (gstate.isDepthTestEnabled() && !DepthTestPassed(p.x, p.y, z)) {
-			if (gstate.isStencilTestEnabled()) {
-				stencil = ApplyStencilOp(gstate.getStencilOpZFail(), stencil);
-				SetPixelStencil(p.x, p.y, stencil);
-			}
-			return;
-		} else if (gstate.isStencilTestEnabled()) {
-			stencil = ApplyStencilOp(gstate.getStencilOpZPass(), stencil);
-		}
-
-		if (gstate.isDepthTestEnabled() && gstate.isDepthWriteEnabled()) {
-			SetPixelDepth(p.x, p.y, z);
-		}
-	} else if (clearMode && gstate.isClearModeDepthMask()) {
-		SetPixelDepth(p.x, p.y, z);
-	}
-
-	const u32 old_color = GetPixelColor(p.x, p.y);
-	u32 new_color;
-
-	// Dithering happens before the logic op and regardless of framebuffer format or clear mode.
-	// We do it while alpha blending because it happens before clamping.
-	if (gstate.isAlphaBlendEnabled() && !clearMode) {
-		const Vec4<int> dst = Vec4<int>::FromRGBA(old_color);
-		Vec3<int> blended = AlphaBlendingResult(prim_color, dst);
-		if (gstate.isDitherEnabled()) {
-			blended += Vec3<int>::AssignToAll(gstate.getDitherValue(p.x, p.y));
-		}
-
-		// ToRGB() always automatically clamps.
-		new_color = blended.ToRGB();
-		new_color |= stencil << 24;
-	} else {
-		if (gstate.isDitherEnabled()) {
-			// We'll discard alpha anyway.
-			prim_color += Vec4<int>::AssignToAll(gstate.getDitherValue(p.x, p.y));
-		}
-
-#if defined(_M_SSE)
-		new_color = Vec3<int>(prim_color.ivec).ToRGB();
-		new_color |= stencil << 24;
-#else
-		new_color = Vec4<int>(prim_color.r(), prim_color.g(), prim_color.b(), stencil).ToRGBA();
-#endif
-	}
-
-	// Logic ops are applied after blending (if blending is enabled.)
-	if (gstate.isLogicOpEnabled() && !clearMode) {
-		// Logic ops don't affect stencil, which happens inside ApplyLogicOp.
-		new_color = ApplyLogicOp(gstate.getLogicOp(), old_color, new_color);
-	}
-
-	if (clearMode) {
-		new_color = (new_color & ~gstate.getClearModeColorMask()) | (old_color & gstate.getClearModeColorMask());
-	}
-	new_color = (new_color & ~gstate.getColorMask()) | (old_color & gstate.getColorMask());
-
-	SetPixelColor(p.x, p.y, new_color);
-}
-
-void DrawSinglePixelNonClear(const DrawingCoords &p, u16 z, u8 fog, const Vec4<int> &color_in) {
-	DrawSinglePixel<false>(p, z, fog, color_in);
-}
-
-static inline void ApplyTexturing(Sampler::Funcs sampler, Vec4<int> &prim_color, float s, float t, int texlevel, int frac_texlevel, bool bilinear, u8 *texptr[], int texbufw[]) {
-	int u[8] = {0}, v[8] = {0};   // 1.23.8 fixed point
-	int frac_u[2], frac_v[2];
-
-	Vec4<int> texcolor0;
-	Vec4<int> texcolor1;
-	const u8 *tptr0 = texptr[texlevel];
-	int bufw0 = texbufw[texlevel];
-	const u8 *tptr1 = texptr[texlevel + 1];
-	int bufw1 = texbufw[texlevel + 1];
+static inline Vec4IntResult SOFTRAST_CALL ApplyTexturing(float s, float t, int x, int y, Vec4IntArg prim_color, int texlevel, int frac_texlevel, bool bilinear, const RasterizerState &state) {
+	const u8 **tptr0 = const_cast<const u8 **>(&state.texptr[texlevel]);
+	const int *bufw0 = &state.texbufw[texlevel];
 
 	if (!bilinear) {
-		// Nearest filtering only.  Round texcoords.
-		GetTexelCoordinates(texlevel, s, t, u[0], v[0]);
-		if (frac_texlevel) {
-			GetTexelCoordinates(texlevel + 1, s, t, u[1], v[1]);
-		}
-
-		texcolor0 = Vec4<int>::FromRGBA(sampler.nearest(u[0], v[0], tptr0, bufw0, texlevel));
-		if (frac_texlevel) {
-			texcolor1 = Vec4<int>::FromRGBA(sampler.nearest(u[1], v[1], tptr1, bufw1, texlevel + 1));
-		}
-	} else {
-		GetTexelCoordinatesQuad(texlevel, s, t, u, v, frac_u[0], frac_v[0]);
-		if (frac_texlevel) {
-			GetTexelCoordinatesQuad(texlevel + 1, s, t, u + 4, v + 4, frac_u[1], frac_v[1]);
-		}
-
-		texcolor0 = Vec4<int>::FromRGBA(sampler.linear(u, v, frac_u[0], frac_v[0], tptr0, bufw0, texlevel));
-		if (frac_texlevel) {
-			texcolor1 = Vec4<int>::FromRGBA(sampler.linear(u + 4, v + 4, frac_u[1], frac_v[1], tptr1, bufw1, texlevel + 1));
-		}
+		return state.nearest(s, t, x, y, prim_color, tptr0, bufw0, texlevel, frac_texlevel, state.samplerID);
 	}
-
-	if (frac_texlevel) {
-		texcolor0 = (texcolor1 * frac_texlevel + texcolor0 * (256 - frac_texlevel)) / 256;
-	}
-	prim_color = GetTextureFunctionOutput(prim_color, texcolor0);
+	return state.linear(s, t, x, y, prim_color, tptr0, bufw0, texlevel, frac_texlevel, state.samplerID);
 }
 
-// Produces a signed 1.23.8 value.
+static inline Vec4IntResult SOFTRAST_CALL ApplyTexturingSingle(float s, float t, int x, int y, Vec4IntArg prim_color, int texlevel, int frac_texlevel, bool bilinear, const RasterizerState &state) {
+	return ApplyTexturing(s, t, ((x & 15) + 1) / 2, ((y & 15) + 1) / 2, prim_color, texlevel, frac_texlevel, bilinear, state);
+}
+
+// Produces a signed 1.27.4 value.
 static int TexLog2(float delta) {
 	union FloatBits {
 		float f;
@@ -991,25 +442,25 @@ static int TexLog2(float delta) {
 	FloatBits f;
 	f.f = delta;
 	// Use the exponent as the tex level, and the top mantissa bits for a frac.
-	// We can't support more than 8 bits of frac, so truncate.
-	int useful = (f.u >> 15) & 0xFFFF;
+	// We can't support more than 4 bits of frac, so truncate.
+	int useful = (f.u >> 19) & 0x0FFF;
 	// Now offset so the exponent aligns with log2f (exp=127 is 0.)
-	return useful - 127 * 256;
+	return useful - 127 * 16;
 }
 
-static inline void CalculateSamplingParams(const float ds, const float dt, const int maxTexLevel, int &level, int &levelFrac, bool &filt) {
-	const int width = gstate.getTextureWidth(0);
-	const int height = gstate.getTextureHeight(0);
+static inline void CalculateSamplingParams(const float ds, const float dt, const RasterizerState &state, int &level, int &levelFrac, bool &filt) {
+	const int width = 1 << state.samplerID.width0Shift;
+	const int height = 1 << state.samplerID.height0Shift;
 
 	// With 8 bits of fraction (because texslope can be fairly precise.)
 	int detail;
-	switch (gstate.getTexLevelMode()) {
+	switch (state.TexLevelMode()) {
 	case GE_TEXLEVEL_MODE_AUTO:
 		detail = TexLog2(std::max(ds * width, dt * height));
 		break;
 	case GE_TEXLEVEL_MODE_SLOPE:
 		// This is always offset by an extra texlevel.
-		detail = 1 * 256 + TexLog2(gstate.getTextureLodSlope());
+		detail = 1 * 16 + TexLog2(state.textureLodSlope);
 		break;
 	case GE_TEXLEVEL_MODE_CONST:
 	default:
@@ -1018,73 +469,95 @@ static inline void CalculateSamplingParams(const float ds, const float dt, const
 		break;
 	}
 
-	// Add in the bias (used in all modes), expanding to 8 bits of fraction.
-	detail += gstate.getTexLevelOffset16() << 4;
+	// Add in the bias (used in all modes), with 4 bits of fraction.
+	detail += state.texLevelOffset;
 
-	if (detail > 0 && maxTexLevel > 0) {
-		bool mipFilt = gstate.isMipmapFilteringEnabled();
+	if (detail > 0 && state.maxTexLevel > 0) {
+		bool mipFilt = state.mipFilt;
 
-		int level8 = std::min(detail, maxTexLevel * 256);
+		int level8 = std::min(detail, state.maxTexLevel * 16);
 		if (!mipFilt) {
 			// Round up at 1.5.
-			level8 += 128;
+			level8 += 8;
 		}
-		level = level8 >> 8;
-		levelFrac = mipFilt ? level8 & 0xFF : 0;
+		level = level8 >> 4;
+		levelFrac = mipFilt ? level8 & 0xF : 0;
 	} else {
 		level = 0;
 		levelFrac = 0;
 	}
 
-	if (g_Config.iTexFiltering == TEX_FILTER_FORCE_LINEAR) {
-		filt = true;
-	} else if (g_Config.iTexFiltering == TEX_FILTER_FORCE_NEAREST) {
-		filt = false;
-	} else {
-		filt = detail > 0 ? gstate.isMinifyFilteringEnabled() : gstate.isMagnifyFilteringEnabled();
-	}
+	if (detail > 0)
+		filt = state.minFilt;
+	else
+		filt = state.magFilt;
 }
 
-static inline void ApplyTexturing(Sampler::Funcs sampler, Vec4<int> *prim_color, const Vec4<float> &s, const Vec4<float> &t, int maxTexLevel, u8 *texptr[], int texbufw[]) {
+static inline void ApplyTexturing(const RasterizerState &state, Vec4<int> *prim_color, const Vec4<int> &mask, const Vec4<float> &s, const Vec4<float> &t, int x, int y) {
 	float ds = s[1] - s[0];
 	float dt = t[2] - t[0];
 
 	int level;
 	int levelFrac;
 	bool bilinear;
-	CalculateSamplingParams(ds, dt, maxTexLevel, level, levelFrac, bilinear);
+	CalculateSamplingParams(ds, dt, state, level, levelFrac, bilinear);
 
+	PROFILE_THIS_SCOPE("sampler");
 	for (int i = 0; i < 4; ++i) {
-		ApplyTexturing(sampler, prim_color[i], s[i], t[i], level, levelFrac, bilinear, texptr, texbufw);
+		if (mask[i] >= 0)
+			prim_color[i] = ApplyTexturing(s[i], t[i], ((x & 15) + 1) / 2, ((y & 15) + 1) / 2, ToVec4IntArg(prim_color[i]), level, levelFrac, bilinear, state);
 	}
 }
 
+template <bool useSSE4>
 struct TriangleEdge {
 	Vec4<int> Start(const ScreenCoords &v0, const ScreenCoords &v1, const ScreenCoords &origin);
 	inline Vec4<int> StepX(const Vec4<int> &w);
 	inline Vec4<int> StepY(const Vec4<int> &w);
 
+	inline void NarrowMinMaxX(const Vec4<int> &w, int64_t minX, int64_t &rowMinX, int64_t &rowMaxX);
+	inline Vec4<int> StepXTimes(const Vec4<int> &w, int c);
+
 	Vec4<int> stepX;
 	Vec4<int> stepY;
 };
 
-Vec4<int> TriangleEdge::Start(const ScreenCoords &v0, const ScreenCoords &v1, const ScreenCoords &origin) {
+#if defined(_M_SSE) && !PPSSPP_ARCH(X86)
+#if defined(__GNUC__) || defined(__clang__) || defined(__INTEL_COMPILER)
+[[gnu::target("sse4.1")]]
+#endif
+static inline __m128i SOFTRAST_CALL TriangleEdgeStartSSE4(__m128i initX, __m128i initY, int xf, int yf, int c) {
+	initX = _mm_mullo_epi32(initX, _mm_set1_epi32(xf));
+	initY = _mm_mullo_epi32(initY, _mm_set1_epi32(yf));
+	return _mm_add_epi32(_mm_add_epi32(initX, initY), _mm_set1_epi32(c));
+}
+#endif
+
+template <bool useSSE4>
+Vec4<int> TriangleEdge<useSSE4>::Start(const ScreenCoords &v0, const ScreenCoords &v1, const ScreenCoords &origin) {
 	// Start at pixel centers.
-	Vec4<int> initX = Vec4<int>::AssignToAll(origin.x) + Vec4<int>(7, 23, 7, 23);
-	Vec4<int> initY = Vec4<int>::AssignToAll(origin.y) + Vec4<int>(7, 7, 23, 23);
+	static constexpr int centerOff = (SCREEN_SCALE_FACTOR / 2) - 1;
+	static constexpr int centerPlus1 = SCREEN_SCALE_FACTOR + centerOff;
+	Vec4<int> initX = Vec4<int>::AssignToAll(origin.x) + Vec4<int>(centerOff, centerPlus1, centerOff, centerPlus1);
+	Vec4<int> initY = Vec4<int>::AssignToAll(origin.y) + Vec4<int>(centerOff, centerOff, centerPlus1, centerPlus1);
 
 	// orient2d refactored.
 	int xf = v0.y - v1.y;
 	int yf = v1.x - v0.x;
 	int c = v1.y * v0.x - v1.x * v0.y;
 
-	stepX = Vec4<int>::AssignToAll(xf * 16 * 2);
-	stepY = Vec4<int>::AssignToAll(yf * 16 * 2);
+	stepX = Vec4<int>::AssignToAll(xf * SCREEN_SCALE_FACTOR * 2);
+	stepY = Vec4<int>::AssignToAll(yf * SCREEN_SCALE_FACTOR * 2);
 
+#if defined(_M_SSE) && !PPSSPP_ARCH(X86)
+	if (useSSE4)
+		return TriangleEdgeStartSSE4(initX.ivec, initY.ivec, xf, yf, c);
+#endif
 	return Vec4<int>::AssignToAll(xf) * initX + Vec4<int>::AssignToAll(yf) * initY + Vec4<int>::AssignToAll(c);
 }
 
-inline Vec4<int> TriangleEdge::StepX(const Vec4<int> &w) {
+template <bool useSSE4>
+inline Vec4<int> TriangleEdge<useSSE4>::StepX(const Vec4<int> &w) {
 #if defined(_M_SSE) && !PPSSPP_ARCH(X86)
 	return _mm_add_epi32(w.ivec, stepX.ivec);
 #else
@@ -1092,12 +565,69 @@ inline Vec4<int> TriangleEdge::StepX(const Vec4<int> &w) {
 #endif
 }
 
-inline Vec4<int> TriangleEdge::StepY(const Vec4<int> &w) {
+template <bool useSSE4>
+inline Vec4<int> TriangleEdge<useSSE4>::StepY(const Vec4<int> &w) {
 #if defined(_M_SSE) && !PPSSPP_ARCH(X86)
 	return _mm_add_epi32(w.ivec, stepY.ivec);
 #else
 	return w + stepY;
 #endif
+}
+
+#if defined(_M_SSE) && !PPSSPP_ARCH(X86)
+#if defined(__GNUC__) || defined(__clang__) || defined(__INTEL_COMPILER)
+[[gnu::target("sse4.1")]]
+#endif
+static inline int SOFTRAST_CALL MaxWeightSSE4(__m128i w) {
+	__m128i max2 = _mm_max_epi32(w, _mm_shuffle_epi32(w, _MM_SHUFFLE(3, 2, 3, 2)));
+	__m128i max1 = _mm_max_epi32(max2, _mm_shuffle_epi32(max2, _MM_SHUFFLE(1, 1, 1, 1)));
+	return _mm_cvtsi128_si32(max1);
+}
+#endif
+
+template <bool useSSE4>
+void TriangleEdge<useSSE4>::NarrowMinMaxX(const Vec4<int> &w, int64_t minX, int64_t &rowMinX, int64_t &rowMaxX) {
+	int wmax;
+#if defined(_M_SSE) && !PPSSPP_ARCH(X86)
+	if (useSSE4) {
+		wmax = MaxWeightSSE4(w.ivec);
+	} else {
+		wmax = std::max(std::max(w.x, w.y), std::max(w.z, w.w));
+	}
+#else
+	wmax = std::max(std::max(w.x, w.y), std::max(w.z, w.w));
+#endif
+	if (wmax < 0) {
+		if (stepX.x > 0) {
+			int steps = -wmax / stepX.x;
+			rowMinX = std::max(rowMinX, minX + steps * SCREEN_SCALE_FACTOR * 2);
+		} else if (stepX.x <= 0) {
+			rowMinX = rowMaxX + 1;
+		}
+	}
+
+	if (wmax >= 0 && stepX.x < 0) {
+		int steps = (-wmax / stepX.x) + 1;
+		rowMaxX = std::min(rowMaxX, minX + steps * SCREEN_SCALE_FACTOR * 2);
+	}
+}
+
+#if defined(_M_SSE) && !PPSSPP_ARCH(X86)
+#if defined(__GNUC__) || defined(__clang__) || defined(__INTEL_COMPILER)
+[[gnu::target("sse4.1")]]
+#endif
+static inline __m128i SOFTRAST_CALL StepTimesSSE4(__m128i w, __m128i step, int c) {
+	return _mm_add_epi32(w, _mm_mullo_epi32(_mm_set1_epi32(c), step));
+}
+#endif
+
+template <bool useSSE4>
+inline Vec4<int> TriangleEdge<useSSE4>::StepXTimes(const Vec4<int> &w, int c) {
+#if defined(_M_SSE) && !PPSSPP_ARCH(X86)
+	if (useSSE4)
+		return StepTimesSSE4(w.ivec, stepX.ivec, c);
+#endif
+	return w + stepX * c;
 }
 
 static inline Vec4<int> MakeMask(const Vec4<int> &w0, const Vec4<int> &w1, const Vec4<int> &w2, const Vec4<int> &bias0, const Vec4<int> &bias1, const Vec4<int> &bias2, const Vec4<int> &scissor) {
@@ -1112,8 +642,23 @@ static inline Vec4<int> MakeMask(const Vec4<int> &w0, const Vec4<int> &w1, const
 #endif
 }
 
+#if defined(_M_SSE) && !PPSSPP_ARCH(X86)
+#if defined(__GNUC__) || defined(__clang__) || defined(__INTEL_COMPILER)
+[[gnu::target("sse4.1")]]
+#endif
+static inline bool SOFTRAST_CALL AnyMaskSSE4(__m128i mask) {
+	__m128i sig = _mm_srai_epi32(mask, 31);
+	return _mm_test_all_ones(sig) == 0;
+}
+#endif
+
+template <bool useSSE4>
 static inline bool AnyMask(const Vec4<int> &mask) {
 #if defined(_M_SSE) && !PPSSPP_ARCH(X86)
+	if (useSSE4) {
+		return AnyMaskSSE4(mask.ivec);
+	}
+
 	// In other words: !(mask.x < 0 && mask.y < 0 && mask.z < 0 && mask.w < 0)
 	__m128i low2 = _mm_and_si128(mask.ivec, _mm_shuffle_epi32(mask.ivec, _MM_SHUFFLE(3, 2, 3, 2)));
 	__m128i low1 = _mm_and_si128(low2, _mm_shuffle_epi32(low2, _MM_SHUFFLE(1, 1, 1, 1)));
@@ -1134,50 +679,23 @@ static inline Vec4<float> EdgeRecip(const Vec4<int> &w0, const Vec4<int> &w1, co
 #endif
 }
 
-template <bool clearMode>
+template <bool clearMode, bool useSSE4>
 void DrawTriangleSlice(
 	const VertexData& v0, const VertexData& v1, const VertexData& v2,
 	int x1, int y1, int x2, int y2,
-	bool byY, int h1, int h2)
+	const RasterizerState &state)
 {
 	Vec4<int> bias0 = Vec4<int>::AssignToAll(IsRightSideOrFlatBottomLine(v0.screenpos.xy(), v1.screenpos.xy(), v2.screenpos.xy()) ? -1 : 0);
 	Vec4<int> bias1 = Vec4<int>::AssignToAll(IsRightSideOrFlatBottomLine(v1.screenpos.xy(), v2.screenpos.xy(), v0.screenpos.xy()) ? -1 : 0);
 	Vec4<int> bias2 = Vec4<int>::AssignToAll(IsRightSideOrFlatBottomLine(v2.screenpos.xy(), v0.screenpos.xy(), v1.screenpos.xy()) ? -1 : 0);
 
-	int texbufw[8] = {0};
+	const PixelFuncID &pixelID = state.pixelID;
 
-	int maxTexLevel = gstate.getTextureMaxLevel();
-	u8 *texptr[8] = {NULL};
-
-	if (!gstate.isMipmapEnabled()) {
-		// No mipmapping enabled
-		maxTexLevel = 0;
-	}
-
-	if (gstate.isTextureMapEnabled() && !clearMode) {
-		GETextureFormat texfmt = gstate.getTextureFormat();
-		for (int i = 0; i <= maxTexLevel; i++) {
-			u32 texaddr = gstate.getTextureAddress(i);
-			texbufw[i] = GetTextureBufw(i, texaddr, texfmt);
-			if (Memory::IsValidAddress(texaddr))
-				texptr[i] = Memory::GetPointerUnchecked(texaddr);
-			else
-				texptr[i] = 0;
-		}
-	}
-
-	TriangleEdge e0;
-	TriangleEdge e1;
-	TriangleEdge e2;
+	TriangleEdge<useSSE4> e0;
+	TriangleEdge<useSSE4> e1;
+	TriangleEdge<useSSE4> e2;
 
 	int64_t minX = x1, maxX = x2, minY = y1, maxY = y2;
-	if (byY) {
-		maxY = std::min(maxY, minY + h2 * 16 * 2) - 1;
-		minY += h1 * 16 * 2;
-	} else {
-		maxX = std::min(maxX, minX + h2 * 16 * 2) - 1;
-		minX += h1 * 16 * 2;
-	}
 
 	ScreenCoords pprime(minX, minY, 0);
 	Vec4<int> w0_base = e0.Start(v1.screenpos, v2.screenpos, pprime);
@@ -1187,10 +705,18 @@ void DrawTriangleSlice(
 	// All the z values are the same, no interpolation required.
 	// This is common, and when we interpolate, we lose accuracy.
 	const bool flatZ = v0.screenpos.z == v1.screenpos.z && v0.screenpos.z == v2.screenpos.z;
+	const bool flatColorAll = clearMode || !state.shadeGouraud;
+	const bool flatColor0 = flatColorAll || (v0.color0 == v1.color0 && v0.color0 == v2.color0);
+	const bool flatColor1 = flatColorAll || (v0.color1 == v1.color1 && v0.color1 == v2.color1);
+	const bool noFog = clearMode || !pixelID.applyFog || (v0.fogdepth >= 1.0f && v1.fogdepth >= 1.0f && v2.fogdepth >= 1.0f);
 
-	Sampler::Funcs sampler = Sampler::GetFuncs();
+#if defined(SOFTGPU_MEMORY_TAGGING_DETAILED) || defined(SOFTGPU_MEMORY_TAGGING_BASIC)
+	uint32_t bpp = pixelID.FBFormat() == GE_FORMAT_8888 ? 4 : 2;
+	std::string tag = StringFromFormat("DisplayListT_%08x", state.listPC);
+	std::string ztag = StringFromFormat("DisplayListTZ_%08x", state.listPC);
+#endif
 
-	for (int64_t curY = minY; curY <= maxY; curY += 32,
+	for (int64_t curY = minY; curY <= maxY; curY += SCREEN_SCALE_FACTOR * 2,
 										w0_base = e0.StepY(w0_base),
 										w1_base = e1.StepY(w1_base),
 										w2_base = e2.StepY(w2_base)) {
@@ -1198,14 +724,25 @@ void DrawTriangleSlice(
 		Vec4<int> w1 = w1_base;
 		Vec4<int> w2 = w2_base;
 
+		DrawingCoords p = TransformUnit::ScreenToDrawing(minX, curY);
+
+		int64_t rowMinX = minX, rowMaxX = maxX;
+		e0.NarrowMinMaxX(w0, minX, rowMinX, rowMaxX);
+		e1.NarrowMinMaxX(w1, minX, rowMinX, rowMaxX);
+		e2.NarrowMinMaxX(w2, minX, rowMinX, rowMaxX);
+
+		int skipX = (rowMinX - minX) / (SCREEN_SCALE_FACTOR * 2);
+		w0 = e0.StepXTimes(w0, skipX);
+		w1 = e1.StepXTimes(w1, skipX);
+		w2 = e2.StepXTimes(w2, skipX);
+		p.x = (p.x + 2 * skipX) & 0x3FF;
+
 		// TODO: Maybe we can clip the edges instead?
-		int scissorYPlus1 = curY + 16 > maxY ? -1 : 0;
-		Vec4<int> scissor_mask = Vec4<int>(0, maxX - minX, scissorYPlus1, (maxX - minX) | scissorYPlus1);
-		Vec4<int> scissor_step = Vec4<int>(0, -32, 0, -32);
+		int scissorYPlus1 = curY + SCREEN_SCALE_FACTOR > maxY ? -1 : 0;
+		Vec4<int> scissor_mask = Vec4<int>(0, rowMaxX - rowMinX - SCREEN_SCALE_FACTOR, scissorYPlus1, (rowMaxX - rowMinX - SCREEN_SCALE_FACTOR) | scissorYPlus1);
+		Vec4<int> scissor_step = Vec4<int>(0, -(SCREEN_SCALE_FACTOR * 2), 0, -(SCREEN_SCALE_FACTOR * 2));
 
-		DrawingCoords p = TransformUnit::ScreenToDrawing(ScreenCoords(minX, curY, 0));
-
-		for (int64_t curX = minX; curX <= maxX; curX += 32,
+		for (int64_t curX = rowMinX; curX <= rowMaxX; curX += SCREEN_SCALE_FACTOR * 2,
 			w0 = e0.StepX(w0),
 			w1 = e1.StepX(w1),
 			w2 = e2.StepX(w2),
@@ -1214,39 +751,48 @@ void DrawTriangleSlice(
 
 			// If p is on or inside all edges, render pixel
 			Vec4<int> mask = MakeMask(w0, w1, w2, bias0, bias1, bias2, scissor_mask);
-			if (AnyMask(mask)) {
+			if (AnyMask<useSSE4>(mask)) {
 				Vec4<float> wsum_recip = EdgeRecip(w0, w1, w2);
 
+				// Color interpolation is not perspective corrected on the PSP.
 				Vec4<int> prim_color[4];
-				Vec3<int> sec_color[4];
-				if (gstate.getShadeMode() == GE_SHADE_GOURAUD && !clearMode) {
-					// Does the PSP do perspective-correct color interpolation? The GC doesn't.
+				if (!flatColor0) {
 					for (int i = 0; i < 4; ++i) {
-						prim_color[i] = Interpolate(v0.color0, v1.color0, v2.color0, w0[i], w1[i], w2[i], wsum_recip[i]);
-						sec_color[i] = Interpolate(v0.color1, v1.color1, v2.color1, w0[i], w1[i], w2[i], wsum_recip[i]);
+						if (mask[i] >= 0)
+							prim_color[i] = Interpolate(v0.color0, v1.color0, v2.color0, w0[i], w1[i], w2[i], wsum_recip[i]);
 					}
 				} else {
 					for (int i = 0; i < 4; ++i) {
 						prim_color[i] = v2.color0;
+					}
+				}
+				Vec3<int> sec_color[4];
+				if (!flatColor1) {
+					for (int i = 0; i < 4; ++i) {
+						if (mask[i] >= 0)
+							sec_color[i] = Interpolate(v0.color1, v1.color1, v2.color1, w0[i], w1[i], w2[i], wsum_recip[i]);
+					}
+				} else {
+					for (int i = 0; i < 4; ++i) {
 						sec_color[i] = v2.color1;
 					}
 				}
 
-				if (gstate.isTextureMapEnabled() && !clearMode) {
+				if (state.enableTextures && !clearMode) {
 					Vec4<float> s, t;
-					if (gstate.isModeThrough()) {
+					if (state.throughMode) {
 						s = Interpolate(v0.texturecoords.s(), v1.texturecoords.s(), v2.texturecoords.s(), w0, w1, w2, wsum_recip);
 						t = Interpolate(v0.texturecoords.t(), v1.texturecoords.t(), v2.texturecoords.t(), w0, w1, w2, wsum_recip);
 
 						// For levels > 0, mipmapping is always based on level 0.  Simpler to scale first.
-						s *= 1.0f / (float)gstate.getTextureWidth(0);
-						t *= 1.0f / (float)gstate.getTextureHeight(0);
+						s *= 1.0f / (float)(1 << state.samplerID.width0Shift);
+						t *= 1.0f / (float)(1 << state.samplerID.height0Shift);
 					} else {
 						// Texture coordinate interpolation must definitely be perspective-correct.
 						GetTextureCoordinates(v0, v1, v2, w0, w1, w2, wsum_recip, s, t);
 					}
 
-					ApplyTexturing(sampler, prim_color, s, t, maxTexLevel, texptr, texbufw);
+					ApplyTexturing(state, prim_color, mask, s, t, curX, curY);
 				}
 
 				if (!clearMode) {
@@ -1262,7 +808,7 @@ void DrawTriangleSlice(
 				}
 
 				Vec4<int> fog = Vec4<int>::AssignToAll(255);
-				if (gstate.isFogEnabled() && !clearMode) {
+				if (!noFog) {
 					Vec4<float> fogdepths = w0.Cast<float>() * v0.fogdepth + w1.Cast<float>() * v1.fogdepth + w2.Cast<float>() * v2.fogdepth;
 					fogdepths = fogdepths * wsum_recip;
 					for (int i = 0; i < 4; ++i) {
@@ -1274,11 +820,12 @@ void DrawTriangleSlice(
 				if (flatZ) {
 					z = Vec4<int>::AssignToAll(v2.screenpos.z);
 				} else {
-					// TODO: Is that the correct way to interpolate?
+					// Z is interpolated pretty much directly.
 					Vec4<float> zfloats = w0.Cast<float>() * v0.screenpos.z + w1.Cast<float>() * v1.screenpos.z + w2.Cast<float>() * v2.screenpos.z;
 					z = (zfloats * wsum_recip).Cast<int>();
 				}
 
+				PROFILE_THIS_SCOPE("draw_tri_px");
 				DrawingCoords subp = p;
 				for (int i = 0; i < 4; ++i) {
 					if (mask[i] < 0) {
@@ -1287,121 +834,216 @@ void DrawTriangleSlice(
 					subp.x = p.x + (i & 1);
 					subp.y = p.y + (i / 2);
 
-					DrawSinglePixel<clearMode>(subp, (u16)z[i], fog[i], prim_color[i]);
+					state.drawPixel(subp.x, subp.y, z[i], fog[i], ToVec4IntArg(prim_color[i]), pixelID);
+
+#if defined(SOFTGPU_MEMORY_TAGGING_DETAILED)
+					uint32_t row = gstate.getFrameBufAddress() + subp.y * pixelID.cached.framebufStride * bpp;
+					NotifyMemInfo(MemBlockFlags::WRITE, row + subp.x * bpp, bpp, tag.c_str(), tag.size());
+					if (pixelID.depthWrite) {
+						row = gstate.getDepthBufAddress() + subp.y * pixelID.cached.depthbufStride * 2;
+						NotifyMemInfo(MemBlockFlags::WRITE, row + subp.x * 2, 2, ztag.c_str(), ztag.size());
+					}
+#endif
 				}
 			}
 		}
 	}
+
+#if !defined(SOFTGPU_MEMORY_TAGGING_DETAILED) && defined(SOFTGPU_MEMORY_TAGGING_BASIC)
+	for (int y = minY; y <= maxY; y += SCREEN_SCALE_FACTOR) {
+		DrawingCoords p = TransformUnit::ScreenToDrawing(minX, y);
+		DrawingCoords pend = TransformUnit::ScreenToDrawing(maxX, y);
+		uint32_t row = gstate.getFrameBufAddress() + p.y * pixelID.cached.framebufStride * bpp;
+		NotifyMemInfo(MemBlockFlags::WRITE, row + p.x * bpp, (pend.x - p.x) * bpp, tag.c_str(), tag.size());
+
+		if (pixelID.depthWrite) {
+			row = gstate.getDepthBufAddress() + p.y * pixelID.cached.depthbufStride * 2;
+			NotifyMemInfo(MemBlockFlags::WRITE, row + p.x * 2, (pend.x - p.x) * 2, ztag.c_str(), ztag.size());
+		}
+	}
+#endif
 }
 
 // Draws triangle, vertices specified in counter-clockwise direction
-void DrawTriangle(const VertexData& v0, const VertexData& v1, const VertexData& v2)
-{
+void DrawTriangle(const VertexData &v0, const VertexData &v1, const VertexData &v2, const BinCoords &range, const RasterizerState &state) {
 	PROFILE_THIS_SCOPE("draw_tri");
 
-	Vec2<int> d01((int)v0.screenpos.x - (int)v1.screenpos.x, (int)v0.screenpos.y - (int)v1.screenpos.y);
-	Vec2<int> d02((int)v0.screenpos.x - (int)v2.screenpos.x, (int)v0.screenpos.y - (int)v2.screenpos.y);
-	Vec2<int> d12((int)v1.screenpos.x - (int)v2.screenpos.x, (int)v1.screenpos.y - (int)v2.screenpos.y);
+	auto drawSlice = cpu_info.bSSE4_1 ?
+		(state.pixelID.clearMode ? &DrawTriangleSlice<true, true> : &DrawTriangleSlice<false, true>) :
+		(state.pixelID.clearMode ? &DrawTriangleSlice<true, false> : &DrawTriangleSlice<false, false>);
 
-	// Drop primitives which are not in CCW order by checking the cross product
-	if (d01.x * d02.y - d01.y * d02.x < 0)
-		return;
-
-	int minX = std::min(std::min(v0.screenpos.x, v1.screenpos.x), v2.screenpos.x) & ~0xF;
-	int minY = std::min(std::min(v0.screenpos.y, v1.screenpos.y), v2.screenpos.y) & ~0xF;
-	int maxX = (std::max(std::max(v0.screenpos.x, v1.screenpos.x), v2.screenpos.x) + 0xF) & ~0xF;
-	int maxY = (std::max(std::max(v0.screenpos.y, v1.screenpos.y), v2.screenpos.y) + 0xF) & ~0xF;
-
-	DrawingCoords scissorTL(gstate.getScissorX1(), gstate.getScissorY1(), 0);
-	DrawingCoords scissorBR(gstate.getScissorX2(), gstate.getScissorY2(), 0);
-	minX = std::max(minX, (int)TransformUnit::DrawingToScreen(scissorTL).x);
-	maxX = std::min(maxX, (int)TransformUnit::DrawingToScreen(scissorBR).x);
-	minY = std::max(minY, (int)TransformUnit::DrawingToScreen(scissorTL).y);
-	maxY = std::min(maxY, (int)TransformUnit::DrawingToScreen(scissorBR).y);
-
-	// 32 because we do two pixels at once, and we don't want overlap.
-	int rangeY = (maxY - minY) / 32 + 1;
-	int rangeX = (maxX - minX) / 32 + 1;
-
-	const int MIN_LINES_PER_THREAD = 4;
-
-	if (rangeY >= 12 && rangeX >= rangeY * 4) {
-		if (gstate.isModeClear()) {
-			auto bound = [&](int a, int b) -> void {
-				DrawTriangleSlice<true>(v0, v1, v2, minX, minY, maxX, maxY, false, a, b);
-			};
-			ParallelRangeLoop(&g_threadManager, bound, 0, rangeX, MIN_LINES_PER_THREAD);
-		} else {
-			auto bound = [&](int a, int b) -> void {
-				DrawTriangleSlice<false>(v0, v1, v2, minX, minY, maxX, maxY, false, a, b);
-			};
-			ParallelRangeLoop(&g_threadManager, bound, 0, rangeX, MIN_LINES_PER_THREAD);
-		}
-	} else if (rangeY >= 12 && rangeX >= 12) {
-		if (gstate.isModeClear()) {
-			auto bound = [&](int a, int b) -> void {
-				DrawTriangleSlice<true>(v0, v1, v2, minX, minY, maxX, maxY, true, a, b);
-			};
-			ParallelRangeLoop(&g_threadManager, bound, 0, rangeY, MIN_LINES_PER_THREAD);
-		} else {
-			auto bound = [&](int a, int b) -> void {
-				DrawTriangleSlice<false>(v0, v1, v2, minX, minY, maxX, maxY, true, a, b);
-			};
-			ParallelRangeLoop(&g_threadManager, bound, 0, rangeY, MIN_LINES_PER_THREAD);
-		}
-	} else {
-		if (gstate.isModeClear()) {
-			DrawTriangleSlice<true>(v0, v1, v2, minX, minY, maxX, maxY, true, 0, rangeY);
-		} else {
-			DrawTriangleSlice<false>(v0, v1, v2, minX, minY, maxX, maxY, true, 0, rangeY);
-		}
-	}
+	drawSlice(v0, v1, v2, range.x1, range.y1, range.x2, range.y2, state);
 }
 
-void DrawPoint(const VertexData &v0)
-{
+void DrawRectangle(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state) {
+	int entireX1 = std::min(v0.screenpos.x, v1.screenpos.x);
+	int entireY1 = std::min(v0.screenpos.y, v1.screenpos.y);
+	int entireX2 = std::max(v0.screenpos.x, v1.screenpos.x) - 1;
+	int entireY2 = std::max(v0.screenpos.y, v1.screenpos.y) - 1;
+	int minX = std::max(entireX1, range.x1) | (SCREEN_SCALE_FACTOR / 2 - 1);
+	int minY = std::max(entireY1, range.y1) | (SCREEN_SCALE_FACTOR / 2 - 1);
+	int maxX = std::min(entireX2, range.x2);
+	int maxY = std::min(entireY2, range.y2);
+
+	Vec2f rowST(0.0f, 0.0f);
+	// Note: this is double the x or y movement.
+	Vec2f stx(0.0f, 0.0f);
+	Vec2f sty(0.0f, 0.0f);
+	if (state.enableTextures) {
+		Vec2f tc0 = v0.texturecoords;
+		Vec2f tc1 = v1.texturecoords;
+		if (state.throughMode) {
+			// For levels > 0, mipmapping is always based on level 0.  Simpler to scale first.
+			tc0.s() *= 1.0f / (float)(1 << state.samplerID.width0Shift);
+			tc1.s() *= 1.0f / (float)(1 << state.samplerID.width0Shift);
+			tc0.t() *= 1.0f / (float)(1 << state.samplerID.height0Shift);
+			tc1.t() *= 1.0f / (float)(1 << state.samplerID.height0Shift);
+		}
+
+		int diffX = (entireX2 - entireX1 + 1) / SCREEN_SCALE_FACTOR;
+		int diffY = (entireY2 - entireY1 + 1) / SCREEN_SCALE_FACTOR;
+		float diffS = tc1.s() - tc0.s();
+		float diffT = tc1.t() - tc0.t();
+
+		if (v0.screenpos.x < v1.screenpos.x) {
+			if (v0.screenpos.y < v1.screenpos.y) {
+				// Okay, simple, TL -> BR.  S and T move toward v1 with X and Y.
+				rowST = tc0;
+				stx = Vec2f(2.0f * diffS / diffX, 0.0f);
+				sty = Vec2f(0.0f, 2.0f * diffT / diffY);
+			} else {
+				// BL to TR, rotated.  We start at TL still.
+				// X moves T (not S) toward v1, and Y moves S away from v1.
+				rowST = Vec2f(tc1.s(), tc0.t());
+				stx = Vec2f(0.0f, 2.0f * diffT / diffX);
+				sty = Vec2f(2.0f * -diffS / diffY, 0.0f);
+			}
+		} else {
+			if (v0.screenpos.y < v1.screenpos.y) {
+				// TR to BL.  Like BL to TR, rotated.
+				// X moves T (not s) away from v1, and Y moves S toward v1.
+				rowST = Vec2f(tc0.s(), tc1.t());
+				stx = Vec2f(0.0f, 2.0f * -diffT / diffX);
+				sty = Vec2f(2.0f * diffS / diffY, 0.0f);
+			} else {
+				// BR to TL, just inverse of TL to BR.
+				rowST = Vec2f(tc1.s(), tc1.t());
+				stx = Vec2f(2.0f * -diffS / diffX, 0.0f);
+				sty = Vec2f(0.0f, 2.0f * -diffT / diffY);
+			}
+		}
+
+		// Okay, now move ST to the minX, minY position.
+		rowST += (stx / (float)(SCREEN_SCALE_FACTOR * 2)) * (minX - entireX1);
+		rowST += (sty / (float)(SCREEN_SCALE_FACTOR * 2)) * (minY - entireY1);
+	}
+
+	// And now what we add to spread out to 4 values.
+	const Vec4f sto4(0.0f, 0.5f * stx.s(), 0.5f * sty.s(), 0.5f * stx.s() + 0.5f * sty.s());
+	const Vec4f tto4(0.0f, 0.5f * stx.t(), 0.5f * sty.t(), 0.5f * stx.t() + 0.5f * sty.t());
+
+	ScreenCoords pprime(minX, minY, 0);
+	Vec4<int> fog = Vec4<int>::AssignToAll(ClampFogDepth(v1.fogdepth));
+	Vec4<int> z = Vec4<int>::AssignToAll(v1.screenpos.z);
+	Vec3<int> sec_color = v1.color1;
+
+#if defined(SOFTGPU_MEMORY_TAGGING_DETAILED) || defined(SOFTGPU_MEMORY_TAGGING_BASIC)
+	uint32_t bpp = state.pixelID.FBFormat() == GE_FORMAT_8888 ? 4 : 2;
+	std::string tag = StringFromFormat("DisplayListR_%08x", state.listPC);
+	std::string ztag = StringFromFormat("DisplayListRZ_%08x", state.listPC);
+#endif
+
+	for (int64_t curY = minY; curY <= maxY; curY += SCREEN_SCALE_FACTOR * 2, rowST += sty) {
+		DrawingCoords p = TransformUnit::ScreenToDrawing(range.x1, curY);
+
+		int scissorY2 = curY + SCREEN_SCALE_FACTOR > maxY ? -1 : 0;
+		Vec4<int> scissor_mask = Vec4<int>(0, maxX - minX - SCREEN_SCALE_FACTOR, scissorY2, (maxX - minX - SCREEN_SCALE_FACTOR) | scissorY2);
+		Vec4<int> scissor_step = Vec4<int>(0, -(SCREEN_SCALE_FACTOR * 2), 0, -(SCREEN_SCALE_FACTOR * 2));
+		Vec2f st = rowST;
+
+		for (int64_t curX = minX; curX <= maxX; curX += SCREEN_SCALE_FACTOR * 2,
+			st += stx,
+			scissor_mask += scissor_step,
+			p.x = (p.x + 2) & 0x3FF) {
+			Vec4<int> mask = scissor_mask;
+
+			Vec4<int> prim_color[4];
+			for (int i = 0; i < 4; ++i) {
+				prim_color[i] = v1.color0;
+			}
+
+			if (state.enableTextures) {
+				Vec4<float> s, t;
+				s = Vec4<float>::AssignToAll(st.s()) + sto4;
+				t = Vec4<float>::AssignToAll(st.t()) + tto4;
+
+				ApplyTexturing(state, prim_color, mask, s, t, curX, curY);
+			}
+
+			if (!state.pixelID.clearMode) {
+				for (int i = 0; i < 4; ++i) {
+#if defined(_M_SSE)
+					// TODO: Tried making Vec4 do this, but things got slower.
+					const __m128i sec = _mm_and_si128(sec_color.ivec, _mm_set_epi32(0, -1, -1, -1));
+					prim_color[i].ivec = _mm_add_epi32(prim_color[i].ivec, sec);
+#else
+					prim_color[i] += Vec4<int>(sec_color, 0);
+#endif
+				}
+			}
+
+			PROFILE_THIS_SCOPE("draw_rect_px");
+			DrawingCoords subp = p;
+			for (int i = 0; i < 4; ++i) {
+				if (mask[i] < 0) {
+					continue;
+				}
+				subp.x = p.x + (i & 1);
+				subp.y = p.y + (i / 2);
+
+				state.drawPixel(subp.x, subp.y, z[i], fog[i], ToVec4IntArg(prim_color[i]), state.pixelID);
+
+#if defined(SOFTGPU_MEMORY_TAGGING_DETAILED)
+				uint32_t row = gstate.getFrameBufAddress() + subp.y * state.pixelID.cached.framebufStride * bpp;
+				NotifyMemInfo(MemBlockFlags::WRITE, row + subp.x * bpp, bpp, tag.c_str(), tag.size());
+				if (state.pixelID.depthWrite) {
+					row = gstate.getDepthBufAddress() + subp.y * state.pixelID.cached.depthbufStride * 2;
+					NotifyMemInfo(MemBlockFlags::WRITE, row + subp.x * 2, 2, ztag.c_str(), ztag.size());
+				}
+#endif
+			}
+		}
+	}
+
+#if !defined(SOFTGPU_MEMORY_TAGGING_DETAILED) && defined(SOFTGPU_MEMORY_TAGGING_BASIC)
+	for (int y = minY; y <= maxY; y += SCREEN_SCALE_FACTOR) {
+		DrawingCoords p = TransformUnit::ScreenToDrawing(minX, y);
+		DrawingCoords pend = TransformUnit::ScreenToDrawing(maxX, y);
+		uint32_t row = gstate.getFrameBufAddress() + p.y * state.pixelID.cached.framebufStride * bpp;
+		NotifyMemInfo(MemBlockFlags::WRITE, row + p.x * bpp, (pend.x - p.x) * bpp, tag.c_str(), tag.size());
+
+		if (state.pixelID.depthWrite) {
+			row = gstate.getDepthBufAddress() + p.y * state.pixelID.cached.depthbufStride * 2;
+			NotifyMemInfo(MemBlockFlags::WRITE, row + p.x * 2, (pend.x - p.x) * 2, ztag.c_str(), ztag.size());
+		}
+	}
+#endif
+}
+
+void DrawPoint(const VertexData &v0, const BinCoords &range, const RasterizerState &state) {
 	ScreenCoords pos = v0.screenpos;
 	Vec4<int> prim_color = v0.color0;
 	Vec3<int> sec_color = v0.color1;
 
-	ScreenCoords scissorTL(TransformUnit::DrawingToScreen(DrawingCoords(gstate.getScissorX1(), gstate.getScissorY1(), 0)));
-	ScreenCoords scissorBR(TransformUnit::DrawingToScreen(DrawingCoords(gstate.getScissorX2(), gstate.getScissorY2(), 0)));
+	auto &pixelID = state.pixelID;
+	auto &samplerID = state.samplerID;
 
-	if (pos.x < scissorTL.x || pos.y < scissorTL.y || pos.x > scissorBR.x || pos.y > scissorBR.y)
-		return;
-
-	bool clearMode = gstate.isModeClear();
-
-	Sampler::Funcs sampler = Sampler::GetFuncs();
-
-	if (gstate.isTextureMapEnabled() && !clearMode) {
-		int texbufw[8] = {0};
-
-		int maxTexLevel = gstate.getTextureMaxLevel();
-		u8 *texptr[8] = {NULL};
-
-		if (!gstate.isMipmapEnabled()) {
-			// No mipmapping enabled
-			maxTexLevel = 0;
-		}
-
-		if (gstate.isTextureMapEnabled() && !clearMode) {
-			GETextureFormat texfmt = gstate.getTextureFormat();
-			for (int i = 0; i <= maxTexLevel; i++) {
-				u32 texaddr = gstate.getTextureAddress(i);
-				texbufw[i] = GetTextureBufw(i, texaddr, texfmt);
-				if (Memory::IsValidAddress(texaddr))
-					texptr[i] = Memory::GetPointerUnchecked(texaddr);
-				else
-					texptr[i] = 0;
-			}
-		}
-
+	if (state.enableTextures) {
 		float s = v0.texturecoords.s();
 		float t = v0.texturecoords.t();
-		if (gstate.isModeThrough()) {
-			s *= 1.0f / (float)gstate.getTextureWidth(0);
-			t *= 1.0f / (float)gstate.getTextureHeight(0);
+		if (state.throughMode) {
+			s *= 1.0f / (float)(1 << state.samplerID.width0Shift);
+			t *= 1.0f / (float)(1 << state.samplerID.height0Shift);
 		} else {
 			// Texture coordinate interpolation must definitely be perspective-correct.
 			GetTextureCoordinates(v0, v0, 0.0f, s, t);
@@ -1410,93 +1052,133 @@ void DrawPoint(const VertexData &v0)
 		int texLevel;
 		int texLevelFrac;
 		bool bilinear;
-		CalculateSamplingParams(0.0f, 0.0f, maxTexLevel, texLevel, texLevelFrac, bilinear);
-		ApplyTexturing(sampler, prim_color, s, t, texLevel, texLevelFrac, bilinear, texptr, texbufw);
+		CalculateSamplingParams(0.0f, 0.0f, state, texLevel, texLevelFrac, bilinear);
+		PROFILE_THIS_SCOPE("sampler");
+		prim_color = ApplyTexturingSingle(s, t, pos.x, pos.y, ToVec4IntArg(prim_color), texLevel, texLevelFrac, bilinear, state);
 	}
 
-	if (!clearMode)
+	if (!pixelID.clearMode)
 		prim_color += Vec4<int>(sec_color, 0);
 
-	ScreenCoords pprime = pos;
-
-	DrawingCoords p = TransformUnit::ScreenToDrawing(pprime);
+	DrawingCoords p = TransformUnit::ScreenToDrawing(pos);
 	u16 z = pos.z;
 
 	u8 fog = 255;
-	if (gstate.isFogEnabled() && !clearMode) {
+	if (pixelID.applyFog) {
 		fog = ClampFogDepth(v0.fogdepth);
 	}
 
-	if (clearMode) {
-		DrawSinglePixel<true>(p, z, fog, prim_color);
-	} else {
-		DrawSinglePixel<false>(p, z, fog, prim_color);
+	PROFILE_THIS_SCOPE("draw_px");
+	state.drawPixel(p.x, p.y, z, fog, ToVec4IntArg(prim_color), pixelID);
+
+#if defined(SOFTGPU_MEMORY_TAGGING_DETAILED) || defined(SOFTGPU_MEMORY_TAGGING_BASIC)
+	uint32_t bpp = pixelID.FBFormat() == GE_FORMAT_8888 ? 4 : 2;
+	std::string tag = StringFromFormat("DisplayListP_%08x", state.listPC);
+
+	uint32_t row = gstate.getFrameBufAddress() + p.y * pixelID.cached.framebufStride * bpp;
+	NotifyMemInfo(MemBlockFlags::WRITE, row + p.x * bpp, bpp, tag.c_str(), tag.size());
+
+	if (pixelID.depthWrite) {
+		std::string ztag = StringFromFormat("DisplayListPZ_%08x", state.listPC);
+		row = gstate.getDepthBufAddress() + p.y * pixelID.cached.depthbufStride * 2;
+		NotifyMemInfo(MemBlockFlags::WRITE, row + p.x * 2, 2, ztag.c_str(), ztag.size());
 	}
+#endif
 }
 
-void ClearRectangle(const VertexData &v0, const VertexData &v1)
-{
-	int minX = std::min(v0.screenpos.x, v1.screenpos.x) & ~0xF;
-	int minY = std::min(v0.screenpos.y, v1.screenpos.y) & ~0xF;
-	int maxX = (std::max(v0.screenpos.x, v1.screenpos.x) + 0xF) & ~0xF;
-	int maxY = (std::max(v0.screenpos.y, v1.screenpos.y) + 0xF) & ~0xF;
+void ClearRectangle(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state) {
+	DrawingCoords pprime = TransformUnit::ScreenToDrawing(range.x1, range.y1);
+	DrawingCoords pend = TransformUnit::ScreenToDrawing(range.x2, range.y2);
+	auto &pixelID = state.pixelID;
+	auto &samplerID = state.samplerID;
 
-	DrawingCoords scissorTL(gstate.getScissorX1(), gstate.getScissorY1(), 0);
-	DrawingCoords scissorBR(gstate.getScissorX2(), gstate.getScissorY2(), 0);
-	minX = std::max(minX, (int)TransformUnit::DrawingToScreen(scissorTL).x);
-	maxX = std::max(0, std::min(maxX, (int)TransformUnit::DrawingToScreen(scissorBR).x + 16));
-	minY = std::max(minY, (int)TransformUnit::DrawingToScreen(scissorTL).y);
-	maxY = std::max(0, std::min(maxY, (int)TransformUnit::DrawingToScreen(scissorBR).y + 16));
-
-	const int w = (maxX - minX) / 16;
+	// Min and max are in PSP fixed point screen coordinates, 16 here is for the 4 subpixel bits.
+	const int w = (range.x2 - range.x1 + 1) / SCREEN_SCALE_FACTOR;
 	if (w <= 0)
 		return;
 
-	if (gstate.isClearModeDepthMask()) {
-		ScreenCoords pprime(minX, minY, 0);
+	if (pixelID.DepthClear()) {
 		const u16 z = v1.screenpos.z;
-		const int stride = gstate.DepthBufStride();
+		const int stride = pixelID.cached.depthbufStride;
 
-		for (pprime.y = minY; pprime.y < maxY; pprime.y += 16) {
-			DrawingCoords p = TransformUnit::ScreenToDrawing(pprime);
-
-			if ((z & 0xFF) == (z >> 8)) {
-				u16 *row = &depthbuf.as16[p.x + p.y * stride];
+		// If both bytes of Z equal, we can just use memset directly which is faster.
+		if ((z & 0xFF) == (z >> 8)) {
+			DrawingCoords p = pprime;
+			for (p.y = pprime.y; p.y <= pend.y; ++p.y) {
+				u16 *row = depthbuf.Get16Ptr(p.x, p.y, stride);
 				memset(row, z, w * 2);
-			} else {
+			}
+		} else {
+			DrawingCoords p = pprime;
+			for (p.y = pprime.y; p.y <= pend.y; ++p.y) {
 				for (int x = 0; x < w; ++x) {
-					SetPixelDepth(p.x + x, p.y, z);
+					SetPixelDepth(p.x + x, p.y, pixelID.cached.depthbufStride, z);
 				}
 			}
 		}
+
+#if defined(SOFTGPU_MEMORY_TAGGING_DETAILED) || defined(SOFTGPU_MEMORY_TAGGING_BASIC)
+		std::string tag = StringFromFormat("DisplayListXZ_%08x", state.listPC);
+		for (int y = pprime.y; y <= pend.y; ++y) {
+			uint32_t row = gstate.getDepthBufAddress() + y * pixelID.cached.depthbufStride * 2;
+			NotifyMemInfo(MemBlockFlags::WRITE, row + pprime.x * 2, w * 2, tag.c_str(), tag.size());
+		}
+#endif
 	}
 
 	// Note: this stays 0xFFFFFFFF if keeping color and alpha, even for 16-bit.
 	u32 keepOldMask = 0xFFFFFFFF;
-	if (gstate.isClearModeColorMask())
-		keepOldMask &= 0xFF000000;
-	if (gstate.isClearModeAlphaMask())
-		keepOldMask &= 0x00FFFFFF;
+	if (pixelID.ColorClear() && pixelID.StencilClear()) {
+		keepOldMask = 0;
+	} else {
+		switch (pixelID.FBFormat()) {
+		case GE_FORMAT_565:
+			if (pixelID.ColorClear())
+				keepOldMask = 0;
+			break;
+
+		case GE_FORMAT_5551:
+			if (pixelID.ColorClear())
+				keepOldMask = 0xFFFF8000;
+			else if (pixelID.StencilClear())
+				keepOldMask = 0xFFFF7FFF;
+			break;
+
+		case GE_FORMAT_4444:
+			if (pixelID.ColorClear())
+				keepOldMask = 0xFFFFF000;
+			else if (pixelID.StencilClear())
+				keepOldMask = 0xFFFF0FFF;
+			break;
+
+		case GE_FORMAT_8888:
+		default:
+			if (pixelID.ColorClear())
+				keepOldMask = 0xFF000000;
+			else if (pixelID.StencilClear())
+				keepOldMask = 0x00FFFFFF;
+			break;
+		}
+	}
 
 	// The pixel write masks are respected in clear mode.
-	keepOldMask |= gstate.getColorMask();
+	if (pixelID.applyColorWriteMask) {
+		keepOldMask |= pixelID.cached.colorWriteMask;
+	}
 
 	const u32 new_color = v1.color0.ToRGBA();
 	u16 new_color16;
-	switch (gstate.FrameBufFormat()) {
+	switch (pixelID.FBFormat()) {
 	case GE_FORMAT_565:
 		new_color16 = RGBA8888ToRGB565(new_color);
-		keepOldMask = keepOldMask == 0 ? 0 : (0xFFFF0000 | RGBA8888ToRGB565(keepOldMask));
 		break;
 
 	case GE_FORMAT_5551:
 		new_color16 = RGBA8888ToRGBA5551(new_color);
-		keepOldMask = keepOldMask == 0 ? 0 : (0xFFFF0000 | RGBA8888ToRGBA5551(keepOldMask));
 		break;
 
 	case GE_FORMAT_4444:
 		new_color16 = RGBA8888ToRGBA4444(new_color);
-		keepOldMask = keepOldMask == 0 ? 0 : (0xFFFF0000 | RGBA8888ToRGBA4444(keepOldMask));
 		break;
 
 	case GE_FORMAT_8888:
@@ -1509,28 +1191,35 @@ void ClearRectangle(const VertexData &v0, const VertexData &v1)
 	}
 
 	if (keepOldMask == 0) {
-		ScreenCoords pprime(minX, minY, 0);
-		const int stride = gstate.FrameBufStride();
+		const int stride = pixelID.cached.framebufStride;
 
-		if (gstate.FrameBufFormat() == GE_FORMAT_8888) {
-			for (pprime.y = minY; pprime.y < maxY; pprime.y += 16) {
-				DrawingCoords p = TransformUnit::ScreenToDrawing(pprime);
-				if ((new_color & 0xFF) == (new_color >> 8) && (new_color & 0xFFFF) == (new_color >> 16)) {
-					u32 *row = &fb.as32[p.x + p.y * stride];
+		if (pixelID.FBFormat() == GE_FORMAT_8888) {
+			const bool canMemsetColor = (new_color & 0xFF) == (new_color >> 8) && (new_color & 0xFFFF) == (new_color >> 16);
+			if (canMemsetColor) {
+				DrawingCoords p = pprime;
+				for (p.y = pprime.y; p.y <= pend.y; ++p.y) {
+					u32 *row = fb.Get32Ptr(p.x, p.y, stride);
 					memset(row, new_color, w * 4);
-				} else {
+				}
+			} else {
+				DrawingCoords p = pprime;
+				for (p.y = pprime.y; p.y <= pend.y; ++p.y) {
 					for (int x = 0; x < w; ++x) {
 						fb.Set32(p.x + x, p.y, stride, new_color);
 					}
 				}
 			}
 		} else {
-			for (pprime.y = minY; pprime.y < maxY; pprime.y += 16) {
-				DrawingCoords p = TransformUnit::ScreenToDrawing(pprime);
-				if ((new_color16 & 0xFF) == (new_color16 >> 8)) {
-					u16 *row = &fb.as16[p.x + p.y * stride];
+			const bool canMemsetColor = (new_color16 & 0xFF) == (new_color16 >> 8);
+			if (canMemsetColor) {
+				DrawingCoords p = pprime;
+				for (p.y = pprime.y; p.y <= pend.y; ++p.y) {
+					u16 *row = fb.Get16Ptr(p.x, p.y, stride);
 					memset(row, new_color16, w * 2);
-				} else {
+				}
+			} else {
+				DrawingCoords p = pprime;
+				for (p.y = pprime.y; p.y <= pend.y; ++p.y) {
 					for (int x = 0; x < w; ++x) {
 						fb.Set16(p.x + x, p.y, stride, new_color16);
 					}
@@ -1538,12 +1227,11 @@ void ClearRectangle(const VertexData &v0, const VertexData &v1)
 			}
 		}
 	} else if (keepOldMask != 0xFFFFFFFF) {
-		ScreenCoords pprime(minX, minY, 0);
-		const int stride = gstate.FrameBufStride();
+		const int stride = pixelID.cached.framebufStride;
 
-		if (gstate.FrameBufFormat() == GE_FORMAT_8888) {
-			for (pprime.y = minY; pprime.y < maxY; pprime.y += 16) {
-				DrawingCoords p = TransformUnit::ScreenToDrawing(pprime);
+		if (pixelID.FBFormat() == GE_FORMAT_8888) {
+			DrawingCoords p = pprime;
+			for (p.y = pprime.y; p.y <= pend.y; ++p.y) {
 				for (int x = 0; x < w; ++x) {
 					const u32 old_color = fb.Get32(p.x + x, p.y, stride);
 					const u32 c = (old_color & keepOldMask) | (new_color & ~keepOldMask);
@@ -1551,8 +1239,8 @@ void ClearRectangle(const VertexData &v0, const VertexData &v1)
 				}
 			}
 		} else {
-			for (pprime.y = minY; pprime.y < maxY; pprime.y += 16) {
-				DrawingCoords p = TransformUnit::ScreenToDrawing(pprime);
+			DrawingCoords p = pprime;
+			for (p.y = pprime.y; p.y <= pend.y; ++p.y) {
 				for (int x = 0; x < w; ++x) {
 					const u16 old_color = fb.Get16(p.x + x, p.y, stride);
 					const u16 c = (old_color & keepOldMask) | (new_color16 & ~keepOldMask);
@@ -1561,10 +1249,20 @@ void ClearRectangle(const VertexData &v0, const VertexData &v1)
 			}
 		}
 	}
+
+#if defined(SOFTGPU_MEMORY_TAGGING_DETAILED) || defined(SOFTGPU_MEMORY_TAGGING_BASIC)
+	if (keepOldMask != 0xFFFFFFFF) {
+		uint32_t bpp = pixelID.FBFormat() == GE_FORMAT_8888 ? 4 : 2;
+		std::string tag = StringFromFormat("DisplayListX_%08x", state.listPC);
+		for (int y = pprime.y; y < pend.y; ++y) {
+			uint32_t row = gstate.getFrameBufAddress() + y * pixelID.cached.framebufStride * bpp;
+			NotifyMemInfo(MemBlockFlags::WRITE, row + pprime.x * bpp, w * bpp, tag.c_str(), tag.size());
+		}
+	}
+#endif
 }
 
-void DrawLine(const VertexData &v0, const VertexData &v1)
-{
+void DrawLine(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state) {
 	// TODO: Use a proper line drawing algorithm that handles fractional endpoints correctly.
 	Vec3<int> a(v0.screenpos.x, v0.screenpos.y, v0.screenpos.z);
 	Vec3<int> b(v1.screenpos.x, v1.screenpos.y, v0.screenpos.z);
@@ -1575,49 +1273,40 @@ void DrawLine(const VertexData &v0, const VertexData &v1)
 
 	int steps;
 	if (abs(dx) < abs(dy))
-		steps = abs(dy) / 16;
+		steps = abs(dy) / SCREEN_SCALE_FACTOR;
 	else
-		steps = abs(dx) / 16;
+		steps = abs(dx) / SCREEN_SCALE_FACTOR;
 
-	float xinc = (float)dx / steps;
-	float yinc = (float)dy / steps;
-	float zinc = (float)dz / steps;
+	// Avoid going too far since we typically don't start at the pixel center.
+	if (dx < 0 && dx >= -SCREEN_SCALE_FACTOR)
+		dx++;
+	if (dy < 0 && dy >= -SCREEN_SCALE_FACTOR)
+		dy++;
 
-	ScreenCoords scissorTL(TransformUnit::DrawingToScreen(DrawingCoords(gstate.getScissorX1(), gstate.getScissorY1(), 0)));
-	ScreenCoords scissorBR(TransformUnit::DrawingToScreen(DrawingCoords(gstate.getScissorX2(), gstate.getScissorY2(), 0)));
-	bool clearMode = gstate.isModeClear();
+	double xinc = (double)dx / steps;
+	double yinc = (double)dy / steps;
+	double zinc = (double)dz / steps;
 
-	int texbufw[8] = {0};
+	auto &pixelID = state.pixelID;
+	auto &samplerID = state.samplerID;
 
-	int maxTexLevel = gstate.getTextureMaxLevel();
-	u8 *texptr[8] = {NULL};
+	const bool interpolateColor = !state.shadeGouraud || (v0.color0 == v1.color0 && v0.color1 == v1.color1);
 
-	if (!gstate.isMipmapEnabled()) {
-		// No mipmapping enabled
-		maxTexLevel = 0;
-	}
+#if defined(SOFTGPU_MEMORY_TAGGING_DETAILED) || defined(SOFTGPU_MEMORY_TAGGING_BASIC)
+	std::string tag = StringFromFormat("DisplayListL_%08x", state.listPC);
+	std::string ztag = StringFromFormat("DisplayListLZ_%08x", state.listPC);
+#endif
 
-	if (gstate.isTextureMapEnabled() && !clearMode) {
-		GETextureFormat texfmt = gstate.getTextureFormat();
-		for (int i = 0; i <= maxTexLevel; i++) {
-			u32 texaddr = gstate.getTextureAddress(i);
-			texbufw[i] = GetTextureBufw(i, texaddr, texfmt);
-			texptr[i] = Memory::GetPointer(texaddr);
-		}
-	}
-
-	Sampler::Funcs sampler = Sampler::GetFuncs();
-
-	float x = a.x > b.x ? a.x - 1 : a.x;
-	float y = a.y > b.y ? a.y - 1 : a.y;
-	float z = a.z;
+	double x = a.x > b.x ? a.x - 1 : a.x;
+	double y = a.y > b.y ? a.y - 1 : a.y;
+	double z = a.z;
 	const int steps1 = steps == 0 ? 1 : steps;
 	for (int i = 0; i < steps; i++) {
-		if (x >= scissorTL.x && y >= scissorTL.y && x <= scissorBR.x && y <= scissorBR.y) {
+		if (x >= range.x1 && y >= range.y1 && x <= range.x2 && y <= range.y2) {
 			// Interpolate between the two points.
 			Vec4<int> prim_color;
 			Vec3<int> sec_color;
-			if (gstate.getShadeMode() == GE_SHADE_GOURAUD) {
+			if (interpolateColor) {
 				prim_color = (v0.color0 * (steps - i) + v1.color0 * i) / steps1;
 				sec_color = (v0.color1 * (steps - i) + v1.color1 * i) / steps1;
 			} else {
@@ -1626,27 +1315,27 @@ void DrawLine(const VertexData &v0, const VertexData &v1)
 			}
 
 			u8 fog = 255;
-			if (gstate.isFogEnabled() && !clearMode) {
+			if (pixelID.applyFog) {
 				fog = ClampFogDepth((v0.fogdepth * (float)(steps - i) + v1.fogdepth * (float)i) / steps1);
 			}
 
-			if (gstate.isAntiAliasEnabled()) {
+			if (state.antialiasLines) {
 				// TODO: Clearmode?
 				// TODO: Calculate.
 				prim_color.a() = 0x7F;
 			}
 
-			if (gstate.isTextureMapEnabled() && !clearMode) {
+			if (state.enableTextures) {
 				float s, s1;
 				float t, t1;
-				if (gstate.isModeThrough()) {
+				if (state.throughMode) {
 					Vec2<float> tc = (v0.texturecoords * (float)(steps - i) + v1.texturecoords * (float)i) / steps1;
 					Vec2<float> tc1 = (v0.texturecoords * (float)(steps - i - 1) + v1.texturecoords * (float)(i + 1)) / steps1;
 
-					s = tc.s() * (1.0f / (float)gstate.getTextureWidth(0));
-					s1 = tc1.s() * (1.0f / (float)gstate.getTextureWidth(0));
-					t = tc.t() * (1.0f / (float)gstate.getTextureHeight(0));
-					t1 = tc1.t() * (1.0f / (float)gstate.getTextureHeight(0));
+					s = tc.s() * (1.0f / (float)(1 << state.samplerID.width0Shift));
+					s1 = tc1.s() * (1.0f / (float)(1 << state.samplerID.width0Shift));
+					t = tc.t() * (1.0f / (float)(1 << state.samplerID.height0Shift));
+					t1 = tc1.t() * (1.0f / (float)(1 << state.samplerID.height0Shift));
 				} else {
 					// Texture coordinate interpolation must definitely be perspective-correct.
 					GetTextureCoordinates(v0, v1, (float)(steps - i) / steps1, s, t);
@@ -1654,59 +1343,50 @@ void DrawLine(const VertexData &v0, const VertexData &v1)
 				}
 
 				// If inc is 0, force the delta to zero.
-				float ds = xinc == 0.0f ? 0.0f : (s1 - s) * 16.0f * (1.0f / xinc);
-				float dt = yinc == 0.0f ? 0.0f : (t1 - t) * 16.0f * (1.0f / yinc);
+				float ds = xinc == 0.0 ? 0.0f : (s1 - s) * (float)SCREEN_SCALE_FACTOR * (1.0f / xinc);
+				float dt = yinc == 0.0 ? 0.0f : (t1 - t) * (float)SCREEN_SCALE_FACTOR * (1.0f / yinc);
 
 				int texLevel;
 				int texLevelFrac;
 				bool texBilinear;
-				CalculateSamplingParams(ds, dt, maxTexLevel, texLevel, texLevelFrac, texBilinear);
+				CalculateSamplingParams(ds, dt, state, texLevel, texLevelFrac, texBilinear);
 
-				if (gstate.isAntiAliasEnabled()) {
-					// TODO: This is a niave and wrong implementation.
-					DrawingCoords p0 = TransformUnit::ScreenToDrawing(ScreenCoords((int)x, (int)y, (int)z));
+				if (state.antialiasLines) {
+					// TODO: This is a naive and wrong implementation.
+					DrawingCoords p0 = TransformUnit::ScreenToDrawing(x, y);
 					s = ((float)p0.x + xinc / 32.0f) / 512.0f;
 					t = ((float)p0.y + yinc / 32.0f) / 512.0f;
 
 					texBilinear = true;
 				}
 
-				ApplyTexturing(sampler, prim_color, s, t, texLevel, texLevelFrac, texBilinear, texptr, texbufw);
+				PROFILE_THIS_SCOPE("sampler");
+				prim_color = ApplyTexturingSingle(s, t, x, y, ToVec4IntArg(prim_color), texLevel, texLevelFrac, texBilinear, state);
 			}
 
-			if (!clearMode)
+			if (!pixelID.clearMode)
 				prim_color += Vec4<int>(sec_color, 0);
 
-			ScreenCoords pprime = ScreenCoords((int)x, (int)y, (int)z);
+			PROFILE_THIS_SCOPE("draw_px");
+			DrawingCoords p = TransformUnit::ScreenToDrawing(x, y);
+			state.drawPixel(p.x, p.y, z, fog, ToVec4IntArg(prim_color), pixelID);
 
-			DrawingCoords p = TransformUnit::ScreenToDrawing(pprime);
-			if (clearMode) {
-				DrawSinglePixel<true>(p, z, fog, prim_color);
-			} else {
-				DrawSinglePixel<false>(p, z, fog, prim_color);
+#if defined(SOFTGPU_MEMORY_TAGGING_DETAILED) || defined(SOFTGPU_MEMORY_TAGGING_BASIC)
+			uint32_t bpp = pixelID.FBFormat() == GE_FORMAT_8888 ? 4 : 2;
+			uint32_t row = gstate.getFrameBufAddress() + p.y * pixelID.cached.framebufStride * bpp;
+			NotifyMemInfo(MemBlockFlags::WRITE, row + p.x * bpp, bpp, tag.c_str(), tag.size());
+
+			if (pixelID.depthWrite) {
+				uint32_t row = gstate.getDepthBufAddress() + y * pixelID.cached.depthbufStride * 2;
+				NotifyMemInfo(MemBlockFlags::WRITE, row + p.x * 2, 2, ztag.c_str(), ztag.size());
 			}
+#endif
 		}
 
 		x += xinc;
 		y += yinc;
 		z += zinc;
 	}
-}
-
-bool GetCurrentStencilbuffer(GPUDebugBuffer &buffer)
-{
-	int w = gstate.getRegionX2() - gstate.getRegionX1() + 1;
-	int h = gstate.getRegionY2() - gstate.getRegionY1() + 1;
-	buffer.Allocate(w, h, GPU_DBG_FORMAT_8BIT);
-
-	u8 *row = buffer.GetData();
-	for (int y = gstate.getRegionY1(); y <= gstate.getRegionY2(); ++y) {
-		for (int x = gstate.getRegionX1(); x <= gstate.getRegionX2(); ++x) {
-			row[x - gstate.getRegionX1()] = GetPixelStencil(x, y);
-		}
-		row += w;
-	}
-	return true;
 }
 
 bool GetCurrentTexture(GPUDebugBuffer &buffer, int level)
@@ -1726,13 +1406,17 @@ bool GetCurrentTexture(GPUDebugBuffer &buffer, int level)
 
 	buffer.Allocate(w, h, GE_FORMAT_8888, false);
 
-	Sampler::Funcs sampler = Sampler::GetFuncs();
+	SamplerID id;
+	ComputeSamplerID(&id);
+	id.cached.clut = (const u8 *)clut;
+
+	Sampler::FetchFunc sampler = Sampler::GetFetchFunc(id);
 
 	u8 *texptr = Memory::GetPointer(texaddr);
 	u32 *row = (u32 *)buffer.GetData();
 	for (int y = 0; y < h; ++y) {
 		for (int x = 0; x < w; ++x) {
-			row[x] = sampler.nearest(x, y, texptr, texbufw, level);
+			row[x] = Vec4<int>(sampler(x, y, texptr, texbufw, level, id)).ToRGBA();
 		}
 		row += w;
 	}

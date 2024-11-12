@@ -634,7 +634,7 @@ namespace MIPSInt
 			case 20: d[i] = powf(2.0f, s[i]); break; //vexp2
 			case 21: d[i] = logf(s[i])/log(2.0f); break; //vlog2
 			case 22: d[i] = USE_VPFU_SQRT ? vfpu_sqrt(s[i])  : fabsf(sqrtf(s[i])); break; //vsqrt
-			case 23: d[i] = asinf(s[i]) / M_PI_2; break; //vasin
+			case 23: d[i] = (float)(asinf(s[i]) / M_PI_2); break; //vasin
 			case 24: d[i] = -1.0f / s[i]; break; // vnrcp
 			case 26: { d[i] = -vfpu_sin(s[i]); } break; // vnsin
 			case 28: d[i] = 1.0f / powf(2.0, s[i]); break; // vrexp2
@@ -1549,10 +1549,11 @@ namespace MIPSInt
 		VectorSize sz = GetVecSize(op);
 		int n = GetNumVectorElements(sz);
 		for (int i = 0; i < n; i++) {
+			// TODO: Make more accurate, use and update RCX regs?
 			switch ((op >> 16) & 0x1f) {
 			case 1: d.u[i] = currentMIPS->rng.R32(); break;  // vrndi
-			case 2: d.f[i] = 1.0f + ((float)currentMIPS->rng.R32() / 0xFFFFFFFF); break; // vrndf1   TODO: make more accurate
-			case 3: d.f[i] = 2.0f + 2 * ((float)currentMIPS->rng.R32() / 0xFFFFFFFF); break; // vrndf2   TODO: make more accurate
+			case 2: d.u[i] = 0x3F800000 | (currentMIPS->rng.R32() & 0x007FFFFF); break; // vrndf1 (>= 1, < 2)
+			case 3: d.u[i] = 0x40000000 | (currentMIPS->rng.R32() & 0x007FFFFF); break; // vrndf2 (>= 2, < 4)
 			default: _dbg_assert_msg_(false,"Trying to interpret instruction that can't be interpreted");
 			}
 		}

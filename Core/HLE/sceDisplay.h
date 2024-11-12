@@ -25,25 +25,9 @@ void __DisplayShutdown();
 
 void Register_sceDisplay();
 
-// will return true once after every end-of-frame.
-bool __DisplayFrameDone();
-
 // Get information about the current framebuffer.
 bool __DisplayGetFramebuf(PSPPointer<u8> *topaddr, u32 *linesize, u32 *pixelFormat, int mode);
 void __DisplaySetFramebuf(u32 topaddr, int linesize, int pixelformat, int sync);
-
-typedef void (*VblankCallback)();
-// Listen for vblank events.  Only register during init.
-void __DisplayListenVblank(VblankCallback callback);
-
-void __DisplayGetDebugStats(char stats[], size_t bufsize);
-void __DisplayGetFPS(float *out_vps, float *out_fps, float *out_actual_fps);
-void __DisplayGetVPS(float *out_vps);
-void __DisplayGetAveragedFPS(float *out_vps, float *out_fps);
-double *__DisplayGetFrameTimes(int *out_valid, int *out_pos, double **out_sleep);
-int __DisplayGetNumVblanks();
-int __DisplayGetVCount();
-int __DisplayGetFlipCount();
 
 // Call this when resuming to avoid a small speedup burst
 void __DisplaySetWasPaused();

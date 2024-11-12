@@ -17,8 +17,6 @@
 
 #pragma once
 
-#include <map>
-
 #include "Common/Data/Collections/Hashmaps.h"
 #include "GPU/GPUInterface.h"
 #include "GPU/GPUState.h"
@@ -36,7 +34,6 @@ class DrawEngineVulkan;
 class VulkanContext;
 class VulkanTexture;
 class VulkanPushBuffer;
-class VulkanDeviceAllocator;
 
 class SamplerCache {
 public:
@@ -66,7 +63,7 @@ public:
 	void EndFrame();
 
 	void DeviceLost();
-	void DeviceRestore(VulkanContext *vulkan, Draw::DrawContext *draw);
+	void DeviceRestore(Draw::DrawContext *draw);
 
 	void SetFramebufferManager(FramebufferManagerVulkan *fbManager);
 	void SetDepalShaderCache(DepalShaderCacheVulkan *dpCache) {
@@ -110,7 +107,7 @@ protected:
 private:
 	void LoadTextureLevel(TexCacheEntry &entry, uint8_t *writePtr, int rowPitch,  int level, int scaleFactor, VkFormat dstFmt);
 	VkFormat GetDestFormat(GETextureFormat format, GEPaletteFormat clutFormat) const;
-	static TexCacheEntry::TexStatus CheckAlpha(const u32 *pixelData, VkFormat dstFmt, int stride, int w, int h);
+	static CheckAlphaResult CheckAlpha(const u32 *pixelData, VkFormat dstFmt, int w);
 	void UpdateCurrentClut(GEPaletteFormat clutFormat, u32 clutBase, bool clutIndexIsSimple) override;
 
 	void ApplyTextureFramebuffer(VirtualFramebuffer *framebuffer, GETextureFormat texFormat, FramebufferNotificationChannel channel) override;
@@ -118,7 +115,6 @@ private:
 
 	void CompileScalingShader();
 
-	VulkanContext *vulkan_ = nullptr;
 	VulkanDeviceAllocator *allocator_ = nullptr;
 	VulkanPushBuffer *push_ = nullptr;
 
@@ -128,16 +124,14 @@ private:
 
 	TextureScalerVulkan scaler;
 
-	FramebufferManagerVulkan *framebufferManagerVulkan_;
 	DepalShaderCacheVulkan *depalShaderCache_;
 	ShaderManagerVulkan *shaderManagerVulkan_;
 	DrawEngineVulkan *drawEngine_;
 	Vulkan2D *vulkan2D_;
 
 	std::string textureShader_;
-	int maxScaleFactor_ = 255;
+	int shaderScaleFactor_ = 0;
 	VkShaderModule uploadCS_ = VK_NULL_HANDLE;
-	VkShaderModule copyCS_ = VK_NULL_HANDLE;
 
 	// Bound state to emulate an API similar to the others
 	VkImageView imageView_ = VK_NULL_HANDLE;

@@ -2,6 +2,7 @@
 // This is quite messy due to platform-specific implementations and #ifdef's.
 // If your platform is not supported, it is suggested to use Qt instead.
 
+#include <cstdlib>
 #include <unistd.h>
 #include <pwd.h>
 
@@ -17,6 +18,7 @@ SDLJoystick *joystick = NULL;
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <csignal>
 #include <thread>
 #include <locale>
 
@@ -190,11 +192,27 @@ void System_AskForPermission(SystemPermission permission) {}
 PermissionStatus System_GetPermissionStatus(SystemPermission permission) { return PERMISSION_STATUS_GRANTED; }
 
 void OpenDirectory(const char *path) {
-#if defined(_WIN32)
-	PIDLIST_ABSOLUTE pidl = ILCreateFromPath(ConvertUTF8ToWString(ReplaceAll(path, "/", "\\")).c_str());
+#if PPSSPP_PLATFORM(WINDOWS)
+	SFGAOF flags;
+	PIDLIST_ABSOLUTE pidl = nullptr;
+	HRESULT hr = SHParseDisplayName(ConvertUTF8ToWString(ReplaceAll(path, "/", "\\")).c_str(), nullptr, &pidl, 0, &flags);
 	if (pidl) {
-		SHOpenFolderAndSelectItems(pidl, 0, NULL, 0);
-		ILFree(pidl);
+		if (SUCCEEDED(hr))
+			SHOpenFolderAndSelectItems(pidl, 0, NULL, 0);
+		CoTaskMemFree(pidl);
+	}
+#elif PPSSPP_PLATFORM(MAC) || (PPSSPP_PLATFORM(LINUX) && !PPSSPP_PLATFORM(ANDROID))
+	pid_t pid = fork();
+	if (pid < 0)
+		return;
+
+	if (pid == 0) {
+#if PPSSPP_PLATFORM(MAC)
+		execlp("open", "open", path, nullptr);
+#else
+		execlp("xdg-open", "xdg-open", path, nullptr);
+#endif
+		exit(1);
 	}
 #endif
 }
@@ -358,6 +376,18 @@ int System_GetPropertyInt(SystemProperty prop) {
 #endif
 	case SYSPROP_DISPLAY_COUNT:
 		return SDL_GetNumVideoDisplays();
+	case SYSPROP_KEYBOARD_LAYOUT:
+	{
+		char q, w, y;
+		q = SDL_GetKeyFromScancode(SDL_SCANCODE_Q);
+		w = SDL_GetKeyFromScancode(SDL_SCANCODE_W);
+		y = SDL_GetKeyFromScancode(SDL_SCANCODE_Y);
+		if (q == 'a' && w == 'z' && y == 'y')
+			return KEYBOARD_LAYOUT_AZERTY;
+		else if (q == 'q' && w == 'w' && y == 'z')
+			return KEYBOARD_LAYOUT_QWERTZ;
+		return KEYBOARD_LAYOUT_QWERTY;
+	}
 	default:
 		return -1;
 	}
@@ -490,6 +520,11 @@ int main(int argc, char *argv[]) {
 #ifdef HAVE_LIBNX
 	socketInitializeDefault();
 	nxlinkStdio();
+#else // HAVE_LIBNX
+	// Ignore sigpipe.
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+		perror("Unable to ignore SIGPIPE");
+	}
 #endif // HAVE_LIBNX
 
 	PROFILE_INIT();
@@ -667,7 +702,17 @@ int main(int argc, char *argv[]) {
 	if (strlen(path) > 0 && path[strlen(path) - 1] != '/')
 		strcat(path, "/");
 
-	NativeInit(remain_argc, (const char **)remain_argv, path, "/tmp", nullptr);
+#if PPSSPP_PLATFORM(MAC)
+	std::string external_dir_str;
+	if (SDL_GetBasePath())
+		external_dir_str = std::string(SDL_GetBasePath()) + "/assets";
+	else
+		external_dir_str = "/tmp";
+	const char *external_dir = external_dir_str.c_str();
+#else
+	const char *external_dir = "/tmp";
+#endif
+	NativeInit(remain_argc, (const char **)remain_argv, path, external_dir, nullptr);
 
 	// Use the setting from the config when initing the window.
 	if (g_Config.bFullScreen)
@@ -696,6 +741,7 @@ int main(int argc, char *argv[]) {
 			printf("GL init error '%s'\n", error_message.c_str());
 		}
 		graphicsContext = ctx;
+#if !PPSSPP_PLATFORM(SWITCH)
 	} else if (g_Config.iGPUBackend == (int)GPUBackend::VULKAN) {
 		SDLVulkanGraphicsContext *ctx = new SDLVulkanGraphicsContext();
 		if (!ctx->Init(window, x, y, mode, &error_message)) {
@@ -709,6 +755,7 @@ int main(int argc, char *argv[]) {
 		} else {
 			graphicsContext = ctx;
 		}
+#endif
 	}
 
 	bool useEmuThread = g_Config.iGPUBackend == (int)GPUBackend::OPENGL;

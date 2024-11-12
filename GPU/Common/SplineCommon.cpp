@@ -18,10 +18,9 @@
 #include <string.h>
 #include <algorithm>
 
-#include "Common/Profiler/Profiler.h"
-
+#include "Common/Common.h"
 #include "Common/CPUDetect.h"
-
+#include "Common/Profiler/Profiler.h"
 #include "GPU/Common/GPUStateUtils.h"
 #include "GPU/Common/SplineCommon.h"
 #include "GPU/Common/DrawEngineCommon.h"
@@ -321,7 +320,8 @@ ControlPoints::ControlPoints(const SimpleVertex *const *points, int size, Simple
 	pos = (Vec3f *)managedBuf.Allocate(sizeof(Vec3f) * size);
 	tex = (Vec2f *)managedBuf.Allocate(sizeof(Vec2f) * size);
 	col = (Vec4f *)managedBuf.Allocate(sizeof(Vec4f) * size);
-	Convert(points, size);
+	if (pos && tex && col)
+		Convert(points, size);
 }
 
 void ControlPoints::Convert(const SimpleVertex *const *points, int size) {
@@ -554,7 +554,10 @@ void DrawEngineCommon::SubmitCurve(const void *control_points, const void *indic
 		HardwareTessellation(output, surface, origVertType, points, tessDataTransfer);
 	} else {
 		ControlPoints cpoints(points, num_points, managedBuf);
-		SoftwareTessellation(output, surface, origVertType, cpoints);
+		if (cpoints.IsValid())
+			SoftwareTessellation(output, surface, origVertType, cpoints);
+		else
+			ERROR_LOG(G3D, "Failed to allocate space for control point values, skipping curve draw");
 	}
 
 	u32 vertTypeWithIndex16 = (vertType & ~GE_VTYPE_IDX_MASK) | GE_VTYPE_IDX_16BIT;
@@ -571,7 +574,8 @@ void DrawEngineCommon::SubmitCurve(const void *control_points, const void *indic
 
 	uint32_t vertTypeID = GetVertTypeID(vertTypeWithIndex16, gstate.getUVGenMode());
 	int generatedBytesRead;
-	DispatchSubmitPrim(output.vertices, output.indices, PatchPrimToPrim(surface.primType), output.count, vertTypeID, gstate.getCullMode(), &generatedBytesRead);
+	if (output.count)
+		DispatchSubmitPrim(output.vertices, output.indices, PatchPrimToPrim(surface.primType), output.count, vertTypeID, gstate.getCullMode(), &generatedBytesRead);
 
 	DispatchFlush();
 

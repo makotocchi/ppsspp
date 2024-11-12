@@ -400,6 +400,7 @@
     <ClInclude Include="..\..\Core\Debugger\WebSocket\GameSubscriber.h" />
     <ClInclude Include="..\..\Core\Debugger\WebSocket\GPUBufferSubscriber.h" />
     <ClInclude Include="..\..\Core\Debugger\WebSocket\GPURecordSubscriber.h" />
+    <ClInclude Include="..\..\Core\Debugger\WebSocket\GPUStatsSubscriber.h" />
     <ClInclude Include="..\..\Core\Debugger\WebSocket\HLESubscriber.h" />
     <ClInclude Include="..\..\Core\Debugger\WebSocket\InputBroadcaster.h" />
     <ClInclude Include="..\..\Core\Debugger\WebSocket\InputSubscriber.h" />
@@ -519,6 +520,7 @@
     <ClInclude Include="..\..\Core\HW\AsyncIOManager.h" />
     <ClInclude Include="..\..\Core\HW\BufferQueue.h" />
     <ClInclude Include="..\..\Core\HW\Camera.h" />
+    <ClInclude Include="..\..\Core\HW\Display.h" />
     <ClInclude Include="..\..\Core\HW\MediaEngine.h" />
     <ClInclude Include="..\..\Core\HW\MemoryStick.h" />
     <ClInclude Include="..\..\Core\HW\MpegDemux.h" />
@@ -579,7 +581,6 @@
     <ClInclude Include="..\..\Core\Util\PortManager.h" />
     <ClInclude Include="..\..\Core\WebServer.h" />
     <ClInclude Include="..\..\Core\Util\AudioFormat.h" />
-    <ClInclude Include="..\..\Core\Util\AudioFormatNEON.h" />
     <ClInclude Include="..\..\Core\Util\BlockAllocator.h" />
     <ClInclude Include="..\..\Core\Util\DisArm64.h" />
     <ClInclude Include="..\..\Core\Util\GameManager.h" />
@@ -634,6 +635,7 @@
     <ClCompile Include="..\..\Core\Debugger\WebSocket\GameSubscriber.cpp" />
     <ClCompile Include="..\..\Core\Debugger\WebSocket\GPUBufferSubscriber.cpp" />
     <ClCompile Include="..\..\Core\Debugger\WebSocket\GPURecordSubscriber.cpp" />
+    <ClCompile Include="..\..\Core\Debugger\WebSocket\GPUStatsSubscriber.cpp" />
     <ClCompile Include="..\..\Core\Debugger\WebSocket\HLESubscriber.cpp" />
     <ClCompile Include="..\..\Core\Debugger\WebSocket\InputBroadcaster.cpp" />
     <ClCompile Include="..\..\Core\Debugger\WebSocket\InputSubscriber.cpp" />
@@ -750,6 +752,7 @@
     <ClCompile Include="..\..\Core\HW\AsyncIOManager.cpp" />
     <ClCompile Include="..\..\Core\HW\BufferQueue.cpp" />
     <ClCompile Include="..\..\Core\HW\Camera.cpp" />
+    <ClCompile Include="..\..\Core\HW\Display.cpp" />
     <ClCompile Include="..\..\Core\HW\MediaEngine.cpp" />
     <ClCompile Include="..\..\Core\HW\MemoryStick.cpp" />
     <ClCompile Include="..\..\Core\HW\MpegDemux.cpp" />
@@ -836,7 +839,6 @@
     <ClCompile Include="..\..\Core\Util\PortManager.cpp" />
     <ClCompile Include="..\..\Core\WebServer.cpp" />
     <ClCompile Include="..\..\Core\Util\AudioFormat.cpp" />
-    <ClCompile Include="..\..\Core\Util\AudioFormatNEON.cpp" />
     <ClCompile Include="..\..\Core\Util\BlockAllocator.cpp" />
     <ClCompile Include="..\..\Core\Util\DisArm64.cpp" />
     <ClCompile Include="..\..\Core\Util\GameManager.cpp" />

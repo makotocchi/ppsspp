@@ -15,15 +15,27 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+// Hack around name collisions between UI and xlib
+// Only affects this file.
+#undef VK_USE_PLATFORM_XLIB_KHR
+#undef VK_USE_PLATFORM_XCB_KHR
+#undef VK_USE_PLATFORM_DIRECTFB_EXT
+#undef VK_USE_PLATFORM_XLIB_XRANDR_EXT
+
 #include <algorithm>
 #include <cstring>
 
 #include "ppsspp_config.h"
 
+#include "Common/Common.h"
 #include "Common/System/Display.h"
 #include "Common/System/NativeApp.h"
 #include "Common/System/System.h"
 #include "Common/GPU/OpenGL/GLFeatures.h"
+
+#if !PPSSPP_PLATFORM(UWP)
+#include "Common/GPU/Vulkan/VulkanContext.h"
+#endif
 #include "Common/File/AndroidStorage.h"
 #include "Common/Data/Text/I18n.h"
 #include "Common/Net/HTTPClient.h"
@@ -54,6 +66,7 @@
 #include "UI/MainScreen.h"
 #include "UI/ControlMappingScreen.h"
 #include "UI/GameSettingsScreen.h"
+
 
 #ifdef _WIN32
 #include "Common/CommonWindows.h"
@@ -88,7 +101,8 @@ void DevMenu::CreatePopupContents(UI::ViewGroup *parent) {
 	items->Add(new Choice(dev->T("Jit Compare")))->OnClick.Handle(this, &DevMenu::OnJitCompare);
 	items->Add(new Choice(dev->T("Shader Viewer")))->OnClick.Handle(this, &DevMenu::OnShaderView);
 	if (g_Config.iGPUBackend == (int)GPUBackend::VULKAN) {
-		items->Add(new CheckBox(&g_Config.bShowAllocatorDebug, dev->T("Allocator Viewer")));
+		// TODO: Make a new allocator visualizer for VMA.
+		// items->Add(new CheckBox(&g_Config.bShowAllocatorDebug, dev->T("Allocator Viewer")));
 		items->Add(new CheckBox(&g_Config.bShowGpuProfile, dev->T("GPU Profile")));
 	}
 	items->Add(new Choice(dev->T("Toggle Freeze")))->OnClick.Handle(this, &DevMenu::OnFreezeFrame);
@@ -719,6 +733,22 @@ void SystemInfoScreen::CreateViews() {
 		for (auto &feature : features) {
 			gpuExtensions->Add(new TextView(feature, new LayoutParams(FILL_PARENT, WRAP_CONTENT)))->SetFocusable(true);
 		}
+		
+#if !PPSSPP_PLATFORM(UWP)
+
+		// Vulkan specific code here, can't be bothered to abstract.
+		// OK because of above check.
+		gpuExtensions->Add(new ItemHeader(si->T("Display Color Formats")));
+		VulkanContext *vk = (VulkanContext *)draw->GetNativeObject(Draw::NativeObject::CONTEXT);
+		if (vk) {
+			for (auto &format : vk->SurfaceFormats()) {
+				std::string line = StringFromFormat("%s : %s", VulkanFormatToString(format.format), VulkanColorSpaceToString(format.colorSpace));
+				gpuExtensions->Add(new TextView(line,
+					new LayoutParams(FILL_PARENT, WRAP_CONTENT)))->SetFocusable(true);
+			}
+		}
+#endif
+
 		gpuExtensions->Add(new ItemHeader(si->T("Vulkan Extensions")));
 		std::vector<std::string> extensions = draw->GetExtensionList();
 		for (auto &extension : extensions) {
@@ -909,6 +939,7 @@ void JitCompareScreen::UpdateDisasm() {
 }
 
 UI::EventReturn JitCompareScreen::OnAddressChange(UI::EventParams &e) {
+	std::lock_guard<std::recursive_mutex> guard(MIPSComp::jitLock);
 	if (!MIPSComp::jit) {
 		return UI::EVENT_DONE;
 	}
@@ -928,6 +959,7 @@ UI::EventReturn JitCompareScreen::OnAddressChange(UI::EventParams &e) {
 }
 
 UI::EventReturn JitCompareScreen::OnShowStats(UI::EventParams &e) {
+	std::lock_guard<std::recursive_mutex> guard(MIPSComp::jitLock);
 	if (!MIPSComp::jit) {
 		return UI::EVENT_DONE;
 	}
@@ -975,6 +1007,7 @@ UI::EventReturn JitCompareScreen::OnNextBlock(UI::EventParams &e) {
 }
 
 UI::EventReturn JitCompareScreen::OnBlockAddress(UI::EventParams &e) {
+	std::lock_guard<std::recursive_mutex> guard(MIPSComp::jitLock);
 	if (!MIPSComp::jit) {
 		return UI::EVENT_DONE;
 	}
@@ -993,6 +1026,7 @@ UI::EventReturn JitCompareScreen::OnBlockAddress(UI::EventParams &e) {
 }
 
 UI::EventReturn JitCompareScreen::OnRandomBlock(UI::EventParams &e) {
+	std::lock_guard<std::recursive_mutex> guard(MIPSComp::jitLock);
 	if (!MIPSComp::jit) {
 		return UI::EVENT_DONE;
 	}
@@ -1020,6 +1054,7 @@ UI::EventReturn JitCompareScreen::OnRandomFPUBlock(UI::EventParams &e) {
 }
 
 void JitCompareScreen::OnRandomBlock(int flag) {
+	std::lock_guard<std::recursive_mutex> guard(MIPSComp::jitLock);
 	if (!MIPSComp::jit) {
 		return;
 	}
@@ -1055,6 +1090,7 @@ void JitCompareScreen::OnRandomBlock(int flag) {
 }
 
 UI::EventReturn JitCompareScreen::OnCurrentBlock(UI::EventParams &e) {
+	std::lock_guard<std::recursive_mutex> guard(MIPSComp::jitLock);
 	if (!MIPSComp::jit) {
 		return UI::EVENT_DONE;
 	}

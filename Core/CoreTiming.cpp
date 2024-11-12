@@ -16,7 +16,9 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include <atomic>
+#include <climits>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <set>
 #include <vector>
@@ -29,7 +31,6 @@
 #include "Core/Core.h"
 #include "Core/Config.h"
 #include "Core/HLE/sceKernelThread.h"
-#include "Core/HLE/sceDisplay.h"
 #include "Core/MIPS/MIPS.h"
 #include "Core/Reporting.h"
 
@@ -182,7 +183,7 @@ int RegisterEvent(const char *name, TimedCallback callback) {
 
 void AntiCrashCallback(u64 userdata, int cyclesLate) {
 	ERROR_LOG(SAVESTATE, "Savestate broken: an unregistered event was called.");
-	Core_EnableStepping(true);
+	Core_EnableStepping(true, "savestate.crash", 0);
 }
 
 void RestoreRegisterEvent(int &event_type, const char *name, TimedCallback callback) {
@@ -191,7 +192,7 @@ void RestoreRegisterEvent(int &event_type, const char *name, TimedCallback callb
 		event_type = -1;
 	if (event_type == -1)
 		event_type = nextEventTypeRestoreId++;
-	if (event_type >= event_types.size()) {
+	if (event_type >= (int)event_types.size()) {
 		// Give it any unused event id starting from the end.
 		// Older save states with messed up ids have gaps near the end.
 		for (int i = (int)event_types.size() - 1; i >= 0; --i) {
@@ -201,7 +202,7 @@ void RestoreRegisterEvent(int &event_type, const char *name, TimedCallback callb
 			}
 		}
 	}
-	_assert_msg_(event_type >= 0 && event_type < event_types.size(), "Invalid event type %d", event_type);
+	_assert_msg_(event_type >= 0 && event_type < (int)event_types.size(), "Invalid event type %d", event_type);
 	event_types[event_type] = EventType{ callback, name };
 	usedEventTypes.insert(event_type);
 	restoredEventTypes.insert(event_type);

@@ -83,6 +83,7 @@ bool GameInfo::Delete() {
 	case IdentifiedFileType::PSP_ELF:
 	case IdentifiedFileType::UNKNOWN_BIN:
 	case IdentifiedFileType::UNKNOWN_ELF:
+	case IdentifiedFileType::UNKNOWN_ISO:
 	case IdentifiedFileType::ARCHIVE_RAR:
 	case IdentifiedFileType::ARCHIVE_ZIP:
 	case IdentifiedFileType::ARCHIVE_7Z:
@@ -340,6 +341,10 @@ public:
 		info_->readyEvent.Notify();
 	}
 
+	TaskType Type() const override {
+		return TaskType::IO_BLOCKING;
+	}
+
 	void Run() override {
 		// An early-return will result in the destructor running, where we can set
 		// flags like working and pending.
@@ -386,7 +391,7 @@ public:
 
 					// Assuming PSP_PBP_DIRECTORY without ID or with disc_total < 1 in GAME dir must be homebrew
 					if ((info_->id.empty() || !info_->disc_total)
-						&& gamePath_.FilePathContains("PSP/GAME/")
+						&& gamePath_.FilePathContainsNoCase("PSP/GAME/")
 						&& info_->fileType == IdentifiedFileType::PSP_PBP_DIRECTORY) {
 						info_->id = g_paramSFO.GenerateFakeID(gamePath_.ToString());
 						info_->id_version = info_->id + "_1.00";
@@ -492,6 +497,22 @@ handleELF:
 
 			// Let's use the screenshot as an icon, too.
 			Path screenshotPath = gamePath_.WithReplacedExtension(".ppst", ".jpg");
+			if (File::Exists(screenshotPath)) {
+				if (File::ReadFileToString(false, screenshotPath, info_->icon.data)) {
+					info_->icon.dataLoaded = true;
+				} else {
+					ERROR_LOG(G3D, "Error loading screenshot data: '%s'", screenshotPath.c_str());
+				}
+			}
+			break;
+		}
+
+		case IdentifiedFileType::PPSSPP_GE_DUMP:
+		{
+			std::lock_guard<std::mutex> guard(info_->lock);
+
+			// Let's use the comparison screenshot as an icon, if it exists.
+			Path screenshotPath = gamePath_.WithReplacedExtension(".ppdmp", ".png");
 			if (File::Exists(screenshotPath)) {
 				if (File::ReadFileToString(false, screenshotPath, info_->icon.data)) {
 					info_->icon.dataLoaded = true;
@@ -657,9 +678,13 @@ void GameInfoCache::Clear() {
 
 void GameInfoCache::CancelAll() {
 	for (auto info : info_) {
-		auto fl = info.second->GetFileLoader();
-		if (fl) {
-			fl->Cancel();
+		// GetFileLoader will create one if there isn't one already.
+		// Avoid that by checking.
+		if (info.second->HasFileLoader()) {
+			auto fl = info.second->GetFileLoader();
+			if (fl) {
+				fl->Cancel();
+			}
 		}
 	}
 }
@@ -738,7 +763,7 @@ std::shared_ptr<GameInfo> GameInfoCache::GetInfo(Draw::DrawContext *draw, const 
 	}
 
 	GameInfoWorkItem *item = new GameInfoWorkItem(gamePath, info);
-	g_threadManager.EnqueueTask(item, TaskType::IO_BLOCKING);
+	g_threadManager.EnqueueTask(item);
 
 	// Don't re-insert if we already have it.
 	if (info_.find(pathStr) == info_.end())

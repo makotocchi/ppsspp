@@ -50,7 +50,7 @@ void CwCheatScreen::LoadCheatInfo() {
 		gameID = info->paramSFO.GetValueString("DISC_ID");
 	}
 	if ((info->id.empty() || !info->disc_total)
-		&& gamePath_.FilePathContains("PSP/GAME/")) {
+		&& gamePath_.FilePathContainsNoCase("PSP/GAME/")) {
 		gameID = g_paramSFO.GenerateFakeID(gamePath_.ToString());
 	}
 
@@ -136,6 +136,7 @@ void CwCheatScreen::onFinish(DialogResult result) {
 	if (result != DR_BACK) // This only works for BACK here.
 		return;
 
+	std::lock_guard<std::recursive_mutex> guard(MIPSComp::jitLock);
 	if (MIPSComp::jit) {
 		MIPSComp::jit->ClearCache();
 	}
@@ -167,6 +168,7 @@ UI::EventReturn CwCheatScreen::OnAddCheat(UI::EventParams &params) {
 
 UI::EventReturn CwCheatScreen::OnEditCheatFile(UI::EventParams &params) {
 	g_Config.bReloadCheats = true;
+	std::lock_guard<std::recursive_mutex> guard(MIPSComp::jitLock);
 	if (MIPSComp::jit) {
 		MIPSComp::jit->ClearCache();
 	}
@@ -356,7 +358,7 @@ bool CwCheatScreen::RebuildCheatFile(int index) {
 		return false;
 	}
 
-	for (int i = 0; i < lines.size(); ++i) {
+	for (size_t i = 0; i < lines.size(); ++i) {
 		fprintf(out, "%s", lines[i].c_str());
 		if (i != lines.size() - 1)
 			fputc('\n', out);

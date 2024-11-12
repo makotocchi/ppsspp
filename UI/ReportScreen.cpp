@@ -30,6 +30,7 @@
 #include "Common/StringUtils.h"
 #include "Common/System/Display.h"
 #include "Common/System/System.h"
+#include "Core/Config.h"
 #include "Core/Core.h"
 #include "Core/Reporting.h"
 #include "Core/Screenshot.h"
@@ -336,7 +337,7 @@ void ReportScreen::UpdateCRCInfo() {
 
 	if (Reporting::HasCRC(gamePath_)) {
 		std::string crc = StringFromFormat("%08X", Reporting::RetrieveCRC(gamePath_));
-		updated = ReplaceAll(rp->T("FeedbackCRCValue", "Disc CRC: [VALUE]"), "[VALUE]", crc);
+		updated = ReplaceAll(rp->T("FeedbackCRCValue", "Disc CRC: %1"), "%1", crc);
 	} else if (showCRC_) {
 		updated = rp->T("FeedbackCRCCalculating", "Disc CRC: Calculating...");
 	}

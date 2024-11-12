@@ -94,13 +94,13 @@ static const D3D11_STENCIL_OP stencilOps[] = {
 };
 
 static const D3D11_PRIMITIVE_TOPOLOGY primToD3D11[8] = {
-	D3D11_PRIMITIVE_TOPOLOGY_POINTLIST,
-	D3D11_PRIMITIVE_TOPOLOGY_LINELIST,
-	D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP,
+	D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, // Points are expanded to triangles.
+	D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, // Lines are expanded to triangles too.
+	D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, // Lines are expanded to triangles too.
 	D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
 	D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
 	D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED,  // D3D11 doesn't do triangle fans.
-	D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+	D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, // Rectangles are expanded to triangles.
 };
 
 static const D3D11_LOGIC_OP logicOps[] = {
@@ -155,22 +155,18 @@ void DrawEngineD3D11::ApplyDrawState(int prim) {
 			keys_.blend.colorWriteMask = (colorMask ? (1 | 2 | 4) : 0) | (alphaMask ? 8 : 0);
 		} else {
 			keys_.blend.value = 0;
-			// Set blend - unless we need to do it in the shader.
-			GenericBlendState blendState;
-			ConvertBlendState(blendState, gstate_c.allowFramebufferRead);
 
 			GenericMaskState maskState;
 			ConvertMaskState(maskState, gstate_c.allowFramebufferRead);
 
+			// Set blend - unless we need to do it in the shader.
+			GenericBlendState blendState;
+			ConvertBlendState(blendState, gstate_c.allowFramebufferRead, maskState.applyFramebufferRead);
+
 			if (blendState.applyFramebufferRead || maskState.applyFramebufferRead) {
-				if (ApplyFramebufferRead(&fboTexNeedsBind_)) {
-					// The shader takes over the responsibility for blending, so recompute.
-					ApplyStencilReplaceAndLogicOpIgnoreBlend(blendState.replaceAlphaWithStencil, blendState);
-				} else {
-					// Until next time, force it off.
-					ResetFramebufferRead();
-					gstate_c.SetAllowFramebufferRead(false);
-				}
+				ApplyFramebufferRead(&fboTexNeedsBind_);
+				// The shader takes over the responsibility for blending, so recompute.
+				ApplyStencilReplaceAndLogicOpIgnoreBlend(blendState.replaceAlphaWithStencil, blendState);
 				gstate_c.Dirty(DIRTY_FRAGMENTSHADER_STATE);
 			} else if (blendState.resetFramebufferRead) {
 				ResetFramebufferRead();
@@ -253,7 +249,7 @@ void DrawEngineD3D11::ApplyDrawState(int prim) {
 
 	if (gstate_c.IsDirty(DIRTY_RASTER_STATE)) {
 		keys_.raster.value = 0;
-		bool wantCull = !gstate.isModeClear() && prim != GE_PRIM_RECTANGLES && gstate.isCullEnabled();
+		bool wantCull = !gstate.isModeClear() && prim != GE_PRIM_RECTANGLES && prim > GE_PRIM_LINE_STRIP && gstate.isCullEnabled();
 		keys_.raster.cullMode = wantCull ? (gstate.getCullMode() ? D3D11_CULL_FRONT : D3D11_CULL_BACK) : D3D11_CULL_NONE;
 
 		if (gstate.isModeClear() || gstate.isModeThrough()) {

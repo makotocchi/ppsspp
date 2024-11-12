@@ -1,14 +1,9 @@
-#if defined(SDL)
-#include <SDL_keyboard.h>
-#elif defined(USING_WIN_UI)
-#include "CommonWindows.h"
-#endif
-
 #include "ppsspp_config.h"
 
 #include "Common/CommonFuncs.h"
 #include "Common/Input/KeyCodes.h"
 #include "Common/Input/InputState.h"
+#include "Common/System/System.h"
 #include "Core/KeyMapDefaults.h"
 #include "Core/KeyMap.h"
 
@@ -199,6 +194,31 @@ static const DefMappingStruct defaultAndroidXboxControllerMap[] = {
 	{VIRTKEY_AXIS_Y_MAX, JOYSTICK_AXIS_Y, -1},
 };
 
+// Retroid reports its controller as "Retro Station Controller".
+// It's very similar to the Android Xbox mapping, just with main buttons swapped around.
+static const DefMappingStruct defaultRetroStationControllerMap[] = {
+	{CTRL_CROSS          , NKCODE_BUTTON_B},
+	{CTRL_CIRCLE         , NKCODE_BUTTON_A},
+	{CTRL_SQUARE         , NKCODE_BUTTON_Y},
+	{CTRL_TRIANGLE       , NKCODE_BUTTON_X},
+	// The hat for DPAD is standard for bluetooth pads, which is the most likely pads on Android I think.
+	{CTRL_LEFT           , NKCODE_DPAD_LEFT},
+	{CTRL_RIGHT          , NKCODE_DPAD_RIGHT},
+	{CTRL_UP             , NKCODE_DPAD_UP},
+	{CTRL_DOWN           , NKCODE_DPAD_DOWN},
+	{CTRL_START          , NKCODE_BUTTON_START},
+	{CTRL_SELECT         , NKCODE_BACK},
+	{CTRL_LTRIGGER       , NKCODE_BUTTON_L1},
+	{CTRL_RTRIGGER       , NKCODE_BUTTON_R1},
+	{VIRTKEY_FASTFORWARD , JOYSTICK_AXIS_RTRIGGER, +1},
+	{VIRTKEY_PAUSE       , JOYSTICK_AXIS_LTRIGGER, +1},
+	{VIRTKEY_AXIS_X_MIN, JOYSTICK_AXIS_X, -1},
+	{VIRTKEY_AXIS_X_MAX, JOYSTICK_AXIS_X, +1},
+	{VIRTKEY_AXIS_Y_MIN, JOYSTICK_AXIS_Y, +1},
+	{VIRTKEY_AXIS_Y_MAX, JOYSTICK_AXIS_Y, -1},
+};
+
+
 static const DefMappingStruct defaultPadMapAndroid[] = {
 	{CTRL_CROSS          , NKCODE_BUTTON_A},
 	{CTRL_CIRCLE         , NKCODE_BUTTON_B},
@@ -303,39 +323,18 @@ void SetDefaultKeyMap(DefaultMaps dmap, bool replace) {
 	switch (dmap) {
 	case DEFAULT_MAPPING_KEYBOARD:
 	{
-		bool azerty = false;
-		bool qwertz = false;
-#if defined(SDL)
-		char q, w, y;
-		q = SDL_GetKeyFromScancode(SDL_SCANCODE_Q);
-		w = SDL_GetKeyFromScancode(SDL_SCANCODE_W);
-		y = SDL_GetKeyFromScancode(SDL_SCANCODE_Y);
-		if (q == 'a' && w == 'z' && y == 'y')
-			azerty = true;
-		else if (q == 'q' && w == 'w' && y == 'z')
-			qwertz = true;
-#elif defined(USING_WIN_UI)
-		HKL localeId = GetKeyboardLayout(0);
-		// TODO: Is this list complete enough?
-		switch ((int)(intptr_t)localeId & 0xFFFF) {
-		case 0x407:
-			qwertz = true;
-			break;
-		case 0x040c:
-		case 0x080c:
-		case 0x1009:
-			azerty = true;
-			break;
-		default:
-			break;
-		}
-#endif
-		if (azerty) {
-			SetDefaultKeyMap(DEVICE_ID_KEYBOARD, defaultAzertyKeyboardKeyMap, ARRAY_SIZE(defaultAzertyKeyboardKeyMap), replace);
-		} else if (qwertz) {
+		int keyboardLayout = System_GetPropertyInt(SYSPROP_KEYBOARD_LAYOUT);
+		switch (keyboardLayout) {
+		case KEYBOARD_LAYOUT_QWERTZ:
 			SetDefaultKeyMap(DEVICE_ID_KEYBOARD, defaultQwertzKeyboardKeyMap, ARRAY_SIZE(defaultQwertzKeyboardKeyMap), replace);
-		} else {
+			break;
+		case KEYBOARD_LAYOUT_AZERTY:
+			SetDefaultKeyMap(DEVICE_ID_KEYBOARD, defaultAzertyKeyboardKeyMap, ARRAY_SIZE(defaultAzertyKeyboardKeyMap), replace);
+			break;
+		case KEYBOARD_LAYOUT_QWERTY:
+		default:
 			SetDefaultKeyMap(DEVICE_ID_KEYBOARD, defaultQwertyKeyboardKeyMap, ARRAY_SIZE(defaultQwertyKeyboardKeyMap), replace);
+			break;
 		}
 	}
 	break;
@@ -362,6 +361,9 @@ void SetDefaultKeyMap(DefaultMaps dmap, bool replace) {
 		break;
 	case DEFAULT_MAPPING_ANDROID_XBOX:
 		SetDefaultKeyMap(DEVICE_ID_PAD_0, defaultAndroidXboxControllerMap, ARRAY_SIZE(defaultAndroidXboxControllerMap), replace);
+		break;
+	case DEFAULT_MAPPING_RETRO_STATION_CONTROLLER:
+		SetDefaultKeyMap(DEVICE_ID_PAD_0, defaultRetroStationControllerMap, ARRAY_SIZE(defaultRetroStationControllerMap), replace);
 		break;
 	}
 

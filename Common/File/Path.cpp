@@ -1,4 +1,6 @@
 #include "ppsspp_config.h"
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 
 #include "Common/File/Path.h"
@@ -87,7 +89,7 @@ Path Path::operator /(const std::string &subdir) const {
 		return Path(path_);
 	}
 	std::string fullPath = path_;
-	if (subdir.front() != '/') {
+	if (subdir.front() != '/' && (fullPath.empty() || fullPath.back() != '/')) {
 		fullPath += "/";
 	}
 	fullPath += subdir;
@@ -216,14 +218,17 @@ std::string Path::GetDirectory() const {
 	return path_;
 }
 
-bool Path::FilePathContains(const std::string &needle) const {
+bool Path::FilePathContainsNoCase(const std::string &needle) const {
 	std::string haystack;
 	if (type_ == PathType::CONTENT_URI) {
 		haystack = AndroidContentURI(path_).FilePath();
 	} else {
 		haystack = path_;
 	}
-	return haystack.find(needle) != std::string::npos;
+
+	auto pred = [](char ch1, char ch2) { return std::toupper(ch1) == std::toupper(ch2); };
+	auto found = std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(), pred);
+	return found != haystack.end();
 }
 
 bool Path::StartsWith(const Path &other) const {
@@ -301,6 +306,17 @@ Path Path::GetRootVolume() const {
 		// Windows path with drive letter
 		std::string path = path_.substr(0, 2);
 		return Path(path);
+	}
+	// Support UNC and device paths.
+	if (path_[0] == '/' && path_[1] == '/') {
+		size_t next = 2;
+		if ((path_[2] == '.' || path_[2] == '?') && path_[3] == '/') {
+			// Device path, or "\\.\UNC" path, skip the dot and consider the device the root.
+			next = 4;
+		}
+
+		size_t len = path_.find_first_of('/', next);
+		return Path(path_.substr(0, len));
 	}
 #endif
 	return Path("/");

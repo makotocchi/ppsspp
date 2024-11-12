@@ -20,9 +20,12 @@
 #include "CommonTypes.h"
 #include "GPU/Common/DrawEngineCommon.h"
 #include "GPU/Common/GPUDebugInterface.h"
+#include "GPU/Software/SoftGpu.h"
 #include "GPU/Math3D.h"
 
 using namespace Math3D;
+
+static constexpr int32_t SCREEN_SCALE_FACTOR = 16;
 
 typedef u16 u10; // TODO: erm... :/
 
@@ -31,7 +34,8 @@ typedef Vec3<float> WorldCoords;
 typedef Vec3<float> ViewCoords;
 typedef Vec4<float> ClipCoords; // Range: -w <= x/y/z <= w
 
-struct SplinePatch;
+class BinManager;
+struct TransformState;
 
 struct ScreenCoords
 {
@@ -60,39 +64,19 @@ struct ScreenCoords
 	}
 };
 
-struct DrawingCoords
-{
+struct DrawingCoords {
 	DrawingCoords() {}
-	DrawingCoords(s16 x, s16 y, u16 z) : x(x), y(y), z(z) {}
+	DrawingCoords(s16 x, s16 y) : x(x), y(y) {}
 
 	s16 x;
 	s16 y;
-	u16 z;
-
-	Vec2<s16> xy() const { return Vec2<s16>(x, y); }
-
-	DrawingCoords operator * (const float t) const
-	{
-		return DrawingCoords((s16)(x * t), (s16)(y * t), (u16)(z * t));
-	}
-
-	DrawingCoords operator + (const DrawingCoords& oth) const
-	{
-		return DrawingCoords(x + oth.x, y + oth.y, z + oth.z);
-	}
 };
 
-struct VertexData
-{
-	void Lerp(float t, const VertexData& a, const VertexData& b)
-	{
-		// World coords only needed for lighting, so we don't Lerp those
-
-		modelpos = ::Lerp(a.modelpos, b.modelpos, t);
+struct VertexData {
+	void Lerp(float t, const VertexData &a, const VertexData &b) {
 		clippos = ::Lerp(a.clippos, b.clippos, t);
-		screenpos = ::Lerp(a.screenpos, b.screenpos, t);  // TODO: Should use a LerpInt (?)
+		// Ignore screenpos because Lerp() is only used pre-calculation of screenpos.
 		texturecoords = ::Lerp(a.texturecoords, b.texturecoords, t);
-		normal = ::Lerp(a.normal, b.normal, t);
 		fogdepth = ::Lerp(a.fogdepth, b.fogdepth, t);
 
 		u16 t_int = (u16)(t*256);
@@ -100,15 +84,11 @@ struct VertexData
 		color1 = LerpInt<Vec3<int>,256>(a.color1, b.color1, t_int);
 	}
 
-	ModelCoords modelpos;
-	WorldCoords worldpos; // TODO: Storing this is dumb, should transform the light to clip space instead
 	ClipCoords clippos;
-	ScreenCoords screenpos; // TODO: Shouldn't store this ?
 	Vec2<float> texturecoords;
-	Vec3<float> normal;
-	WorldCoords worldnormal;
 	Vec4<int> color0;
 	Vec3<int> color1;
+	ScreenCoords screenpos; // TODO: Shouldn't store this ?
 	float fogdepth;
 };
 
@@ -126,16 +106,36 @@ public:
 	static ViewCoords WorldToView(const WorldCoords& coords);
 	static ClipCoords ViewToClip(const ViewCoords& coords);
 	static ScreenCoords ClipToScreen(const ClipCoords& coords);
-	static DrawingCoords ScreenToDrawing(const ScreenCoords& coords);
-	static ScreenCoords DrawingToScreen(const DrawingCoords& coords);
+	static inline DrawingCoords ScreenToDrawing(int x, int y) {
+		DrawingCoords ret;
+		// When offset > coord, this is negative and force-scissors.
+		ret.x = x / SCREEN_SCALE_FACTOR;
+		ret.y = y / SCREEN_SCALE_FACTOR;
+		return ret;
+	}
+	static inline DrawingCoords ScreenToDrawing(const ScreenCoords &coords) {
+		return ScreenToDrawing(coords.x, coords.y);
+	}
+	static ScreenCoords DrawingToScreen(const DrawingCoords &coords, u16 z);
 
 	void SubmitPrimitive(void* vertices, void* indices, GEPrimitiveType prim_type, int vertex_count, u32 vertex_type, int *bytesRead, SoftwareDrawEngine *drawEngine);
 
 	bool GetCurrentSimpleVertices(int count, std::vector<GPUDebugVertex> &vertices, std::vector<u16> &indices);
-	VertexData ReadVertex(VertexReader& vreader);
 
-	bool outside_range_flag = false;
-	u8 *buf;
+	void Flush(const char *reason);
+	void FlushIfOverlap(const char *reason, uint32_t addr, uint32_t stride, uint32_t w, uint32_t h);
+	void NotifyClutUpdate(const void *src);
+
+	void GetStats(char *buffer, size_t bufsize);
+
+	void SetDirty(SoftDirty flags);
+	SoftDirty GetDirty();
+
+private:
+	VertexData ReadVertex(VertexReader &vreader, const TransformState &lstate, bool &outside_range_flag);
+
+	u8 *decoded_ = nullptr;
+	BinManager *binner_ = nullptr;
 };
 
 class SoftwareDrawEngine : public DrawEngineCommon {
@@ -145,6 +145,7 @@ public:
 
 	void DispatchFlush() override;
 	void DispatchSubmitPrim(void *verts, void *inds, GEPrimitiveType prim, int vertexCount, u32 vertType, int cullMode, int *bytesRead) override;
+	void DispatchSubmitImm(void *verts, void *inds, GEPrimitiveType prim, int vertexCount, u32 vertTypeID, int cullMode, int *bytesRead) override;
 
 	VertexDecoder *FindVertexDecoder(u32 vtype);
 

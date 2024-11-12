@@ -1,5 +1,6 @@
 // NOTE: Apologies for the quality of this code, this is really from pre-opensource Dolphin - that is, 2003.
 
+#include <cctype>
 #include <tchar.h>
 #include <math.h>
 #include <iomanip>
@@ -19,6 +20,12 @@
 #include "DumpMemoryWindow.h"
 
 wchar_t CtrlMemView::szClassName[] = L"CtrlMemView";
+
+static constexpr UINT_PTR IDT_REDRAW_DELAYED = 0xC0DE0001;
+static constexpr UINT REDRAW_DELAY = 1000 / 60;
+// We also redraw regularly, since data changes during runtime.
+static constexpr UINT_PTR IDT_REDRAW_AUTO = 0xC0DE0002;
+static constexpr UINT REDRAW_INTERVAL = 1000;
 
 CtrlMemView::CtrlMemView(HWND _wnd)
 {
@@ -56,7 +63,7 @@ CtrlMemView::CtrlMemView(HWND _wnd)
 	asciiStart = hexStart + (rowSize*3+1)*charWidth;
 
 	// set redraw timer
-	SetTimer(wnd,1,1000,0);
+	SetTimer(wnd, IDT_REDRAW_AUTO, REDRAW_INTERVAL, nullptr);
 }
 
 CtrlMemView::~CtrlMemView()
@@ -157,8 +164,16 @@ LRESULT CALLBACK CtrlMemView::wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 		return DLGC_WANTARROWS|DLGC_WANTCHARS|DLGC_WANTTAB;
 		break;
 	case WM_TIMER:
-		if (wParam == 1 && IsWindowVisible(ccp->wnd))
+		// This is actually delayed too, using another timer.  That way we won't update twice.
+		if (wParam == IDT_REDRAW_AUTO && IsWindowVisible(ccp->wnd))
 			ccp->redraw();
+
+		if (wParam == IDT_REDRAW_DELAYED) {
+			InvalidateRect(hwnd, nullptr, FALSE);
+			UpdateWindow(hwnd);
+			ccp->redrawScheduled_ = false;
+			KillTimer(hwnd, wParam);
+		}
 		break;
     default:
         break;
@@ -421,7 +436,7 @@ void CtrlMemView::onChar(WPARAM wParam, LPARAM lParam)
 	}
 
 	bool active = Core_IsActive();
-	if (active) Core_EnableStepping(true);
+	if (active) Core_EnableStepping(true, "memory.access", curAddress);
 
 	if (asciiSelected)
 	{
@@ -459,8 +474,10 @@ void CtrlMemView::redraw()
 		visibleRows -= offsetSpace; // visibleRows is calculated based on the size of the control, but X rows have already been used for the offsets and are no longer usable
 	}
 
-	InvalidateRect(wnd, NULL, FALSE);
-	UpdateWindow(wnd); 
+	if (!redrawScheduled_) {
+		SetTimer(wnd, IDT_REDRAW_DELAYED, REDRAW_DELAY, nullptr);
+		redrawScheduled_ = true;
+	}
 }
 
 void CtrlMemView::onMouseDown(WPARAM wParam, LPARAM lParam, int button)
@@ -700,38 +717,74 @@ void CtrlMemView::scrollCursor(int bytes)
 	redraw();
 }
 
+bool CtrlMemView::ParseSearchString(const std::string &query, bool asHex, std::vector<uint8_t> &data) {
+	data.clear();
+	if (!asHex) {
+		for (size_t i = 0; i < query.length(); i++) {
+			data.push_back(query[i]);
+		}
+		return true;
+	}
 
-std::vector<u32> CtrlMemView::searchString(std::string searchQuery)
-{
+	for (size_t index = 0; index < query.size(); ) {
+		if (isspace(query[index])) {
+			index++;
+			continue;
+		}
+
+		u8 value = 0;
+		for (int i = 0; i < 2 && index < query.size(); i++) {
+			char c = tolower(query[index++]);
+			if (c >= 'a' && c <= 'f') {
+				value |= (c - 'a' + 10) << (1 - i) * 4;
+			} else  if (c >= '0' && c <= '9') {
+				value |= (c - '0') << (1 - i) * 4;
+			} else {
+				return false;
+			}
+		}
+
+		data.push_back(value);
+	}
+
+	return true;
+}
+
+std::vector<u32> CtrlMemView::searchString(const std::string &searchQuery) {
 	std::vector<u32> searchResAddrs;
-	std::vector<u8> searchData;
 
 	auto memLock = Memory::Lock();
 	if (!PSP_IsInited())
 		return searchResAddrs;
 
-	size_t queryLength = searchQuery.length();
-	if (queryLength == 0)
+	std::vector<u8> searchData;
+	if (!ParseSearchString(searchQuery, false, searchData))
 		return searchResAddrs;
 
-	// TODO: Scratchpad, VRAM?
-	u32 segmentStart = PSP_GetKernelMemoryBase(); //RAM start 
-	const u32 segmentEnd = PSP_GetUserMemoryEnd() - (u32)queryLength; //RAM end
-	u8* ptr;
+	if (searchData.empty())
+		return searchResAddrs;
 
-	redraw();
-	for (segmentStart = PSP_GetKernelMemoryBase(); segmentStart < segmentEnd; segmentStart++) {
-		if (KeyDownAsync(VK_ESCAPE))
-		{
-			return searchResAddrs;
-		}
+	std::vector<std::pair<u32, u32>> memoryAreas;
+	memoryAreas.push_back(std::pair<u32, u32>(PSP_GetScratchpadMemoryBase(), PSP_GetScratchpadMemoryEnd()));
+	// Ignore the video memory mirrors.
+	memoryAreas.push_back(std::pair<u32, u32>(PSP_GetVidMemBase(), 0x04200000));
+	memoryAreas.push_back(std::pair<u32, u32>(PSP_GetKernelMemoryBase(), PSP_GetUserMemoryEnd()));
 
-		ptr = Memory::GetPointer(segmentStart);
-		if (memcmp(ptr, searchQuery.c_str(), queryLength) == 0) {
-			searchResAddrs.push_back(segmentStart);
+	for (const auto &area : memoryAreas) {
+		const u32 segmentStart = area.first;
+		const u32 segmentEnd = area.second - (u32)searchData.size();
+
+		for (u32 pos = segmentStart; pos < segmentEnd; pos++) {
+			if ((pos % 256) == 0 && KeyDownAsync(VK_ESCAPE)) {
+				return searchResAddrs;
+			}
+
+			u8 *ptr = Memory::GetPointerUnchecked(pos);
+			if (memcmp(ptr, searchData.data(), searchData.size()) == 0) {
+				searchResAddrs.push_back(pos);
+			}
 		}
-	};
-	redraw();
+	}
 
 	return searchResAddrs;
 };
@@ -760,46 +813,16 @@ void CtrlMemView::search(bool continueSearch)
 	}
 
 	std::vector<u8> searchData;
-	if (asciiSelected)
-	{
-		for (size_t i = 0; i < searchQuery.length(); i++)
-		{
-			char c = searchQuery[i];
-			searchData.push_back(c);
-		}
-	} else {
-		size_t index = 0;
-		while (index < searchQuery.size())
-		{
-			if (searchQuery[index] == ' ' || searchQuery[index] == '\t')
-			{
-				index++;
-				continue;
-			}
-
-			u8 value = 0;
-			for (int i = 0; i < 2 && index < searchQuery.size(); i++)
-			{
-				char c = tolower(searchQuery[index++]);
-				if (c >= 'a' && c <= 'f')
-				{
-					value |= (c-'a'+10) << (1-i)*4;
-				} else  if (c >= '0' && c <= '9')
-				{
-					value |= (c-'0') << (1-i)*4;
-				} else {
-					MessageBox(wnd,L"Invalid search text.",L"Error",MB_OK);
-					return;
-				}
-			}
-
-			searchData.push_back(value);
-		}
+	if (!ParseSearchString(searchQuery, !asciiSelected, searchData)) {
+		MessageBox(wnd, L"Invalid search text.", L"Error", MB_OK);
+		return;
 	}
 
-	std::vector<std::pair<u32,u32>> memoryAreas;
-	memoryAreas.push_back(std::pair<u32,u32>(0x04000000, 0x04200000));
-	memoryAreas.push_back(std::pair<u32,u32>(0x08000000, 0x0A000000));
+	std::vector<std::pair<u32, u32>> memoryAreas;
+	// Ignore the video memory mirrors.
+	memoryAreas.push_back(std::pair<u32,u32>(PSP_GetVidMemBase(), 0x04200000));
+	memoryAreas.push_back(std::pair<u32,u32>(PSP_GetKernelMemoryBase(), PSP_GetUserMemoryEnd()));
+	memoryAreas.push_back(std::pair<u32, u32>(PSP_GetScratchpadMemoryBase(), PSP_GetScratchpadMemoryEnd()));
 	
 	searching = true;
 	redraw();	// so the cursor is disabled

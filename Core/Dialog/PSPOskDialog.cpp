@@ -28,8 +28,8 @@
 #include "Core/Dialog/PSPOskDialog.h"
 #include "Core/Util/PPGeDraw.h"
 #include "Core/HLE/sceCtrl.h"
-#include "Core/HLE/sceDisplay.h"
 #include "Core/HLE/sceUtility.h"
+#include "Core/HW/Display.h"
 #include "Core/Config.h"
 #include "Core/Reporting.h"
 #include "GPU/GPUState.h"
@@ -942,8 +942,10 @@ int PSPOskDialog::Update(int animSpeed) {
 #if defined(USING_WIN_UI) || defined(USING_QT_UI) || PPSSPP_PLATFORM(ANDROID)
 	// Windows: Fall back to the OSK/continue normally if we're in fullscreen.
 	// The dialog box doesn't work right if in fullscreen.
-	if (g_Config.bBypassOSKWithKeyboard && !g_Config.bFullScreen)
-		return NativeKeyboard();
+	if (System_GetPropertyBool(SYSPROP_HAS_KEYBOARD)) {
+		if (g_Config.bBypassOSKWithKeyboard && !g_Config.bFullScreen)
+			return NativeKeyboard();
+	}
 #endif
 
 	UpdateFade(animSpeed);

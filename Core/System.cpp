@@ -98,7 +98,7 @@ static std::string loadingReason;
 bool audioInitialized;
 
 bool coreCollectDebugStats = false;
-bool coreCollectDebugStatsForced = false;
+static int coreCollectDebugStatsCounter = 0;
 
 // This can be read and written from ANYWHERE.
 volatile CoreState coreState = CORE_STEPPING;
@@ -385,13 +385,25 @@ void Core_UpdateState(CoreState newState) {
 }
 
 void Core_UpdateDebugStats(bool collectStats) {
-	if (coreCollectDebugStats != collectStats) {
-		coreCollectDebugStats = collectStats;
+	bool newState = collectStats || coreCollectDebugStatsCounter > 0;
+	if (coreCollectDebugStats != newState) {
+		coreCollectDebugStats = newState;
 		mipsr4k.ClearJitCache();
 	}
 
-	kernelStats.ResetFrame();
-	gpuStats.ResetFrame();
+	if (!PSP_CoreParameter().frozen && !Core_IsStepping()) {
+		kernelStats.ResetFrame();
+		gpuStats.ResetFrame();
+	}
+}
+
+void Core_ForceDebugStats(bool enable) {
+	if (enable) {
+		coreCollectDebugStatsCounter++;
+	} else {
+		coreCollectDebugStatsCounter--;
+	}
+	_assert_(coreCollectDebugStatsCounter >= 0);
 }
 
 bool PSP_InitStart(const CoreParameter &coreParam, std::string *error_string) {
@@ -586,9 +598,9 @@ CoreParameter &PSP_CoreParameter() {
 }
 
 Path GetSysDirectory(PSPDirectories directoryType) {
-	Path memStickDirectory = g_Config.memStickDirectory;
+	const Path &memStickDirectory = g_Config.memStickDirectory;
 	Path pspDirectory;
-	if (memStickDirectory.GetFilename() == "PSP") {
+	if (!strcasecmp(memStickDirectory.GetFilename().c_str(), "PSP")) {
 		// Let's strip this off, to easily allow choosing a root directory named "PSP" on Android.
 		pspDirectory = memStickDirectory;
 	} else {
@@ -633,6 +645,8 @@ Path GetSysDirectory(PSPDirectories directoryType) {
 		return pspDirectory / "AUDIO";
 	case DIRECTORY_CUSTOM_SHADERS:
 		return pspDirectory / "shaders";
+	case DIRECTORY_CUSTOM_THEMES:
+		return pspDirectory / "themes";
 
 	case DIRECTORY_MEMSTICK_ROOT:
 		return g_Config.memStickDirectory;
@@ -717,6 +731,7 @@ void InitSysDirectories() {
 	File::CreateDir(GetSysDirectory(DIRECTORY_GAME));
 	File::CreateDir(GetSysDirectory(DIRECTORY_SAVEDATA));
 	File::CreateDir(GetSysDirectory(DIRECTORY_SAVESTATE));
+	File::CreateDir(GetSysDirectory(DIRECTORY_SYSTEM));
 
 	if (g_Config.currentDirectory.empty()) {
 		g_Config.currentDirectory = GetSysDirectory(DIRECTORY_GAME);

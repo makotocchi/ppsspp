@@ -239,9 +239,6 @@
     <ClCompile Include="..\..\Core\Util\AudioFormat.cpp">
       <Filter>Util</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\Core\Util\AudioFormatNEON.cpp">
-      <Filter>Util</Filter>
-    </ClCompile>
     <ClCompile Include="..\..\Core\Util\BlockAllocator.cpp">
       <Filter>Util</Filter>
     </ClCompile>
@@ -682,6 +679,9 @@
     <ClCompile Include="..\..\Core\Debugger\WebSocket\GPURecordSubscriber.cpp">
       <Filter>Debugger\WebSocket</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\Core\Debugger\WebSocket\GPUStatsSubscriber.cpp">
+      <Filter>Debugger\WebSocket</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\Core\Debugger\WebSocket\HLESubscriber.cpp">
       <Filter>Debugger\WebSocket</Filter>
     </ClCompile>
@@ -746,6 +746,9 @@
       <Filter>HW</Filter>
     </ClCompile>
     <ClCompile Include="..\..\Core\HW\Camera.cpp">
+      <Filter>HW</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Core\HW\Display.cpp">
       <Filter>HW</Filter>
     </ClCompile>
     <ClCompile Include="..\..\Core\Util\PortManager.cpp">
@@ -1224,9 +1227,6 @@
     <ClInclude Include="..\..\Core\Util\AudioFormat.h">
       <Filter>Util</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\Core\Util\AudioFormatNEON.h">
-      <Filter>Util</Filter>
-    </ClInclude>
     <ClInclude Include="..\..\Core\Util\BlockAllocator.h">
       <Filter>Util</Filter>
     </ClInclude>
@@ -1685,6 +1685,9 @@
     <ClInclude Include="..\..\Core\Debugger\WebSocket\GPURecordSubscriber.h">
       <Filter>Debugger\WebSocket</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\Core\Debugger\WebSocket\GPUStatsSubscriber.h">
+      <Filter>Debugger\WebSocket</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\Core\Debugger\WebSocket\HLESubscriber.h">
       <Filter>Debugger\WebSocket</Filter>
     </ClInclude>
@@ -1725,6 +1728,9 @@
       <Filter>MIPS\ARM64</Filter>
     </ClInclude>
     <ClInclude Include="..\..\Core\HW\Camera.h">
+      <Filter>HW</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Core\HW\Display.h">
       <Filter>HW</Filter>
     </ClInclude>
     <ClInclude Include="..\..\Core\Util\PortManager.h">

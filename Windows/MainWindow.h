@@ -5,7 +5,6 @@
 #if !PPSSPP_PLATFORM(UWP)
 
 #include "Common/CommonWindows.h"
-#include <string>
 
 #include "Core/System.h"
 #include "MainWindowMenu.h"
@@ -61,9 +60,12 @@ namespace MainWindow
 
 	void Init(HINSTANCE hInstance);
 	BOOL Show(HINSTANCE hInstance);
-	void CreateDebugWindows();
+	void CreateDisasmWindow();
+	void CreateGeDebuggerWindow();
+	void CreateMemoryWindow();
+	void CreateVFPUWindow();
+	void NotifyDebuggerMapLoaded();
 	void DestroyDebugWindows();
-	void Close();
 	void UpdateMenus(bool isMenuSelect = false);
 	void UpdateCommands();
 	void UpdateSwitchUMD();

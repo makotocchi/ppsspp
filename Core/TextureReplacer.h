@@ -17,12 +17,12 @@
 
 #pragma once
 
-#include <map>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include "Common/Common.h"
+#include "Common/CommonTypes.h"
 #include "Common/MemoryUtil.h"
 #include "Common/File/Path.h"
 
@@ -32,6 +32,8 @@
 class IniFile;
 class TextureCacheCommon;
 class TextureReplacer;
+class ReplacedTextureTask;
+class LimitedWaitable;
 
 enum class ReplacedTextureFormat {
 	F_5650,
@@ -125,6 +127,8 @@ namespace std {
 }
 
 struct ReplacedTexture {
+	~ReplacedTexture();
+
 	inline bool Valid() {
 		return !levels_.empty();
 	}
@@ -153,13 +157,25 @@ struct ReplacedTexture {
 		return (u8)alphaStatus_;
 	}
 
+	bool IsReady(double budget);
+
 	bool Load(int level, void *out, int rowPitch);
 
 protected:
+	void Prepare();
+	void PrepareData(int level);
+	void PurgeIfOlder(double t);
+
 	std::vector<ReplacedTextureLevel> levels_;
+	std::vector<std::vector<uint8_t>> levelData_;
 	ReplacedTextureAlpha alphaStatus_;
+	double lastUsed_ = 0.0;
+	LimitedWaitable *threadWaitable_ = nullptr;
+	std::mutex mutex_;
+	bool cancelPrepare_ = false;
 
 	friend TextureReplacer;
+	friend ReplacedTextureTask;
 };
 
 struct ReplacedTextureDecodeInfo {
@@ -188,8 +204,17 @@ public:
 
 	ReplacedTexture &FindReplacement(u64 cachekey, u32 hash, int w, int h);
 	bool FindFiltering(u64 cachekey, u32 hash, TextureFiltering *forceFiltering);
+	ReplacedTexture &FindNone() {
+		return none_;
+	}
 
+	// Check if a NotifyTextureDecoded for this texture is desired (used to avoid reads from write-combined memory.)
+	bool WillSave(const ReplacedTextureDecodeInfo &replacedInfo);
+
+	// Notify that a new texture was decoded.  May already be upscaled, saves the data passed.
 	void NotifyTextureDecoded(const ReplacedTextureDecodeInfo &replacedInfo, const void *data, int pitch, int level, int w, int h);
+
+	void Decimate(bool forcePressure);
 
 	static bool GenerateIni(const std::string &gameID, Path &generatedFilename);
 
@@ -206,7 +231,6 @@ protected:
 	void PopulateReplacement(ReplacedTexture *result, u64 cachekey, u32 hash, int w, int h);
 	bool PopulateLevel(ReplacedTextureLevel &level);
 
-	SimpleBuf<u32> saveBuf;
 	bool enabled_ = false;
 	bool allowVideo_ = false;
 	bool ignoreAddress_ = false;
@@ -225,5 +249,5 @@ protected:
 
 	ReplacedTexture none_;
 	std::unordered_map<ReplacementCacheKey, ReplacedTexture> cache_;
-	std::unordered_map<ReplacementCacheKey, ReplacedTextureLevel> savedCache_;
+	std::unordered_map<ReplacementCacheKey, std::pair<ReplacedTextureLevel, double>> savedCache_;
 };

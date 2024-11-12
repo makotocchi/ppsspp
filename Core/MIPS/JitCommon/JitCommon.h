@@ -17,10 +17,10 @@
 
 #pragma once
 
-#include <vector>
+#include <mutex>
 #include <string>
+#include <vector>
 
-#include "Common/Common.h"
 #include "Common/CommonTypes.h"
 #include "Core/MIPS/MIPS.h"
 
@@ -154,6 +154,7 @@ namespace MIPSComp {
 	typedef int (MIPSFrontendInterface::*MIPSReplaceFunc)();
 
 	extern JitInterface *jit;
+	extern std::recursive_mutex jitLock;
 
 	void DoDummyJitState(PointerWrap &p);
 

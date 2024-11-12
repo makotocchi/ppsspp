@@ -24,7 +24,7 @@
 #include "Common/Math/math_util.h"
 #include "Common/UI/Context.h"
 
-#include "Common/Common.h"
+#include "Common/CommonTypes.h"
 #include "Common/Log.h"
 #include "Core/Config.h"
 #include "Core/System.h"
@@ -273,8 +273,8 @@ public:
 
 	void GetContentDimensions(const UIContext &dc, float &w, float &h) const override {
 		const AtlasImage *image = dc.Draw()->GetAtlas()->getImage(ImageID("I_DIR"));
-		w = 2 * D_pad_Radius * spacing_ + image->w * scale_;
-		h = 2 * D_pad_Radius * spacing_ + image->h * scale_;
+		w = 2.0f * D_pad_Radius * spacing_ + image->w * scale_;
+		h = w;
 	};
 
 	float GetSpacing() const override { return spacing_; }
@@ -301,7 +301,7 @@ public:
 		dc.Draw()->DrawImage(stickImage, bounds_.centerX(), bounds_.centerY(), scale_ * spacing_, colorBg, ALIGN_CENTER);
 	}
 
-	float GetSpacing() const override { return spacing_; }
+	float GetSpacing() const override { return spacing_ * 3; }
 	void SetSpacing(float s) override {
 		// In mapping spacing is clamped between 0.5 and 3.0 and passed to this method
 		spacing_ = s/3;
