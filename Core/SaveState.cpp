@@ -456,13 +456,13 @@ namespace SaveState
 
 	void NextSlot()
 	{
-		g_Config.iCurrentStateSlot = (g_Config.iCurrentStateSlot + 1) % NUM_SLOTS;
+		g_Config.iCurrentStateSlot = (g_Config.iCurrentStateSlot + 1) % g_Config.iSavestateCount;
 	}
 
 	void PreviousSlot()
 	{
 		if (g_Config.iCurrentStateSlot == 0) {
-			g_Config.iCurrentStateSlot = NUM_SLOTS - 1;
+			g_Config.iCurrentStateSlot = g_Config.iSavestateCount - 1;
 		}
 		else {
 			g_Config.iCurrentStateSlot = g_Config.iCurrentStateSlot - 1;
@@ -683,7 +683,7 @@ namespace SaveState
 	int GetNewestSlot(const Path &gameFilename) {
 		int newestSlot = -1;
 		tm newestDate = {0};
-		for (int i = 0; i < NUM_SLOTS; i++) {
+		for (int i = 0; i < g_Config.iSavestateCount; i++) {
 			Path fn = GenerateSaveSlotFilename(gameFilename, i, STATE_EXTENSION);
 			if (File::Exists(fn)) {
 				tm time;
@@ -700,7 +700,7 @@ namespace SaveState
 	int GetOldestSlot(const Path &gameFilename) {
 		int oldestSlot = -1;
 		tm oldestDate = {0};
-		for (int i = 0; i < NUM_SLOTS; i++) {
+		for (int i = 0; i < g_Config.iSavestateCount; i++) {
 			Path fn = GenerateSaveSlotFilename(gameFilename, i, STATE_EXTENSION);
 			if (File::Exists(fn)) {
 				tm time;

@@ -673,37 +673,6 @@ namespace MainWindow {
 			break;
 		}
 
-		case ID_FILE_SAVESTATE_SLOT_1: g_Config.iCurrentStateSlot = 0; break;
-		case ID_FILE_SAVESTATE_SLOT_2: g_Config.iCurrentStateSlot = 1; break;
-		case ID_FILE_SAVESTATE_SLOT_3: g_Config.iCurrentStateSlot = 2; break;
-		case ID_FILE_SAVESTATE_SLOT_4: g_Config.iCurrentStateSlot = 3; break;
-		case ID_FILE_SAVESTATE_SLOT_5: g_Config.iCurrentStateSlot = 4; break;
-		case ID_FILE_SAVESTATE_SLOT_6: g_Config.iCurrentStateSlot = 5; break;
-		case ID_FILE_SAVESTATE_SLOT_7: g_Config.iCurrentStateSlot = 6; break;
-		case ID_FILE_SAVESTATE_SLOT_8: g_Config.iCurrentStateSlot = 7; break;
-		case ID_FILE_SAVESTATE_SLOT_9: g_Config.iCurrentStateSlot = 8; break;
-		case ID_FILE_SAVESTATE_SLOT_10: g_Config.iCurrentStateSlot = 9; break;
-		case ID_FILE_SAVESTATE_SLOT_11: g_Config.iCurrentStateSlot = 10; break;
-		case ID_FILE_SAVESTATE_SLOT_12: g_Config.iCurrentStateSlot = 11; break;
-		case ID_FILE_SAVESTATE_SLOT_13: g_Config.iCurrentStateSlot = 12; break;
-		case ID_FILE_SAVESTATE_SLOT_14: g_Config.iCurrentStateSlot = 13; break;
-		case ID_FILE_SAVESTATE_SLOT_15: g_Config.iCurrentStateSlot = 14; break;
-		case ID_FILE_SAVESTATE_SLOT_16: g_Config.iCurrentStateSlot = 15; break;
-		case ID_FILE_SAVESTATE_SLOT_17: g_Config.iCurrentStateSlot = 16; break;
-		case ID_FILE_SAVESTATE_SLOT_18: g_Config.iCurrentStateSlot = 17; break;
-		case ID_FILE_SAVESTATE_SLOT_19: g_Config.iCurrentStateSlot = 18; break;
-		case ID_FILE_SAVESTATE_SLOT_20: g_Config.iCurrentStateSlot = 19; break;
-		case ID_FILE_SAVESTATE_SLOT_21: g_Config.iCurrentStateSlot = 20; break;
-		case ID_FILE_SAVESTATE_SLOT_22: g_Config.iCurrentStateSlot = 21; break;
-		case ID_FILE_SAVESTATE_SLOT_23: g_Config.iCurrentStateSlot = 22; break;
-		case ID_FILE_SAVESTATE_SLOT_24: g_Config.iCurrentStateSlot = 23; break;
-		case ID_FILE_SAVESTATE_SLOT_25: g_Config.iCurrentStateSlot = 24; break;
-		case ID_FILE_SAVESTATE_SLOT_26: g_Config.iCurrentStateSlot = 25; break;
-		case ID_FILE_SAVESTATE_SLOT_27: g_Config.iCurrentStateSlot = 26; break;
-		case ID_FILE_SAVESTATE_SLOT_28: g_Config.iCurrentStateSlot = 27; break;
-		case ID_FILE_SAVESTATE_SLOT_29: g_Config.iCurrentStateSlot = 28; break;
-		case ID_FILE_SAVESTATE_SLOT_30: g_Config.iCurrentStateSlot = 29; break;
-
 		case ID_FILE_QUICKLOADSTATE:
 		{
 			SetCursor(LoadCursor(0, IDC_WAIT));
@@ -1072,6 +1041,11 @@ namespace MainWindow {
 
 		default:
 		{
+			if (wmId >= ID_FILE_SAVESTATE_SLOT_BASE && wmId < ID_FILE_SAVESTATE_SLOT_BASE + g_Config.iSavestateCount) {
+				g_Config.iCurrentStateSlot = wmId - ID_FILE_SAVESTATE_SLOT_BASE;
+				break;
+			}
+
 			// Handle the dynamic shader switching here.
 			// The Menu ID is contained in wParam, so subtract
 			// ID_SHADERS_BASE and an additional 1 off it.
@@ -1304,47 +1278,25 @@ namespace MainWindow {
 			CheckMenuItem(menu, frameskippingType[i], MF_BYCOMMAND | ((i == g_Config.iFrameSkipType) ? MF_CHECKED : MF_UNCHECKED));
 		}
 
-		static const int savestateSlot[] = {
-			ID_FILE_SAVESTATE_SLOT_1,
-			ID_FILE_SAVESTATE_SLOT_2,
-			ID_FILE_SAVESTATE_SLOT_3,
-			ID_FILE_SAVESTATE_SLOT_4,
-			ID_FILE_SAVESTATE_SLOT_5,
-			ID_FILE_SAVESTATE_SLOT_6,
-			ID_FILE_SAVESTATE_SLOT_7,
-			ID_FILE_SAVESTATE_SLOT_8,
-			ID_FILE_SAVESTATE_SLOT_9,
-			ID_FILE_SAVESTATE_SLOT_10,
-			ID_FILE_SAVESTATE_SLOT_11,
-			ID_FILE_SAVESTATE_SLOT_12,
-			ID_FILE_SAVESTATE_SLOT_13,
-			ID_FILE_SAVESTATE_SLOT_14,
-			ID_FILE_SAVESTATE_SLOT_15,
-			ID_FILE_SAVESTATE_SLOT_16,
-			ID_FILE_SAVESTATE_SLOT_17,
-			ID_FILE_SAVESTATE_SLOT_18,
-			ID_FILE_SAVESTATE_SLOT_19,
-			ID_FILE_SAVESTATE_SLOT_20,
-			ID_FILE_SAVESTATE_SLOT_21,
-			ID_FILE_SAVESTATE_SLOT_22,
-			ID_FILE_SAVESTATE_SLOT_23,
-			ID_FILE_SAVESTATE_SLOT_24,
-			ID_FILE_SAVESTATE_SLOT_25,
-			ID_FILE_SAVESTATE_SLOT_26,
-			ID_FILE_SAVESTATE_SLOT_27,
-			ID_FILE_SAVESTATE_SLOT_28,
-			ID_FILE_SAVESTATE_SLOT_29,
-			ID_FILE_SAVESTATE_SLOT_30
-		};
+		HMENU savestateMenu = GetSubmenuById(menu, ID_FILE_SAVESTATE_SLOT_MENU);
+		const int currentSavestateCount = GetMenuItemCount(savestateMenu);
+
+		if (currentSavestateCount != g_Config.iSavestateCount) {
+			EmptySubMenu(savestateMenu);
+			for (int i = 0; i < g_Config.iSavestateCount; i++) {
+				std::wstring slotName = std::to_wstring(i + 1);
+				AppendMenu(savestateMenu, MF_STRING, ID_FILE_SAVESTATE_SLOT_BASE + i, slotName.c_str());
+			}
+		}
 
 		if (g_Config.iCurrentStateSlot < 0)
 			g_Config.iCurrentStateSlot = 0;
 
-		else if (g_Config.iCurrentStateSlot >= SaveState::NUM_SLOTS)
-			g_Config.iCurrentStateSlot = SaveState::NUM_SLOTS - 1;
+		else if (g_Config.iCurrentStateSlot >= g_Config.iSavestateCount)
+			g_Config.iCurrentStateSlot = g_Config.iSavestateCount - 1;
 
-		for (int i = 0; i < ARRAY_SIZE(savestateSlot); i++) {
-			CheckMenuItem(menu, savestateSlot[i], MF_BYCOMMAND | ((i == g_Config.iCurrentStateSlot) ? MF_CHECKED : MF_UNCHECKED));
+		for (int i = 0; i < g_Config.iSavestateCount; i++) {
+			CheckMenuItem(menu, ID_FILE_SAVESTATE_SLOT_BASE + i, MF_BYCOMMAND | ((i == g_Config.iCurrentStateSlot) ? MF_CHECKED : MF_UNCHECKED));
 		}
 
 		bool allowD3D9 = g_Config.IsBackendEnabled(GPUBackend::DIRECT3D9);

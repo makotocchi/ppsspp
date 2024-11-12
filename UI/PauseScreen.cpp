@@ -364,8 +364,6 @@ GamePauseScreen::~GamePauseScreen() {
 }
 
 void GamePauseScreen::CreateViews() {
-	static const int NUM_SAVESLOTS = 30;
-
 	using namespace UI;
 	Margins scrollMargins(0, 20, 0, 0);
 	Margins actionMenuMargins(0, 20, 15, 0);
@@ -382,7 +380,7 @@ void GamePauseScreen::CreateViews() {
 
 	leftColumnItems->Add(new Spacer(0.0));
 	leftColumnItems->SetSpacing(10.0);
-	for (int i = 0; i < NUM_SAVESLOTS; i++) {
+	for (int i = 0; i < g_Config.iSavestateCount; i++) {
 		SaveSlotView *slot = leftColumnItems->Add(new SaveSlotView(gamePath_, i, new LayoutParams(FILL_PARENT, WRAP_CONTENT)));
 		slot->OnStateLoaded.Handle(this, &GamePauseScreen::OnState);
 		slot->OnStateSaved.Handle(this, &GamePauseScreen::OnState);

@@ -88,6 +88,7 @@ public:
 	bool bEnableLogging;
 	bool bDumpDecryptedEboot;
 	bool bFullscreenOnDoubleclick;
+	int iSavestateCount;
 
 	// These four are Win UI only
 	bool bPauseOnLostFocus;
